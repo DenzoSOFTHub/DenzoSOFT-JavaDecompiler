@@ -79,7 +79,7 @@ public class PerformanceBenchmark {
             roundErrors[r] = errors;
             totalErrors += errors;
 
-            double ms = roundTimes[r] / 1_000_000.0;
+            double ms = roundTimes[r] / 1000000.0;
             double memMB = (memAfter - memBefore) / (1024.0 * 1024.0);
             System.out.printf("  Round %d: %.1f ms, %d errors, mem delta ~%.1f MB%n",
                 r + 1, ms, errors, memMB);
@@ -128,10 +128,10 @@ public class PerformanceBenchmark {
         for (long t : roundTimes) total += t;
         long avg = total / measureRounds;
 
-        double medianMs = median / 1_000_000.0;
-        double bestMs = best / 1_000_000.0;
-        double worstMs = worst / 1_000_000.0;
-        double avgMs = avg / 1_000_000.0;
+        double medianMs = median / 1000000.0;
+        double bestMs = best / 1000000.0;
+        double worstMs = worst / 1000000.0;
+        double avgMs = avg / 1000000.0;
         double classesPerSec = classes.size() / (medianMs / 1000.0);
         double avgPerClass = medianMs / classes.size();
 
@@ -164,7 +164,7 @@ public class PerformanceBenchmark {
         for (int i = 0; i < Math.min(10, indices.length); i++) {
             int idx = indices[i].intValue();
             System.out.printf("  %.2f ms  %s (%d bytes)%n",
-                perClassTimes[idx] / 1_000_000.0, classNames[idx], classes.get(idx).data.length);
+                perClassTimes[idx] / 1000000.0, classNames[idx], classes.get(idx).data.length);
         }
 
         // Top 5 fastest
@@ -173,7 +173,7 @@ public class PerformanceBenchmark {
         for (int i = Math.max(0, indices.length - 5); i < indices.length; i++) {
             int idx = indices[i].intValue();
             System.out.printf("  %.2f ms  %s (%d bytes)%n",
-                perClassTimes[idx] / 1_000_000.0, classNames[idx], classes.get(idx).data.length);
+                perClassTimes[idx] / 1000000.0, classNames[idx], classes.get(idx).data.length);
         }
 
         System.out.println();
