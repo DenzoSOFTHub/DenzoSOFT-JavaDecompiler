@@ -92,10 +92,12 @@ This is a Copyleft license that gives the user the right to use, copy and modify
 - **Security limits**: Max bytecode size, max recursion depth, max AST nodes
 
 ### Tools
+- **Swing GUI**: JD-GUI style graphical interface with tabbed JAR browsing, package tree, syntax-highlighted source viewer, drag-and-drop, find (Ctrl+F)
 - **CLI**: Single-class and JAR decompilation
 - **Batch mode**: Parallel decompilation of entire JARs/directories with thread pool
 - **Trace mode**: Per-class diagnostic trace file for troubleshooting (see below)
 - **Library API**: Simple `Loader`/`Printer` interfaces for embedding
+- **Class inspection API**: Javassist-like ClassPool/CtClass/CtMethod/CtField for programmatic navigation
 - **Benchmark tool**: Built-in performance measurement
 
 ## Usage
@@ -108,6 +110,10 @@ java -jar denzosoft-decompiler.jar MyClass.class
 
 # Decompile a class from a .jar
 java -jar denzosoft-decompiler.jar myapp.jar com/example/MyClass
+
+# Launch graphical interface (JD-GUI style)
+java -jar denzosoft-decompiler.jar --gui
+java -jar denzosoft-decompiler.jar --gui myapp.jar
 
 # Batch decompile an entire JAR (parallel)
 java -jar denzosoft-decompiler.jar --batch myapp.jar output/
@@ -361,7 +367,7 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 
 ## Performance
 
-Benchmark results (measured on project's own 166 class files):
+Benchmark results (measured on project's own 180 class files):
 
 | Metric | Value |
 |---|---|
