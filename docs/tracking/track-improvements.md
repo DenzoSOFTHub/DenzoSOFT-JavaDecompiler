@@ -1,15 +1,13 @@
 # Improvement Tracking
 
 Format: IMP-YYYY-NNNN
-Status flow: TO_ANALYZE -> IN_ANALYSIS -> IN_PROGRESS -> RESOLVED -> CLOSED -> RELEASED
-Each improvement has a dedicated file in docs/tracking/items/.
+Index shows ONLY open items. Resolved items are in docs/releases/v{X.Y.Z}/.
 
 ---
 
 ## Open Improvements
 
-(none)
-
-## Resolved (moved to release notes)
-
-(none)
+| ID | Severity | Summary | Item File |
+|---|---|---|---|
+| IMP-2026-0001 | LOW | Inner classes positioned at original line number | [IMP-2026-0001](items/IMP-2026-0001.md) |
+| IMP-2026-0002 | LOW | If-else-if chains show else-if syntax | [IMP-2026-0002](items/IMP-2026-0002.md) |

@@ -732,8 +732,23 @@ public class TryCatchReconstructor {
         return false;
     }
 
+    // START_CHANGE: BUG-2026-0021-20260324-1 - Only remove duplicated finally if last statements match
     public static List<Statement> removeDuplicatedFinally(List<Statement> catchBody, int finallySize) {
         if (finallySize <= 0 || catchBody.size() <= finallySize) return catchBody;
+
+        // Check if the last N statements are likely duplicated finally code
+        // by verifying they are ExpressionStatements (typical for inline finally)
+        int start = catchBody.size() - finallySize;
+        boolean allLikelyFinally = true;
+        for (int i = start; i < catchBody.size(); i++) {
+            Statement s = catchBody.get(i);
+            if (s instanceof ExpressionStatement || s instanceof ReturnStatement) {
+                continue; // typical finally statement
+            }
+            allLikelyFinally = false;
+            break;
+        }
+        if (!allLikelyFinally) return catchBody;
 
         List<Statement> filtered = new ArrayList<Statement>();
         int keepCount = catchBody.size() - finallySize;
@@ -742,4 +757,5 @@ public class TryCatchReconstructor {
         }
         return filtered;
     }
+    // END_CHANGE: BUG-2026-0021-1
 }

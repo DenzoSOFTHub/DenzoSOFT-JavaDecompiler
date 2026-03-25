@@ -205,29 +205,6 @@ public class JavaSourceWriter implements Processor {
         printer.indent();
         lineNumber++;
 
-        // Enum constants
-        if (result.isEnum()) {
-            boolean first = true;
-            for (JavaSyntaxResult.FieldDeclaration field : result.getFields()) {
-                if (field.isEnum()) {
-                    if (!first) {
-                        printer.printText(",");
-                        printer.endLine();
-                    }
-                    printer.startLine(lineNumber++);
-                    printer.printDeclaration(Printer.FIELD, internalName, field.name, field.descriptor);
-                    first = false;
-                }
-            }
-            if (!first) {
-                printer.printText(";");
-                printer.endLine();
-                lineNumber++;
-                printer.startLine(lineNumber);
-                printer.endLine();
-            }
-        }
-
         // Build map of field name -> initializer from static init (<clinit>)
         Map<String, Expression> staticInits = new LinkedHashMap<String, Expression>();
         Set<String> inlinedFieldNames = new HashSet<String>();
@@ -255,6 +232,47 @@ public class JavaSourceWriter implements Processor {
                 }
             }
         }
+
+        // START_CHANGE: BUG-2026-0022-20260324-1 - Enum constants with constructor arguments
+        // Enum constants (moved after staticInits to access constructor args)
+        if (result.isEnum()) {
+            boolean first = true;
+            for (JavaSyntaxResult.FieldDeclaration field : result.getFields()) {
+                if (field.isEnum()) {
+                    if (!first) {
+                        printer.printText(",");
+                        printer.endLine();
+                    }
+                    printer.startLine(lineNumber++);
+                    printer.printDeclaration(Printer.FIELD, internalName, field.name, field.descriptor);
+                    // Extract constructor arguments from static initializer
+                    Expression initExpr = staticInits.get(field.name);
+                    if (initExpr instanceof NewExpression) {
+                        NewExpression ne = (NewExpression) initExpr;
+                        List<Expression> allArgs = ne.getArguments();
+                        // Skip first 2 args (name, ordinal) which are synthetic
+                        if (allArgs != null && allArgs.size() > 2) {
+                            printer.printText("(");
+                            for (int ai = 2; ai < allArgs.size(); ai++) {
+                                if (ai > 2) printer.printText(", ");
+                                writeExpression(printer, allArgs.get(ai), internalName);
+                            }
+                            printer.printText(")");
+                        }
+                        inlinedFieldNames.add(field.name);
+                    }
+                    first = false;
+                }
+            }
+            if (!first) {
+                printer.printText(";");
+                printer.endLine();
+                lineNumber++;
+                printer.startLine(lineNumber);
+                printer.endLine();
+            }
+        }
+        // END_CHANGE: BUG-2026-0022-1
 
         // Fields (non-enum)
         for (JavaSyntaxResult.FieldDeclaration field : result.getFields()) {
@@ -456,7 +474,36 @@ public class JavaSourceWriter implements Processor {
         printer.indent();
         lineNumber++;
 
-        // Enum constants
+        // START_CHANGE: BUG-2026-0022-20260324-2 - Extract enum constructor args from inner class clinit
+        // Build staticInits map for inner classes (same logic as top-level)
+        Map<String, Expression> innerStaticInits = new LinkedHashMap<String, Expression>();
+        Set<String> innerInlinedFieldNames = new HashSet<String>();
+        for (JavaSyntaxResult.MethodDeclaration m : inner.getMethods()) {
+            if ("<clinit>".equals(m.name) && m.body != null) {
+                for (Statement s : m.body) {
+                    if (s instanceof ExpressionStatement) {
+                        Expression e = ((ExpressionStatement) s).getExpression();
+                        if (e instanceof AssignmentExpression) {
+                            AssignmentExpression ae = (AssignmentExpression) e;
+                            if (ae.getLeft() instanceof FieldAccessExpression) {
+                                String fieldName = ((FieldAccessExpression) ae.getLeft()).getName();
+                                innerStaticInits.put(fieldName, ae.getRight());
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    } else if (s instanceof ReturnStatement) {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Enum constants with constructor args
         if (inner.isEnum()) {
             boolean first = true;
             for (JavaSyntaxResult.FieldDeclaration field : inner.getFields()) {
@@ -467,6 +514,21 @@ public class JavaSourceWriter implements Processor {
                     }
                     printer.startLine(lineNumber++);
                     printer.printDeclaration(Printer.FIELD, innerInternalName, field.name, field.descriptor);
+                    // Extract constructor arguments from static initializer
+                    Expression initExpr = innerStaticInits.get(field.name);
+                    if (initExpr instanceof NewExpression) {
+                        NewExpression ne = (NewExpression) initExpr;
+                        List<Expression> allArgs = ne.getArguments();
+                        if (allArgs != null && allArgs.size() > 2) {
+                            printer.printText("(");
+                            for (int ai = 2; ai < allArgs.size(); ai++) {
+                                if (ai > 2) printer.printText(", ");
+                                writeExpression(printer, allArgs.get(ai), innerInternalName);
+                            }
+                            printer.printText(")");
+                        }
+                        innerInlinedFieldNames.add(field.name);
+                    }
                     first = false;
                 }
             }
@@ -478,6 +540,7 @@ public class JavaSourceWriter implements Processor {
                 printer.endLine();
             }
         }
+        // END_CHANGE: BUG-2026-0022-2
 
         // Fields (non-enum)
         for (JavaSyntaxResult.FieldDeclaration field : inner.getFields()) {
@@ -1326,7 +1389,9 @@ public class JavaSourceWriter implements Processor {
         } else if (expr instanceof StringConstantExpression) {
             StringConstantExpression sce = (StringConstantExpression) expr;
             // START_CHANGE: LIM-0006-20260324-3 - Emit text block for Java 15+ strings with newlines
-            if (currentMajorVersion >= 59 && sce.getValue().contains("\n")) {
+            // START_CHANGE: BUG-2026-0023-20260324-1 - Require at least 2 newlines for text block detection
+            if (currentMajorVersion >= 59 && sce.getValue().indexOf("\n") != sce.getValue().lastIndexOf("\n")) {
+            // END_CHANGE: BUG-2026-0023-1
                 String raw = sce.getValue();
                 // Ensure text block ends with newline for proper closing delimiter
                 if (!raw.endsWith("\n")) {
@@ -1475,10 +1540,18 @@ public class JavaSourceWriter implements Processor {
                 printer.printText(ioe.getPatternVariableName());
             }
         } else if (expr instanceof BinaryOperatorExpression) {
+            // START_CHANGE: BUG-2026-0013-20260324-1 - Parenthesize based on operator precedence
             BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
+            boolean needLeftParens = needsParentheses(boe.getLeft(), boe.getOperator(), true);
+            boolean needRightParens = needsParentheses(boe.getRight(), boe.getOperator(), false);
+            if (needLeftParens) printer.printText("(");
             writeExpression(printer, boe.getLeft(), ownerInternalName);
+            if (needLeftParens) printer.printText(")");
             printer.printText(" " + boe.getOperator() + " ");
+            if (needRightParens) printer.printText("(");
             writeExpression(printer, boe.getRight(), ownerInternalName);
+            if (needRightParens) printer.printText(")");
+            // END_CHANGE: BUG-2026-0013-1
         } else if (expr instanceof UnaryOperatorExpression) {
             UnaryOperatorExpression uoe = (UnaryOperatorExpression) expr;
             if (uoe.isPrefix()) {
@@ -1683,6 +1756,7 @@ public class JavaSourceWriter implements Processor {
         }
     }
 
+    // START_CHANGE: BUG-2026-0019-20260324-1 - Handle complex statements in lambda body
     private void writeInlineLambdaStatement(Printer printer, Statement stmt, String ownerInternalName) {
         if (stmt instanceof ExpressionStatement) {
             writeExpression(printer, ((ExpressionStatement) stmt).getExpression(), ownerInternalName);
@@ -1695,11 +1769,75 @@ public class JavaSourceWriter implements Processor {
                 writeExpression(printer, rs.getExpression(), ownerInternalName);
             }
             printer.printText(";");
+        } else if (stmt instanceof IfStatement) {
+            IfStatement is = (IfStatement) stmt;
+            printer.printKeyword("if");
+            printer.printText(" (");
+            writeExpression(printer, is.getCondition(), ownerInternalName);
+            printer.printText(") { ");
+            writeInlineLambdaBody(printer, is.getThenBody(), ownerInternalName);
+            printer.printText(" }");
+        } else if (stmt instanceof IfElseStatement) {
+            IfElseStatement ies = (IfElseStatement) stmt;
+            printer.printKeyword("if");
+            printer.printText(" (");
+            writeExpression(printer, ies.getCondition(), ownerInternalName);
+            printer.printText(") { ");
+            writeInlineLambdaBody(printer, ies.getThenBody(), ownerInternalName);
+            printer.printText(" } ");
+            printer.printKeyword("else");
+            printer.printText(" { ");
+            writeInlineLambdaBody(printer, ies.getElseBody(), ownerInternalName);
+            printer.printText(" }");
         } else {
             writeInlineStatement(printer, stmt, ownerInternalName);
             printer.printText(";");
         }
     }
+
+    private void writeInlineLambdaBody(Printer printer, Statement body, String ownerInternalName) {
+        List<Statement> stmts = null;
+        if (body instanceof BlockStatement) {
+            stmts = ((BlockStatement) body).getStatements();
+        }
+        if (stmts != null) {
+            for (int i = 0; i < stmts.size(); i++) {
+                if (!(stmts.get(i) instanceof ReturnStatement && !((ReturnStatement) stmts.get(i)).hasExpression())) {
+                    writeInlineLambdaStatement(printer, stmts.get(i), ownerInternalName);
+                    printer.printText(" ");
+                }
+            }
+        } else if (body != null) {
+            writeInlineLambdaStatement(printer, body, ownerInternalName);
+        }
+    }
+    // END_CHANGE: BUG-2026-0019-1
+
+    // START_CHANGE: BUG-2026-0013-20260324-2 - Operator precedence helpers
+    private boolean needsParentheses(Expression child, String parentOp, boolean isLeft) {
+        if (!(child instanceof BinaryOperatorExpression)) return false;
+        String childOp = ((BinaryOperatorExpression) child).getOperator();
+        int parentPrec = getOperatorPrecedence(parentOp);
+        int childPrec = getOperatorPrecedence(childOp);
+        if (childPrec < parentPrec) return true;
+        if (childPrec == parentPrec && !isLeft) return true;
+        return false;
+    }
+
+    private int getOperatorPrecedence(String op) {
+        if ("||".equals(op)) return 1;
+        if ("&&".equals(op)) return 2;
+        if ("|".equals(op)) return 3;
+        if ("^".equals(op)) return 4;
+        if ("&".equals(op)) return 5;
+        if ("==".equals(op) || "!=".equals(op)) return 6;
+        if ("<".equals(op) || ">".equals(op) || "<=".equals(op) || ">=".equals(op)) return 7;
+        if ("<<".equals(op) || ">>".equals(op) || ">>>".equals(op)) return 8;
+        if ("+".equals(op) || "-".equals(op)) return 9;
+        if ("*".equals(op) || "/".equals(op) || "%".equals(op)) return 10;
+        return 0;
+    }
+    // END_CHANGE: BUG-2026-0013-2
 
     private void writeArguments(Printer printer, List<Expression> args, String ownerInternalName) {
         printer.printText("(");

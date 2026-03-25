@@ -231,15 +231,41 @@ public class StructuredFlowBuilder {
                 // Emit statements before the switch (setup code)
                 output.addAll(block.statements);
 
-                // Build switch cases
+                // START_CHANGE: BUG-2026-0017-20260324-1 - Group switch keys with same target PC
+                // Build switch cases, grouping keys that share the same target
                 List<SwitchStatement.SwitchCase> cases = new ArrayList<SwitchStatement.SwitchCase>();
                 if (block.switchKeys != null) {
+                    // Build ordered groups: keys with same target PC get combined labels
+                    List<List<Integer>> keyGroups = new ArrayList<List<Integer>>();
+                    List<Integer> targetPcs = new ArrayList<Integer>();
                     for (int i = 0; i < block.switchKeys.length; i++) {
+                        int targetPc = (block.switchTargets != null && i < block.switchTargets.length)
+                            ? block.switchTargets[i] : -1;
+                        int groupIdx = -1;
+                        for (int g = 0; g < targetPcs.size(); g++) {
+                            if (targetPcs.get(g).intValue() == targetPc) {
+                                groupIdx = g;
+                                break;
+                            }
+                        }
+                        if (groupIdx >= 0) {
+                            keyGroups.get(groupIdx).add(Integer.valueOf(block.switchKeys[i]));
+                        } else {
+                            List<Integer> group = new ArrayList<Integer>();
+                            group.add(Integer.valueOf(block.switchKeys[i]));
+                            keyGroups.add(group);
+                            targetPcs.add(Integer.valueOf(targetPc));
+                        }
+                    }
+                    for (int g = 0; g < keyGroups.size(); g++) {
                         List<Expression> labels = new ArrayList<Expression>();
-                        labels.add(IntegerConstantExpression.valueOf(block.lineNumber, block.switchKeys[i]));
+                        for (int k = 0; k < keyGroups.get(g).size(); k++) {
+                            labels.add(IntegerConstantExpression.valueOf(block.lineNumber, keyGroups.get(g).get(k).intValue()));
+                        }
                         List<Statement> caseStmts = new ArrayList<Statement>();
-                        if (block.switchTargets != null && i < block.switchTargets.length) {
-                            BasicBlock targetBlock = cfg.getBlockAtPc(block.switchTargets[i]);
+                        int targetPc = targetPcs.get(g).intValue();
+                        if (targetPc >= 0) {
+                            BasicBlock targetBlock = cfg.getBlockAtPc(targetPc);
                             if (targetBlock != null && !visited.contains(targetBlock.startPc)) {
                                 buildFromBlock(targetBlock, caseStmts, visited, caseStopPc);
                             }
@@ -247,6 +273,7 @@ public class StructuredFlowBuilder {
                         cases.add(new SwitchStatement.SwitchCase(labels, caseStmts));
                     }
                 }
+                // END_CHANGE: BUG-2026-0017-1
                 // Default case
                 if (block.switchDefaultTarget >= 0) {
                     BasicBlock defaultBlock = cfg.getBlockAtPc(block.switchDefaultTarget);
@@ -494,11 +521,21 @@ public class StructuredFlowBuilder {
 
                         // Check what the merge block does with the value
                         if (mergeBlock != null) {
+                            // START_CHANGE: BUG-2026-0015-20260324-1 - Only emit return if merge block is pure return (no prior statements)
                             visited.add(mergeBlock.startPc);
-                            if (mergeBlock.isReturn()) {
+                            boolean pureReturn = mergeBlock.isReturn()
+                                && (mergeBlock.statements == null || mergeBlock.statements.isEmpty());
+                            if (pureReturn) {
                                 // return condition ? A : B;
                                 preStatements.add(new ReturnStatement(line, ternary));
+                            } else if (mergeBlock.isReturn() && mergeBlock.statements != null && !mergeBlock.statements.isEmpty()) {
+                                // Merge block has statements then return - ternary is consumed as argument
+                                // Replace the stack-derived argument in the merge block's statements with the ternary
+                                // Use condBlock's stackTopExpression as the method receiver if available
+                                Expression receiver = condBlock.stackTopExpression;
+                                replaceTernaryInMergeStatements(preStatements, mergeBlock.statements, ternary, trueValue, falseValue, receiver);
                             } else if (mergeBlock.statements != null && !mergeBlock.statements.isEmpty()) {
+                            // END_CHANGE: BUG-2026-0015-1
                                 // The merge block has a store - replace with ternary assignment
                                 Statement mergeStmt = mergeBlock.statements.get(0);
                                 if (mergeStmt instanceof ExpressionStatement) {
@@ -570,11 +607,22 @@ public class StructuredFlowBuilder {
         // Pattern 2: if-then-else - true block ends with goto merge, false block falls to merge
         int mergePoint = findMergePoint(condBlock, trueTarget, falseTarget);
 
-        // START_CHANGE: ISS-2026-0007-20260324-11 - Skip Pattern 2 if merge point is beyond stopPc (labeled break)
+        // START_CHANGE: BUG-2026-0014-20260324-1 - Only skip merge if it's beyond an outer loop exit, not just stopPc
+        // Previously: mergePoint > stopPc caused inner loop body loss
+        // Now: only reject merge if it targets an outer loop exit point
         if (mergePoint >= 0 && stopPc >= 0 && mergePoint > stopPc) {
-            mergePoint = -1; // Force fall-through to Pattern 3
+            boolean mergeExceedsOuterExit = false;
+            for (int oli = 0; oli < outerLoopMergePoints.size(); oli++) {
+                if (mergePoint >= outerLoopMergePoints.get(oli).intValue()) {
+                    mergeExceedsOuterExit = true;
+                    break;
+                }
+            }
+            if (mergeExceedsOuterExit) {
+                mergePoint = -1; // Force fall-through to Pattern 3
+            }
         }
-        // END_CHANGE: ISS-2026-0007-11
+        // END_CHANGE: BUG-2026-0014-1
 
         if (mergePoint >= 0) {
             lastEffectiveMergePoint = mergePoint;
@@ -1069,6 +1117,76 @@ public class StructuredFlowBuilder {
         Type type = trueVal.getType() != null ? trueVal.getType() : PrimitiveType.INT;
         return new TernaryExpression(line, type, cond, trueVal, falseVal);
     }
+
+    // START_CHANGE: BUG-2026-0015-20260324-2 - Replace ternary value in merge block statements
+    private void replaceTernaryInMergeStatements(List<Statement> output,
+            List<Statement> mergeStmts, Expression ternary,
+            Expression trueValue, Expression falseValue, Expression receiver) {
+        for (int i = 0; i < mergeStmts.size(); i++) {
+            Statement s = mergeStmts.get(i);
+            if (i == 0 && s instanceof ExpressionStatement) {
+                Expression expr = ((ExpressionStatement) s).getExpression();
+                // Replace the value argument with the ternary expression
+                Expression replaced = replaceArgWithTernary(expr, ternary, trueValue, falseValue, receiver);
+                if (replaced != null) {
+                    output.add(new ExpressionStatement(replaced));
+                    continue;
+                }
+            }
+            output.add(s);
+        }
+    }
+
+    private Expression replaceArgWithTernary(Expression expr, Expression ternary,
+            Expression trueValue, Expression falseValue, Expression receiver) {
+        if (expr instanceof MethodInvocationExpression) {
+            MethodInvocationExpression mie = (MethodInvocationExpression) expr;
+            List<Expression> args = mie.getArguments();
+            // Determine the correct object receiver
+            Expression obj = mie.getObject();
+            if (receiver != null) {
+                obj = receiver;
+            }
+            if (args != null && !args.isEmpty()) {
+                List<Expression> newArgs = new ArrayList<Expression>(args);
+                // Replace last arg that matches one of the ternary values
+                for (int i = newArgs.size() - 1; i >= 0; i--) {
+                    Expression arg = newArgs.get(i);
+                    if (expressionMatchesValue(arg, trueValue) || expressionMatchesValue(arg, falseValue)) {
+                        newArgs.set(i, ternary);
+                        return new MethodInvocationExpression(
+                            mie.getLineNumber(), mie.getType(), obj,
+                            mie.getOwnerInternalName(), mie.getMethodName(), mie.getDescriptor(), newArgs);
+                    }
+                }
+                // If no direct match, replace the last argument
+                newArgs.set(newArgs.size() - 1, ternary);
+                return new MethodInvocationExpression(
+                    mie.getLineNumber(), mie.getType(), obj,
+                    mie.getOwnerInternalName(), mie.getMethodName(), mie.getDescriptor(), newArgs);
+            } else {
+                // No args - the ternary is the sole argument
+                List<Expression> newArgs = new ArrayList<Expression>();
+                newArgs.add(ternary);
+                return new MethodInvocationExpression(
+                    mie.getLineNumber(), mie.getType(), obj,
+                    mie.getOwnerInternalName(), mie.getMethodName(), mie.getDescriptor(), newArgs);
+            }
+        }
+        return null;
+    }
+
+    private boolean expressionMatchesValue(Expression a, Expression b) {
+        if (a == null || b == null) return false;
+        if (a instanceof StringConstantExpression && b instanceof StringConstantExpression) {
+            return ((StringConstantExpression) a).getValue().equals(((StringConstantExpression) b).getValue());
+        }
+        if (a instanceof IntegerConstantExpression && b instanceof IntegerConstantExpression) {
+            return ((IntegerConstantExpression) a).getValue() == ((IntegerConstantExpression) b).getValue();
+        }
+        return a == b;
+    }
+    // END_CHANGE: BUG-2026-0015-2
 
     /**
      * Interface for the bytecode decoder that populates block statements and conditions.

@@ -31,6 +31,15 @@ public class Main {
 
         String path = args[0];
 
+        if ("--gui".equals(path)) {
+            String[] guiArgs = new String[args.length - 1];
+            for (int i = 1; i < args.length; i++) {
+                guiArgs[i - 1] = args[i];
+            }
+            it.denzosoft.javadecompiler.gui.DecompilerGui.main(guiArgs);
+            return;
+        }
+
         if ("--version".equals(path) || "-v".equals(path)) {
             System.out.println("DenzoSOFT Java Decompiler v" + DenzoDecompiler.getVersion());
             System.out.println("Supports Java 1.0 through Java " + DenzoDecompiler.getMaxSupportedJavaVersion());
@@ -247,6 +256,7 @@ public class Main {
         System.out.println("  java -jar denzosoft-decompiler.jar <file.jar> <class-name>   Decompile a class from a .jar");
         System.out.println("  java -jar denzosoft-decompiler.jar --batch <file.jar> <output-dir>    Batch decompile JAR");
         System.out.println("  java -jar denzosoft-decompiler.jar --batch <class-dir> <output-dir>   Batch decompile directory");
+        System.out.println("  java -jar denzosoft-decompiler.jar --gui [file.jar ...]       Launch GUI");
         System.out.println("  java -jar denzosoft-decompiler.jar --version                 Show version");
         System.out.println();
         System.out.println("Examples:");

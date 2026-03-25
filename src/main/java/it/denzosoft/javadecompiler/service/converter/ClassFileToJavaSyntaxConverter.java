@@ -1657,6 +1657,26 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                                         stack.push(lambda);
                                         break;
                                     }
+                                    // START_CHANGE: BUG-2026-0020-20260324-1 - Detect method references (non-synthetic impl method)
+                                    // If the impl method is not a synthetic lambda body, it's a method reference
+                                    if (implMethodName != null) {
+                                        int refKind = handleEntry[0];
+                                        String ownerName = pool.getMemberClassName(handleEntry[1]);
+                                        String implDesc = pool.getMemberDescriptor(handleEntry[1]);
+                                        if (ownerName == null) ownerName = "";
+                                        // For REF_invokeVirtual (5), REF_invokeInterface (9): instance method ref
+                                        // For REF_invokeStatic (6): static method ref
+                                        // For REF_newInvokeSpecial (8): constructor ref (Type::new)
+                                        String refMethodName = implMethodName;
+                                        if (refKind == 8) {
+                                            refMethodName = "new";
+                                        }
+                                        Expression methodRef = new MethodReferenceExpression(
+                                            line, retType, null, ownerName, refMethodName, implDesc);
+                                        stack.push(methodRef);
+                                        break;
+                                    }
+                                    // END_CHANGE: BUG-2026-0020-1
                                 }
                             }
                         }

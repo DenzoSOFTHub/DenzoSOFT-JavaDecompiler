@@ -1,12 +1,12 @@
 # Bug Tracking
 
-Format: BUG-YYYY-NNNN
-Status flow: TO_ANALYZE -> IN_ANALYSIS -> IN_PROGRESS -> RESOLVED -> CLOSED -> RELEASED
-
-Index shows ONLY open items. Resolved items are removed. Released items are in docs/releases/v{X.Y.Z}/.
+Index shows ONLY open items. Resolved items are in docs/releases/v{X.Y.Z}/.
 
 ---
 
 ## Open Bugs
 
-(none)
+| ID | Severity | Summary |
+|---|---|---|
+| BUG-2026-0016 | HIGH | While with assignment in condition not reconstructed |
+| BUG-2026-0018 | HIGH | Array for-each with if body: some edge cases |
