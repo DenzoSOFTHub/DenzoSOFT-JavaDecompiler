@@ -162,6 +162,11 @@ public class JavaSyntaxResult {
         // START_CHANGE: LIM-0004-20260326-7 - Type annotations on method return type
         public List<AnnotationInfo> returnTypeAnnotations;
         // END_CHANGE: LIM-0004-7
+        // START_CHANGE: IMP-LINES-20260326-5 - Bytecode metadata for --show-bytecode
+        public int bytecodeLength;
+        public int maxStack;
+        public int maxLocals;
+        // END_CHANGE: IMP-LINES-5
 
         public MethodDeclaration(int accessFlags, String name, String descriptor,
                                    Type returnType, List<Type> parameterTypes,

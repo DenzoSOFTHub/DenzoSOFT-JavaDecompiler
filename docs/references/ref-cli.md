@@ -7,8 +7,20 @@ This document describes the command-line interface for DenzoSOFT Java Decompiler
 ## Synopsis
 
 ```
-java -jar denzosoft-decompiler.jar <command> [options]
+java -jar denzosoft-decompiler.jar [options] <command>
 ```
+
+---
+
+## Global Options
+
+| Option | Description |
+|---|---|
+| `--compact` | Compact output without line number alignment. By default, the decompiler preserves original source line numbers by inserting blank lines. |
+| `--show-bytecode` | Show bytecode metadata (size, max\_stack, max\_locals) as a comment at the start of each method body. |
+| `--show-native-info` | Show JNI function names and parameter types as comments on native method declarations. |
+
+Options can appear anywhere on the command line, before or after the command. Multiple options can be combined.
 
 ---
 
@@ -17,7 +29,7 @@ java -jar denzosoft-decompiler.jar <command> [options]
 ### Decompile a .class file
 
 ```
-java -jar denzosoft-decompiler.jar <file.class>
+java -jar denzosoft-decompiler.jar [options] <file.class>
 ```
 
 Reads the specified `.class` file, decompiles it, and prints Java source code to standard output. Inner classes in the same directory are automatically discovered and loaded.
@@ -127,7 +139,7 @@ Prints the decompiler version and the maximum supported Java version, then exits
 **Output:**
 
 ```
-DenzoSOFT Java Decompiler v1.0.0-SNAPSHOT
+DenzoSOFT Java Decompiler v1.4.0
 Supports Java 1.0 through Java 25
 ```
 
@@ -164,14 +176,26 @@ File not found, I/O errors, and other exceptions print the error message and sta
 ## Examples
 
 ```bash
-# Decompile a single class
+# Decompile a single class (compact output, default)
 java -jar denzosoft-decompiler.jar HelloWorld.class
+
+# Decompile with compact output (no line number alignment)
+java -jar denzosoft-decompiler.jar --compact HelloWorld.class
+
+# Decompile with bytecode metadata
+java -jar denzosoft-decompiler.jar --show-bytecode HelloWorld.class
+
+# Decompile with JNI info for native methods
+java -jar denzosoft-decompiler.jar --show-native-info NativeLib.class
 
 # Decompile a class from a JAR and save to file
 java -jar denzosoft-decompiler.jar myapp.jar com/example/Main > Main.java
 
 # Batch decompile a JAR
 java -jar denzosoft-decompiler.jar --batch myapp.jar src-decompiled/
+
+# Batch decompile with all options
+java -jar denzosoft-decompiler.jar --show-bytecode --show-native-info --batch myapp.jar src-decompiled/
 
 # Batch decompile compiled classes
 java -jar denzosoft-decompiler.jar --batch target/classes/ decompiled-src/

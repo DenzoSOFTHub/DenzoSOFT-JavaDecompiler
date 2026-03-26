@@ -33,6 +33,10 @@ public class JavaSourceWriter implements Processor {
     // START_CHANGE: BUG-2026-0029-20260325-1 - Map anonymous inner class names to their interface/superclass display name
     private Map<String, String> anonymousClassDisplayNames = new HashMap<String, String>();
     // END_CHANGE: BUG-2026-0029-1
+    // START_CHANGE: IMP-LINES-20260326-7 - Output flags from configuration
+    private boolean showBytecode;
+    private boolean showNativeInfo;
+    // END_CHANGE: IMP-LINES-7
 
     @Override
     public void process(Message message) throws Exception {
@@ -42,6 +46,12 @@ public class JavaSourceWriter implements Processor {
         if (result == null) {
             throw new IllegalStateException("No javaSyntaxResult in message");
         }
+
+        // START_CHANGE: IMP-LINES-20260326-8 - Read output flags from configuration
+        Map<String, Object> config = message.getHeader("configuration");
+        showBytecode = config != null && Boolean.TRUE.equals(config.get("showBytecode"));
+        showNativeInfo = config != null && Boolean.TRUE.equals(config.get("showNativeInfo"));
+        // END_CHANGE: IMP-LINES-8
 
         // START_CHANGE: LIM-0006-20260324-2 - Store major version for text block detection
         currentMajorVersion = result.getMajorVersion();
@@ -1110,7 +1120,8 @@ public class JavaSourceWriter implements Processor {
         // Body
         if (method.isAbstract() || method.isNative()) {
             printer.printText(";");
-            if (method.isNative()) {
+            // START_CHANGE: IMP-LINES-20260326-9 - JNI comments only when showNativeInfo is enabled
+            if (method.isNative() && showNativeInfo) {
                 // JNI function name: Java_package_Class_methodName
                 // For overloaded methods, JNI appends mangled descriptor
                 String jniName = "Java_" + ownerInternalName.replace('/', '_') + "_" + method.name;
@@ -1131,6 +1142,7 @@ public class JavaSourceWriter implements Processor {
                     printer.printText(")");
                 }
             }
+            // END_CHANGE: IMP-LINES-9
             printer.endLine();
             lineNumber++;
         } else {
@@ -1138,6 +1150,17 @@ public class JavaSourceWriter implements Processor {
             printer.endLine();
             printer.indent();
             lineNumber++;
+
+            // START_CHANGE: IMP-LINES-20260326-10 - Bytecode metadata comment
+            if (showBytecode && method.bytecodeLength > 0) {
+                printer.startLine(lineNumber);
+                printer.printText("// Bytecode: " + method.bytecodeLength + " bytes"
+                    + ", max_stack=" + method.maxStack
+                    + ", max_locals=" + method.maxLocals);
+                printer.endLine();
+                lineNumber++;
+            }
+            // END_CHANGE: IMP-LINES-10
 
             for (Statement stmt : method.body) {
                 // Skip trailing void return in constructors and void methods

@@ -95,6 +95,9 @@ This is a Copyleft license that gives the user the right to use, copy and modify
 - **Swing GUI**: JD-GUI style graphical interface with tabbed JAR browsing, package tree, syntax-highlighted source viewer, drag-and-drop, find (Ctrl+F)
 - **CLI**: Single-class and JAR decompilation
 - **Batch mode**: Parallel decompilation of entire JARs/directories with thread pool
+- **Line number alignment**: Preserves original source line numbers by default (use `--compact` for dense output)
+- **Bytecode metadata**: Optional `--show-bytecode` displays bytecode size, max\_stack, max\_locals per method
+- **Native method info**: Optional `--show-native-info` displays JNI function names and parameter types
 - **Trace mode**: Per-class diagnostic trace file for troubleshooting (see below)
 - **Library API**: Simple `Loader`/`Printer` interfaces for embedding
 - **Class inspection API**: Javassist-like ClassPool/CtClass/CtMethod/CtField for programmatic navigation
@@ -105,8 +108,17 @@ This is a Copyleft license that gives the user the right to use, copy and modify
 ### Command Line
 
 ```bash
-# Decompile a .class file
+# Decompile a .class file (default: preserves source line numbers)
 java -jar denzosoft-decompiler.jar MyClass.class
+
+# Compact output (no line number alignment)
+java -jar denzosoft-decompiler.jar --compact MyClass.class
+
+# Show bytecode metadata in method bodies
+java -jar denzosoft-decompiler.jar --show-bytecode MyClass.class
+
+# Show JNI info for native methods
+java -jar denzosoft-decompiler.jar --show-native-info NativeLib.class
 
 # Decompile a class from a .jar
 java -jar denzosoft-decompiler.jar myapp.jar com/example/MyClass
@@ -126,6 +138,105 @@ java -jar denzosoft-decompiler.jar --trace trace-output/ MyClass.class
 
 # Show version
 java -jar denzosoft-decompiler.jar --version
+```
+
+### Output Options
+
+By default the decompiler preserves the original source line numbers by inserting blank lines (useful for matching stack traces). Three flags control additional output features:
+
+#### Default output (line-aligned)
+
+Blank lines are inserted so that each statement appears on the same line number as in the original source. This makes stack traces and debugger line references match the decompiled code.
+
+```java
+public class ByteReader {
+    private final byte[] data;
+    private int offset;
+
+    public ByteReader(byte[] data) {
+
+
+
+
+                                        // <-- blank lines to align with original source
+        this.data = data;               // line 17 (matches original .java)
+        this.offset = 0;                // line 18
+    }
+
+    public int getOffset() {
+        return this.offset;
+    }
+
+    public void setOffset(int offset) {
+        this.offset = offset;
+    }
+}
+```
+
+#### `--compact`
+
+Removes line-alignment blank lines for a denser, more readable output:
+
+```java
+public class ByteReader {
+    private final byte[] data;
+    private int offset;
+
+    public ByteReader(byte[] data) {
+        this.data = data;
+        this.offset = 0;
+    }
+
+    public int getOffset() {
+        return this.offset;
+    }
+
+    public void setOffset(int offset) {
+        this.offset = offset;
+    }
+}
+```
+
+#### `--show-bytecode`
+
+Adds a comment at the start of each method body showing bytecode size, operand stack depth, and local variable count:
+
+```java
+public ByteReader(byte[] data) {
+    // Bytecode: 15 bytes, max_stack=2, max_locals=2
+    this.data = data;
+    this.offset = 0;
+}
+
+public int getOffset() {
+    // Bytecode: 5 bytes, max_stack=1, max_locals=1
+    return this.offset;
+}
+
+public int remaining() {
+    // Bytecode: 11 bytes, max_stack=2, max_locals=1
+    return this.data.length - this.offset;
+}
+```
+
+#### `--show-native-info`
+
+Shows JNI function names and C parameter types for native methods:
+
+```java
+private static native void registerNatives(); // JNI: Java_java_lang_System_registerNatives | params: (JNIEnv*, jclass)
+
+public static native long currentTimeMillis(); // JNI: Java_java_lang_System_currentTimeMillis | params: (JNIEnv*, jclass)
+
+public static native void arraycopy(Object arg0, int arg1, Object arg2, int arg3, int arg4); // JNI: Java_java_lang_System_arraycopy | params: (JNIEnv*, jclass, jobject, jint, jobject, jint, jint)
+```
+
+Without `--show-native-info`, native methods are shown without the JNI comment:
+
+```java
+private static native void registerNatives();
+public static native long currentTimeMillis();
+public static native void arraycopy(Object arg0, int arg1, Object arg2, int arg3, int arg4);
 ```
 
 ### Library API

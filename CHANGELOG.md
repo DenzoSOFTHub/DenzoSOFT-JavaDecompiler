@@ -2,6 +2,17 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.5.0] - 2026-03-26
+
+### Added
+- Line number alignment is now the default output mode (preserves original source line numbers)
+- `--compact` CLI option: produces dense output without line number alignment
+- `--show-bytecode` CLI option: shows bytecode metadata (size, max_stack, max_locals) per method
+- `--show-native-info` CLI option: shows JNI function names and parameter types on native methods
+
+### Fixed
+- Printer currentLine tracking: `endLine()` now advances line position, fixing line number drift in aligned mode
+
 ## [1.4.0] - 2026-03-26
 
 ### Added
@@ -22,7 +33,7 @@ All notable changes to DenzoSOFT Java Decompiler.
 ## [1.3.0] - 2026-03-26
 
 ### Added
-- Line number alignment: decompiled output preserves original source line numbers
+- Line number alignment in decompiled output (default since v1.5.0, use `--compact` to disable)
 - Implicit `super()` to Object suppressed (not shown when redundant)
 - `while(true)` loop reconstruction
 - Nested ternary support (3+ levels): `x > 0 ? "pos" : x < 0 ? "neg" : "zero"`

@@ -9,6 +9,8 @@ import it.denzosoft.javadecompiler.api.loader.Loader;
 import it.denzosoft.javadecompiler.api.printer.Printer;
 
 import java.io.ByteArrayOutputStream;
+import java.util.HashMap;
+import java.util.Map;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -34,11 +36,28 @@ import java.util.jar.JarFile;
 public class BatchDecompiler {
     private int threadCount;
     private File outputDir;
+    // START_CHANGE: IMP-LINES-20260326-3 - Add output options
+    private boolean alignLines;
+    private boolean showBytecode;
+    private boolean showNativeInfo;
 
     public BatchDecompiler(File outputDir, int threadCount) {
+        this(outputDir, threadCount, true, false, false);
+    }
+
+    public BatchDecompiler(File outputDir, int threadCount, boolean alignLines) {
+        this(outputDir, threadCount, alignLines, false, false);
+    }
+
+    public BatchDecompiler(File outputDir, int threadCount, boolean alignLines,
+                           boolean showBytecode, boolean showNativeInfo) {
         this.outputDir = outputDir;
         this.threadCount = threadCount;
+        this.alignLines = alignLines;
+        this.showBytecode = showBytecode;
+        this.showNativeInfo = showNativeInfo;
     }
+    // END_CHANGE: IMP-LINES-3
 
     /**
      * Decompile all classes in a JAR file to the output directory.
@@ -185,7 +204,7 @@ public class BatchDecompiler {
 
     private void decompileClass(String className, final byte[] classData) throws Exception {
         DenzoDecompiler decompiler = new DenzoDecompiler();
-        StringCollector collector = new StringCollector();
+        StringCollector collector = new StringCollector(alignLines);
 
         Loader loader = new Loader() {
             public boolean canLoad(String internalName) {
@@ -197,7 +216,13 @@ public class BatchDecompiler {
             }
         };
 
-        decompiler.decompile(loader, collector, className);
+        Map<String, Object> config = null;
+        if (showBytecode || showNativeInfo) {
+            config = new HashMap<String, Object>();
+            if (showBytecode) config.put("showBytecode", Boolean.TRUE);
+            if (showNativeInfo) config.put("showNativeInfo", Boolean.TRUE);
+        }
+        decompiler.decompile(loader, collector, className, config);
 
         // Write output maintaining package directory structure
         String outputPath = className.replace('/', File.separatorChar) + ".java";
@@ -264,13 +289,19 @@ public class BatchDecompiler {
     /**
      * Simple Printer that collects output into a String.
      */
+    // START_CHANGE: IMP-LINES-20260326-4 - Compact/aligned line modes for batch decompiler
     private static class StringCollector implements Printer {
         private final StringBuilder sb = new StringBuilder();
         private int indentLevel = 0;
-        private int currentLine = 0;
+        private int currentLine = 1;
+        private final boolean alignLines;
         private static final String INDENT = "    ";
 
-        public void start(int maxLineNumber, int majorVersion, int minorVersion) { currentLine = 0; }
+        StringCollector(boolean alignLines) {
+            this.alignLines = alignLines;
+        }
+
+        public void start(int maxLineNumber, int majorVersion, int minorVersion) { currentLine = 1; }
         public void end() {}
 
         public void printText(String text) { sb.append(text); }
@@ -290,20 +321,21 @@ public class BatchDecompiler {
         public void unindent() { indentLevel--; }
 
         public void startLine(int lineNumber) {
-            if (lineNumber > 0 && lineNumber > currentLine + 1) {
-                int gap = lineNumber - currentLine - 1;
+            if (alignLines && lineNumber > 0 && lineNumber > currentLine) {
+                int gap = lineNumber - currentLine;
                 for (int g = 0; g < gap; g++) sb.append("\n");
+                currentLine = lineNumber;
             }
-            currentLine = lineNumber;
             for (int i = 0; i < indentLevel; i++) sb.append(INDENT);
         }
 
         public void endLine() {
             sb.append("\n");
+            currentLine++;
         }
 
         public void extraLine(int count) {
-            for (int i = 0; i < count; i++) sb.append("\n");
+            for (int i = 0; i < count; i++) { sb.append("\n"); currentLine++; }
         }
 
         public void startMarker(int type) {}
@@ -311,4 +343,5 @@ public class BatchDecompiler {
 
         public String getResult() { return sb.toString(); }
     }
+    // END_CHANGE: IMP-LINES-4
 }

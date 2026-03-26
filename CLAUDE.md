@@ -11,17 +11,20 @@ Package: `it.denzosoft.javadecompiler`. Build: `mvn clean package`.
 
 ```bash
 mvn clean compile          # Compile
-mvn clean package          # Build JAR (target/java-decompiler-1.3.0.jar)
+mvn clean package          # Build JAR (target/java-decompiler-1.5.0.jar)
 mvn test                   # Run tests (if surefire configured)
 ```
 
 **Running the decompiler:**
 ```bash
-java -jar target/java-decompiler-1.3.0.jar <file.class>                    # Single class
-java -jar target/java-decompiler-1.3.0.jar <file.jar> <ClassName>          # From JAR
-java -jar target/java-decompiler-1.3.0.jar --batch <file.jar> <output-dir> # Batch
-java -jar target/java-decompiler-1.3.0.jar --gui [file.jar ...]            # GUI
-java -jar target/java-decompiler-1.3.0.jar --trace <dir> <file>            # Tracing
+java -jar target/java-decompiler-1.5.0.jar <file.class>                      # Default (line-aligned)
+java -jar target/java-decompiler-1.5.0.jar --compact <file.class>            # Compact output
+java -jar target/java-decompiler-1.5.0.jar --show-bytecode <file.class>      # With bytecode metadata
+java -jar target/java-decompiler-1.5.0.jar --show-native-info <file.class>   # With JNI info on native methods
+java -jar target/java-decompiler-1.5.0.jar <file.jar> <ClassName>            # From JAR
+java -jar target/java-decompiler-1.5.0.jar --batch <file.jar> <output-dir>   # Batch
+java -jar target/java-decompiler-1.5.0.jar --gui [file.jar ...]              # GUI
+java -jar target/java-decompiler-1.5.0.jar --trace <dir> <file>              # Tracing
 ```
 
 **Running the test suite** (custom test runner, not JUnit — requires JDK 25 javac):

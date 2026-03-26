@@ -395,6 +395,13 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             returnType, paramTypes, paramNames, thrownExceptions,
             bodyStatements, maxLineNumber, signature,
             methodAnnotations, paramAnnotations);
+        // START_CHANGE: IMP-LINES-20260326-6 - Populate bytecode metadata
+        if (code != null) {
+            md.bytecodeLength = code.getCode().length;
+            md.maxStack = code.getMaxStack();
+            md.maxLocals = code.getMaxLocals();
+        }
+        // END_CHANGE: IMP-LINES-6
         // START_CHANGE: LIM-0004-20260326-9 - Populate method return type annotations
         List<AnnotationInfo> returnTypeAnns = extractTypeAnnotationsByTarget(method.getAttributes(), 0x14);
         if (!returnTypeAnns.isEmpty()) {

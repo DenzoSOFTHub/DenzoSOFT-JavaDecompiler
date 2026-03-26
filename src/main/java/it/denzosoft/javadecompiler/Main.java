@@ -13,6 +13,10 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
@@ -23,7 +27,34 @@ import java.util.jar.JarFile;
  */
 public class Main {
 
+    // START_CHANGE: IMP-LINES-20260326-1 - Add --align-lines flag for optional line number preservation
     public static void main(String[] args) {
+        if (args.length < 1) {
+            printUsage();
+            System.exit(1);
+        }
+
+        // Parse global flags
+        // Default: align lines ON, bytecode OFF, native info OFF
+        boolean alignLines = true;
+        boolean showBytecode = false;
+        boolean showNativeInfo = false;
+        List<String> filteredArgs = new ArrayList<String>();
+        for (int i = 0; i < args.length; i++) {
+            if ("--align-lines".equals(args[i])) {
+                alignLines = true;
+            } else if ("--compact".equals(args[i])) {
+                alignLines = false;
+            } else if ("--show-bytecode".equals(args[i])) {
+                showBytecode = true;
+            } else if ("--show-native-info".equals(args[i])) {
+                showNativeInfo = true;
+            } else {
+                filteredArgs.add(args[i]);
+            }
+        }
+        args = filteredArgs.toArray(new String[filteredArgs.size()]);
+
         if (args.length < 1) {
             printUsage();
             System.exit(1);
@@ -55,13 +86,14 @@ public class Main {
                 File traceDir = new File(args[1]);
                 DenzoDecompiler decompiler = new DenzoDecompiler();
                 decompiler.setTraceDir(traceDir);
-                StringPrinter printer = new StringPrinter();
+                StringPrinter printer = new StringPrinter(alignLines);
 
+                Map<String, Object> config = buildConfig(showBytecode, showNativeInfo);
                 String target = args[2];
                 if (target.endsWith(".class")) {
-                    decompileClassFile(decompiler, printer, target);
+                    decompileClassFile(decompiler, printer, target, config);
                 } else if (target.endsWith(".jar") && args.length >= 4) {
-                    decompileFromJar(decompiler, printer, target, args[3]);
+                    decompileFromJar(decompiler, printer, target, args[3], config);
                 } else {
                     System.err.println("Error: specify a .class file or .jar + class-name");
                     System.exit(1);
@@ -92,7 +124,7 @@ public class Main {
                     outputDir.mkdirs();
                 }
                 int threads = Runtime.getRuntime().availableProcessors();
-                BatchDecompiler batch = new BatchDecompiler(outputDir, threads);
+                BatchDecompiler batch = new BatchDecompiler(outputDir, threads, alignLines, showBytecode, showNativeInfo);
                 BatchDecompiler.BatchResult result;
                 if (input.isDirectory()) {
                     result = batch.decompileDirectory(input);
@@ -124,17 +156,18 @@ public class Main {
 
         try {
             DenzoDecompiler decompiler = new DenzoDecompiler();
-            StringPrinter printer = new StringPrinter();
+            StringPrinter printer = new StringPrinter(alignLines);
+            Map<String, Object> config = buildConfig(showBytecode, showNativeInfo);
 
             if (path.endsWith(".class")) {
-                decompileClassFile(decompiler, printer, path);
+                decompileClassFile(decompiler, printer, path, config);
             } else if (path.endsWith(".jar")) {
                 if (args.length < 2) {
                     System.err.println("Error: specify the class name to decompile from the jar");
                     System.err.println("Example: java -jar denzosoft-decompiler.jar myapp.jar com/example/MyClass");
                     System.exit(1);
                 }
-                decompileFromJar(decompiler, printer, path, args[1]);
+                decompileFromJar(decompiler, printer, path, args[1], config);
             } else {
                 System.err.println("Error: unsupported file type. Use .class or .jar files.");
                 System.exit(1);
@@ -165,7 +198,14 @@ public class Main {
         return baos.toByteArray();
     }
 
-    private static void decompileClassFile(DenzoDecompiler decompiler, StringPrinter printer, String path) throws Exception {
+    private static Map<String, Object> buildConfig(boolean showBytecode, boolean showNativeInfo) {
+        Map<String, Object> config = new HashMap<String, Object>();
+        if (showBytecode) config.put("showBytecode", Boolean.TRUE);
+        if (showNativeInfo) config.put("showNativeInfo", Boolean.TRUE);
+        return config.isEmpty() ? null : config;
+    }
+
+    private static void decompileClassFile(DenzoDecompiler decompiler, StringPrinter printer, String path, Map<String, Object> config) throws Exception {
         final File classFile = new File(path);
         FileInputStream fis = new FileInputStream(classFile);
         final byte[] data;
@@ -214,11 +254,11 @@ public class Main {
             }
         };
 
-        decompiler.decompile(loader, printer, className);
+        decompiler.decompile(loader, printer, className, config);
     }
 
     private static void decompileFromJar(DenzoDecompiler decompiler, StringPrinter printer,
-                                          String jarPath, String className) throws Exception {
+                                          String jarPath, String className, final Map<String, Object> config) throws Exception {
         String entryName = className.replace('.', '/') + ".class";
 
         final JarFile jar = new JarFile(jarPath);
@@ -242,7 +282,7 @@ public class Main {
                 }
             };
 
-            decompiler.decompile(loader, printer, className.replace('.', '/'));
+            decompiler.decompile(loader, printer, className.replace('.', '/'), config);
         } finally {
             jar.close();
         }
@@ -259,6 +299,11 @@ public class Main {
         System.out.println("  java -jar denzosoft-decompiler.jar --gui [file.jar ...]       Launch GUI");
         System.out.println("  java -jar denzosoft-decompiler.jar --version                 Show version");
         System.out.println();
+        System.out.println("Options:");
+        System.out.println("  --compact           Compact output without line number alignment");
+        System.out.println("  --show-bytecode     Show bytecode metadata as comments in method bodies");
+        System.out.println("  --show-native-info  Show JNI function names and parameter types for native methods");
+        System.out.println();
         System.out.println("Examples:");
         System.out.println("  java -jar denzosoft-decompiler.jar MyClass.class");
         System.out.println("  java -jar denzosoft-decompiler.jar myapp.jar com/example/MyClass");
@@ -272,11 +317,16 @@ public class Main {
     static class StringPrinter implements Printer {
         private final StringBuilder sb = new StringBuilder();
         private int indentLevel = 0;
-        private int currentLine = 0;
+        private int currentLine = 1;
+        private final boolean alignLines;
         private static final String INDENT = "    ";
 
+        StringPrinter(boolean alignLines) {
+            this.alignLines = alignLines;
+        }
+
         public void start(int maxLineNumber, int majorVersion, int minorVersion) {
-            currentLine = 0;
+            currentLine = 1;
         }
         public void end() {}
 
@@ -296,15 +346,15 @@ public class Main {
         public void indent() { indentLevel++; }
         public void unindent() { indentLevel--; }
 
+        // START_CHANGE: IMP-LINES-20260326-2 - Compact/aligned line modes
         public void startLine(int lineNumber) {
-            // Insert blank lines to reach the target line number
-            if (lineNumber > 0 && lineNumber > currentLine + 1) {
-                int gap = lineNumber - currentLine - 1;
+            if (alignLines && lineNumber > 0 && lineNumber > currentLine) {
+                int gap = lineNumber - currentLine;
                 for (int g = 0; g < gap; g++) {
                     sb.append("\n");
                 }
+                currentLine = lineNumber;
             }
-            currentLine = lineNumber;
             for (int i = 0; i < indentLevel; i++) {
                 sb.append(INDENT);
             }
@@ -312,6 +362,7 @@ public class Main {
 
         public void endLine() {
             sb.append("\n");
+            currentLine++;
         }
 
         public void extraLine(int count) {
@@ -320,6 +371,7 @@ public class Main {
                 currentLine++;
             }
         }
+        // END_CHANGE: IMP-LINES-2
     // END_CHANGE: IMP-2026-0003-1
 
         @Override public void startMarker(int type) {}
@@ -327,4 +379,5 @@ public class Main {
 
         public String getResult() { return sb.toString(); }
     }
+    // END_CHANGE: IMP-LINES-1
 }
