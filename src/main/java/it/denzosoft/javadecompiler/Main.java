@@ -268,48 +268,59 @@ public class Main {
     /**
      * Simple Printer implementation that collects output into a String.
      */
+    // START_CHANGE: IMP-2026-0003-20260326-1 - Line-number-aware printer
     static class StringPrinter implements Printer {
         private final StringBuilder sb = new StringBuilder();
         private int indentLevel = 0;
+        private int currentLine = 0;
         private static final String INDENT = "    ";
 
-        @Override public void start(int maxLineNumber, int majorVersion, int minorVersion) {}
-        @Override public void end() {}
+        public void start(int maxLineNumber, int majorVersion, int minorVersion) {
+            currentLine = 0;
+        }
+        public void end() {}
 
-        @Override public void printText(String text) { sb.append(text); }
-        @Override public void printNumericConstant(String constant) { sb.append(constant); }
-        @Override public void printStringConstant(String constant, String ownerInternalName) { sb.append(constant); }
-        @Override public void printKeyword(String keyword) { sb.append(keyword); }
+        public void printText(String text) { sb.append(text); }
+        public void printNumericConstant(String constant) { sb.append(constant); }
+        public void printStringConstant(String constant, String ownerInternalName) { sb.append(constant); }
+        public void printKeyword(String keyword) { sb.append(keyword); }
 
-        @Override
         public void printDeclaration(int type, String internalTypeName, String name, String descriptor) {
             sb.append(name);
         }
 
-        @Override
         public void printReference(int type, String internalTypeName, String name, String descriptor, String ownerInternalName) {
             sb.append(name);
         }
 
-        @Override public void indent() { indentLevel++; }
-        @Override public void unindent() { indentLevel--; }
+        public void indent() { indentLevel++; }
+        public void unindent() { indentLevel--; }
 
-        @Override
         public void startLine(int lineNumber) {
+            // Insert blank lines to reach the target line number
+            if (lineNumber > 0 && lineNumber > currentLine + 1) {
+                int gap = lineNumber - currentLine - 1;
+                for (int g = 0; g < gap; g++) {
+                    sb.append("\n");
+                }
+            }
+            currentLine = lineNumber;
             for (int i = 0; i < indentLevel; i++) {
                 sb.append(INDENT);
             }
         }
 
-        @Override
         public void endLine() {
             sb.append("\n");
         }
 
-        @Override
         public void extraLine(int count) {
-            for (int i = 0; i < count; i++) sb.append("\n");
+            for (int i = 0; i < count; i++) {
+                sb.append("\n");
+                currentLine++;
+            }
         }
+    // END_CHANGE: IMP-2026-0003-1
 
         @Override public void startMarker(int type) {}
         @Override public void endMarker(int type) {}

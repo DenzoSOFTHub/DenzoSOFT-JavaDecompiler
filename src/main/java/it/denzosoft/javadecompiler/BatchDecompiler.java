@@ -267,9 +267,10 @@ public class BatchDecompiler {
     private static class StringCollector implements Printer {
         private final StringBuilder sb = new StringBuilder();
         private int indentLevel = 0;
+        private int currentLine = 0;
         private static final String INDENT = "    ";
 
-        public void start(int maxLineNumber, int majorVersion, int minorVersion) {}
+        public void start(int maxLineNumber, int majorVersion, int minorVersion) { currentLine = 0; }
         public void end() {}
 
         public void printText(String text) { sb.append(text); }
@@ -289,9 +290,12 @@ public class BatchDecompiler {
         public void unindent() { indentLevel--; }
 
         public void startLine(int lineNumber) {
-            for (int i = 0; i < indentLevel; i++) {
-                sb.append(INDENT);
+            if (lineNumber > 0 && lineNumber > currentLine + 1) {
+                int gap = lineNumber - currentLine - 1;
+                for (int g = 0; g < gap; g++) sb.append("\n");
             }
+            currentLine = lineNumber;
+            for (int i = 0; i < indentLevel; i++) sb.append(INDENT);
         }
 
         public void endLine() {

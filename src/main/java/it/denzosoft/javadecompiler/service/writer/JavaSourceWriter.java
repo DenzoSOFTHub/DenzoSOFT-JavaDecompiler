@@ -1128,6 +1128,11 @@ public class JavaSourceWriter implements Processor {
                 if (stmt instanceof ReturnStatement && !((ReturnStatement) stmt).hasExpression()) {
                     continue;
                 }
+                // START_CHANGE: IMP-2026-0003-20260326-2 - Skip implicit super() to Object
+                if (method.isConstructor() && isImplicitSuperCall(stmt, result)) {
+                    continue;
+                }
+                // END_CHANGE: IMP-2026-0003-2
                 // START_CHANGE: ISS-2026-0012-20260324-4 - Skip super(name, ordinal) in enum constructors
                 if (result.isEnum() && method.isConstructor() && isEnumSuperCall(stmt)) {
                     continue;
@@ -2217,6 +2222,23 @@ public class JavaSourceWriter implements Processor {
         return false;
     }
     // END_CHANGE: ISS-2026-0011-6
+
+    // START_CHANGE: IMP-2026-0003-20260326-3 - Detect implicit super() to java.lang.Object
+    private boolean isImplicitSuperCall(Statement stmt, JavaSyntaxResult result) {
+        if (!(stmt instanceof ExpressionStatement)) return false;
+        Expression expr = ((ExpressionStatement) stmt).getExpression();
+        if (!(expr instanceof MethodInvocationExpression)) return false;
+        MethodInvocationExpression mie = (MethodInvocationExpression) expr;
+        // super() with no arguments to java.lang.Object
+        if ("super".equals(mie.getMethodName()) && mie.getArguments().isEmpty()) {
+            String superName = result.getSuperName();
+            if (superName == null || "java/lang/Object".equals(superName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // END_CHANGE: IMP-2026-0003-3
 
     // START_CHANGE: ISS-2026-0012-20260324-5 - Detect super(name, ordinal) call in enum constructor
     private boolean isEnumSuperCall(Statement stmt) {
