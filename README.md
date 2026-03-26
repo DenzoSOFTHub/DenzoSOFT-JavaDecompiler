@@ -347,23 +347,25 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 ## Known Limitations
 
 ### Compilability Exceptions
-- **String switch** (Java 7+): The compiler generates a 2-phase hashCode/equals lookup pattern. The decompiler shows this compiled pattern rather than reconstructing the original `switch(string)` syntax. Functionally correct but structurally different from the original.
-- **Try-with-resources** (Java 7+): The compiler generates complex `addSuppressed` + nested try-catch patterns. The decompiler falls back to linear code (no try-catch wrapper) to ensure compilability, losing the resource management structure.
+- **Try-with-resources** (Java 7+): The compiler generates complex `addSuppressed` + nested try-catch patterns. The decompiler falls back to linear code to ensure compilability, losing the resource management structure. Model and writer support exist; resource extraction logic is pending.
 
 ### Type Information
 - **Generic type erasure**: Some generic type parameters are lost at bytecode level; raw types may appear where generics were used. `LocalVariableTypeTable` is used when available for better results.
 - **`@Override`**: Not reconstructable (has `RetentionPolicy.SOURCE`, not present in class files)
-- **Type annotations** (Java 8+): Parsed but not rendered in output (`@NonNull List<@NonNull String>`)
+- **Type annotations** (Java 8+): Not yet rendered in output (`@NonNull List<@NonNull String>`). Attributes are recognized but skipped during parsing.
 
 ### Modern Java Features
 - **Pattern matching for switch** (Java 21+): Model exists but bytecode pattern detection not fully implemented
-- **Text blocks** (Java 15+): Model exists but not distinguished from regular string literals in bytecode
+- **Text blocks** (Java 15+): Heuristic detection based on newline count (2+ newlines → text block) for Java 15+ class files. Exact distinction is impossible since text blocks and regular strings compile to identical bytecode.
 - **String templates** (Java 21+ preview): Not supported
 
 ### Output Quality
-- **Inner/anonymous classes**: Decompiled separately; inner class inlining model exists but writer rendering is in progress
-- **Complex lambda captures**: Lambda body reconstruction works for simple cases; captured variables may show as synthetic field accesses
-- **Enum constant initialization**: Complex enum constructors may show compiler-generated initialization code
+- **Inner/anonymous classes**: Named inner classes are fully inlined. Anonymous classes have display name mapping but body inlining into `new` expressions is in progress.
+
+### Resolved in Previous Versions
+- **String switch** (Java 7+): Fully reconstructed from hashCode/equals pattern since v1.1.0
+- **Enum constant initialization**: Synthetic members suppressed, constructor arguments extracted since v1.1.0/v1.2.0
+- **Lambda captures**: Captured variables properly resolved via bootstrap method analysis since v1.1.0
 
 ## Performance
 
