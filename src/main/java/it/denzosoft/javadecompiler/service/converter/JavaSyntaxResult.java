@@ -117,6 +117,9 @@ public class JavaSyntaxResult {
         public final Expression initialValue;
         public final String signature;
         public final List<AnnotationInfo> annotations;
+        // START_CHANGE: LIM-0004-20260326-6 - Type annotations on field type
+        public List<AnnotationInfo> typeAnnotations;
+        // END_CHANGE: LIM-0004-6
 
         public FieldDeclaration(int accessFlags, String name, String descriptor,
                                  Type type, Expression initialValue, String signature,
@@ -156,6 +159,9 @@ public class JavaSyntaxResult {
         public final String signature;
         public final List<AnnotationInfo> annotations;
         public final List<List<AnnotationInfo>> parameterAnnotations;
+        // START_CHANGE: LIM-0004-20260326-7 - Type annotations on method return type
+        public List<AnnotationInfo> returnTypeAnnotations;
+        // END_CHANGE: LIM-0004-7
 
         public MethodDeclaration(int accessFlags, String name, String descriptor,
                                    Type returnType, List<Type> parameterTypes,

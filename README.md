@@ -346,26 +346,25 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 
 ## Known Limitations
 
-### Compilability Exceptions
-- **Try-with-resources** (Java 7+): The compiler generates complex `addSuppressed` + nested try-catch patterns. The decompiler falls back to linear code to ensure compilability, losing the resource management structure. Model and writer support exist; resource extraction logic is pending.
-
-### Type Information
+### Permanent Limitations
 - **Generic type erasure**: Some generic type parameters are lost at bytecode level; raw types may appear where generics were used. `LocalVariableTypeTable` is used when available for better results.
 - **`@Override`**: Not reconstructable (has `RetentionPolicy.SOURCE`, not present in class files)
-- **Type annotations** (Java 8+): Not yet rendered in output (`@NonNull List<@NonNull String>`). Attributes are recognized but skipped during parsing.
-
-### Modern Java Features
-- **Pattern matching for switch** (Java 21+): Model exists but bytecode pattern detection not fully implemented
 - **Text blocks** (Java 15+): Heuristic detection based on newline count (2+ newlines → text block) for Java 15+ class files. Exact distinction is impossible since text blocks and regular strings compile to identical bytecode.
 - **String templates** (Java 21+ preview): Not supported
 
 ### Output Quality
 - **Inner/anonymous classes**: Named inner classes are fully inlined. Anonymous classes have display name mapping but body inlining into `new` expressions is in progress.
+- **Type annotations** (Java 8+): Field type and method return type annotations are rendered. Annotations on generic type arguments (`List<@NonNull String>`) are not yet supported.
 
 ### Resolved in Previous Versions
 - **String switch** (Java 7+): Fully reconstructed from hashCode/equals pattern since v1.1.0
 - **Enum constant initialization**: Synthetic members suppressed, constructor arguments extracted since v1.1.0/v1.2.0
 - **Lambda captures**: Captured variables properly resolved via bootstrap method analysis since v1.1.0
+- **Try-with-resources** (Java 7+): Resource extraction from finally/close() patterns since v1.4.0
+- **Pattern matching for switch** (Java 21+): Type patterns reconstructed from SwitchBootstraps since v1.4.0
+- **Type annotations** (Java 8+): Parsed and rendered on field types and method return types since v1.4.0
+- **If-else-if chains**: Rendered as `else if` instead of nested `else { if }` since v1.4.0
+- **While with assignment**: `while((line = readLine()) != null)` pattern reconstructed since v1.4.0
 
 ## Performance
 

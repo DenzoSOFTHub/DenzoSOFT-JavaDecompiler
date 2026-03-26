@@ -109,12 +109,12 @@ public final class AttributeParser {
             return parseMethodParametersAttribute(reader, pool, name, length);
         } else if ("AnnotationDefault".equals(name)) {
             return parseAnnotationDefaultAttribute(reader, pool, name, length);
+        // START_CHANGE: LIM-0004-20260326-3 - Parse type annotations instead of skipping
         } else if ("RuntimeVisibleTypeAnnotations".equals(name)) {
-            reader.skip(length);
-            return new Attribute(name, length);
+            return parseRuntimeTypeAnnotationsAttribute(reader, pool, name, length, true);
         } else if ("RuntimeInvisibleTypeAnnotations".equals(name)) {
-            reader.skip(length);
-            return new Attribute(name, length);
+            return parseRuntimeTypeAnnotationsAttribute(reader, pool, name, length, false);
+        // END_CHANGE: LIM-0004-3
         } else {
             // Unknown attribute - skip its content
             reader.skip(length);
@@ -448,4 +448,74 @@ public final class AttributeParser {
         }
         return new AnnotationInfo.ElementValue(tag, value);
     }
+
+    // START_CHANGE: LIM-0004-20260326-4 - Parse RuntimeVisibleTypeAnnotations/RuntimeInvisibleTypeAnnotations
+    private static RuntimeTypeAnnotationsAttribute parseRuntimeTypeAnnotationsAttribute(
+            ByteReader reader, ConstantPool pool, String name, int length, boolean visible) {
+        int count = reader.readUnsignedShort();
+        TypeAnnotationInfo[] typeAnnotations = new TypeAnnotationInfo[count];
+        for (int i = 0; i < count; i++) {
+            typeAnnotations[i] = parseTypeAnnotation(reader, pool);
+        }
+        return new RuntimeTypeAnnotationsAttribute(name, length, typeAnnotations, visible);
+    }
+
+    private static TypeAnnotationInfo parseTypeAnnotation(ByteReader reader, ConstantPool pool) {
+        int targetType = reader.readUnsignedByte();
+
+        // Skip target_info based on target_type (JVM spec 4.7.20.1)
+        switch (targetType) {
+            case 0x00: case 0x01: // type_parameter_target
+                reader.readUnsignedByte(); // type_parameter_index
+                break;
+            case 0x10: // supertype_target
+                reader.readUnsignedShort(); // supertype_index
+                break;
+            case 0x11: case 0x12: // type_parameter_bound_target
+                reader.readUnsignedByte(); // type_parameter_index
+                reader.readUnsignedByte(); // bound_index
+                break;
+            case 0x13: case 0x14: case 0x15: // empty_target (field, method_return, method_receiver)
+                break;
+            case 0x16: // formal_parameter_target
+                reader.readUnsignedByte(); // formal_parameter_index
+                break;
+            case 0x17: // throws_target
+                reader.readUnsignedShort(); // throws_type_index
+                break;
+            case 0x40: case 0x41: // localvar_target
+                int tableLength = reader.readUnsignedShort();
+                for (int j = 0; j < tableLength; j++) {
+                    reader.readUnsignedShort(); // start_pc
+                    reader.readUnsignedShort(); // length
+                    reader.readUnsignedShort(); // index
+                }
+                break;
+            case 0x42: // catch_target
+                reader.readUnsignedShort(); // exception_table_index
+                break;
+            case 0x43: case 0x44: case 0x45: case 0x46: // offset_target
+                reader.readUnsignedShort(); // offset
+                break;
+            case 0x47: case 0x48: case 0x49: case 0x4A: case 0x4B: // type_argument_target
+                reader.readUnsignedShort(); // offset
+                reader.readUnsignedByte(); // type_argument_index
+                break;
+            default:
+                // Unknown target type - cannot reliably parse further
+                break;
+        }
+
+        // Skip type_path (JVM spec 4.7.20.2)
+        int pathLength = reader.readUnsignedByte();
+        for (int j = 0; j < pathLength; j++) {
+            reader.readUnsignedByte(); // type_path_kind
+            reader.readUnsignedByte(); // type_argument_index
+        }
+
+        // Parse the annotation itself
+        AnnotationInfo annotation = parseAnnotation(reader, pool);
+        return new TypeAnnotationInfo(targetType, annotation);
+    }
+    // END_CHANGE: LIM-0004-4
 }

@@ -30,6 +30,7 @@ import it.denzosoft.javadecompiler.service.converter.transform.BooleanSimplifier
 import it.denzosoft.javadecompiler.service.converter.transform.CompoundAssignmentSimplifier;
 import it.denzosoft.javadecompiler.service.converter.transform.ForEachDetector;
 import it.denzosoft.javadecompiler.service.converter.transform.ForLoopDetector;
+import it.denzosoft.javadecompiler.service.converter.transform.PatternSwitchReconstructor;
 import it.denzosoft.javadecompiler.service.converter.transform.StringSwitchReconstructor;
 import it.denzosoft.javadecompiler.service.converter.transform.TryCatchReconstructor;
 import it.denzosoft.javadecompiler.util.OpcodeInfo;
@@ -275,9 +276,16 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
         List<AnnotationInfo> annotations = extractAnnotations(field.getAttributes());
 
-        return new JavaSyntaxResult.FieldDeclaration(
+        JavaSyntaxResult.FieldDeclaration fd = new JavaSyntaxResult.FieldDeclaration(
             field.getAccessFlags(), field.getName(), field.getDescriptor(),
             type, initialValue, signature, annotations);
+        // START_CHANGE: LIM-0004-20260326-8 - Populate field type annotations
+        List<AnnotationInfo> fieldTypeAnns = extractTypeAnnotationsByTarget(field.getAttributes(), 0x13);
+        if (!fieldTypeAnns.isEmpty()) {
+            fd.typeAnnotations = fieldTypeAnns;
+        }
+        // END_CHANGE: LIM-0004-8
+        return fd;
     }
 
     private JavaSyntaxResult.MethodDeclaration convertMethod(MethodInfo method, ClassFile classFile) {
@@ -382,11 +390,18 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         }
         // END_CHANGE: BUG-2026-0031-1
 
-        return new JavaSyntaxResult.MethodDeclaration(
+        JavaSyntaxResult.MethodDeclaration md = new JavaSyntaxResult.MethodDeclaration(
             method.getAccessFlags(), method.getName(), method.getDescriptor(),
             returnType, paramTypes, paramNames, thrownExceptions,
             bodyStatements, maxLineNumber, signature,
             methodAnnotations, paramAnnotations);
+        // START_CHANGE: LIM-0004-20260326-9 - Populate method return type annotations
+        List<AnnotationInfo> returnTypeAnns = extractTypeAnnotationsByTarget(method.getAttributes(), 0x14);
+        if (!returnTypeAnns.isEmpty()) {
+            md.returnTypeAnnotations = returnTypeAnns;
+        }
+        // END_CHANGE: LIM-0004-9
+        return md;
     }
 
     private List<AnnotationInfo> extractAnnotations(List<Attribute> attributes) {
@@ -401,6 +416,23 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         }
         return result;
     }
+
+    // START_CHANGE: LIM-0004-20260326-5 - Extract type annotations by target type
+    private List<AnnotationInfo> extractTypeAnnotationsByTarget(List<Attribute> attributes, int targetType) {
+        List<AnnotationInfo> result = new ArrayList<AnnotationInfo>();
+        for (Attribute attr : attributes) {
+            if (attr instanceof RuntimeTypeAnnotationsAttribute) {
+                RuntimeTypeAnnotationsAttribute rtaa = (RuntimeTypeAnnotationsAttribute) attr;
+                for (TypeAnnotationInfo tai : rtaa.getTypeAnnotations()) {
+                    if (tai.getTargetType() == targetType) {
+                        result.add(tai.getAnnotation());
+                    }
+                }
+            }
+        }
+        return result;
+    }
+    // END_CHANGE: LIM-0004-5
 
     /**
      * Add casts to generic type variable for return statements in methods with generic return types.
@@ -714,6 +746,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 result = ForLoopDetector.convert(result);
                 // Post-process: reconstruct string switch from hashCode/equals pattern
                 result = StringSwitchReconstructor.reconstruct(result);
+                // START_CHANGE: LIM-0005-20260326-4 - Reconstruct pattern switch from typeSwitch bootstrap
+                if (patternSwitchLabels != null && !patternSwitchLabels.isEmpty()) {
+                    result = PatternSwitchReconstructor.reconstruct(result, patternSwitchLabels);
+                }
+                // END_CHANGE: LIM-0005-4
                 // Prepend variable pre-declarations (for vars used across if/else branches)
                 if (!preDeclarations.isEmpty()) {
                     List<Statement> withDecls = new ArrayList<Statement>();
@@ -749,6 +786,10 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     private Map<String, List<String>> syntheticParamNames;
     // Bootstrap methods attribute for the current class
     private BootstrapMethodsAttribute bootstrapMethodsAttr;
+    // START_CHANGE: LIM-0005-20260326-1 - Pattern switch case labels from typeSwitch bootstrap
+    // Maps variable name → list of case label strings (types/constants) from SwitchBootstraps
+    private Map<String, List<String>> patternSwitchLabels;
+    // END_CHANGE: LIM-0005-1
 
     /**
      * Decode instructions in a single basic block.
@@ -1670,6 +1711,47 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     stack.push(concat);
                     break;
                 }
+
+                // START_CHANGE: LIM-0005-20260326-2 - Detect SwitchBootstraps.typeSwitch/enumSwitch
+                if (("typeSwitch".equals(methodName) || "enumSwitch".equals(methodName))
+                        && bootstrapMethodsAttr != null) {
+                    int bsmIndex = indyEntry[0];
+                    BootstrapMethodsAttribute.BootstrapMethod[] bsms = bootstrapMethodsAttr.getBootstrapMethods();
+                    if (bsmIndex >= 0 && bsmIndex < bsms.length) {
+                        BootstrapMethodsAttribute.BootstrapMethod bsm = bsms[bsmIndex];
+                        // Extract case label types from bootstrap arguments
+                        List<String> caseLabels = new ArrayList<String>();
+                        for (int bi = 0; bi < bsm.bootstrapArguments.length; bi++) {
+                            int argIdx = bsm.bootstrapArguments[bi];
+                            int tag = pool.getTag(argIdx);
+                            if (tag == ConstantPool.CONSTANT_Class) {
+                                caseLabels.add(pool.getClassName(argIdx));
+                            } else if (tag == ConstantPool.CONSTANT_String) {
+                                caseLabels.add("\"" + pool.getStringConstant(argIdx) + "\"");
+                            } else if (tag == ConstantPool.CONSTANT_Integer) {
+                                Object val = pool.getValue(argIdx);
+                                caseLabels.add(String.valueOf(val));
+                            } else {
+                                String utf8 = pool.getUtf8(argIdx);
+                                caseLabels.add(utf8 != null ? utf8 : "/* case " + bi + " */");
+                            }
+                        }
+                        // Store labels keyed by method name for PatternSwitchReconstructor
+                        if (patternSwitchLabels == null) {
+                            patternSwitchLabels = new HashMap<String, List<String>>();
+                        }
+                        patternSwitchLabels.put(methodName + "_" + line, caseLabels);
+                        // Push the selector (first arg) as the result - the switch will use it
+                        Expression selector = args.isEmpty() ? NullExpression.INSTANCE : args.get(0);
+                        // Create a tagged method invocation so the reconstructor can find it
+                        Expression invocation = new StaticMethodInvocationExpression(
+                            line, retType, "java/lang/runtime/SwitchBootstraps",
+                            methodName, desc, args);
+                        stack.push(invocation);
+                        break;
+                    }
+                }
+                // END_CHANGE: LIM-0005-2
 
                 // Check if this is a lambda (not string concat, empty class name)
                 if (methodName != null && !"makeConcatWithConstants".equals(methodName)) {

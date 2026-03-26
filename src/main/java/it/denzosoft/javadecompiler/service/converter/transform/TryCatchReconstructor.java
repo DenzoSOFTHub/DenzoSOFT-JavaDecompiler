@@ -273,12 +273,56 @@ public class TryCatchReconstructor {
                 continue; // skip this exception group - emit original statements unchanged
             }
 
+            // START_CHANGE: LIM-0008-20260326-1 - Try-with-resources resource extraction
+            List<Statement> resources = null;
+            if (isTryWithResourcesPattern(catchClauses, finallyBody)) {
+                // Extract resource variable names from finally close() calls
+                List<String> closeVarNames = extractCloseVariableNames(finallyBody);
+                if (!closeVarNames.isEmpty()) {
+                    resources = new ArrayList<Statement>();
+                    List<Statement> remainingBefore = new ArrayList<Statement>();
+                    for (Statement bs : beforeTry) {
+                        String assignedVar = getAssignedVarName(bs);
+                        if (assignedVar != null && closeVarNames.contains(assignedVar)) {
+                            resources.add(bs);
+                        } else {
+                            remainingBefore.add(bs);
+                        }
+                    }
+                    if (resources.isEmpty()) {
+                        // Also check the tryBody for resource declarations
+                        List<Statement> remainingTry = new ArrayList<Statement>();
+                        for (Statement ts : tryBody) {
+                            String assignedVar = getAssignedVarName(ts);
+                            if (assignedVar != null && closeVarNames.contains(assignedVar)) {
+                                resources.add(ts);
+                            } else {
+                                remainingTry.add(ts);
+                            }
+                        }
+                        if (!resources.isEmpty()) {
+                            tryBody = remainingTry;
+                        }
+                    } else {
+                        beforeTry = remainingBefore;
+                    }
+                    if (resources.isEmpty()) {
+                        resources = null;
+                    } else {
+                        // Remove compiler-generated Throwable catches and close() finally
+                        catchClauses = filterTWRCatchClauses(catchClauses);
+                        finallyBody = null;
+                    }
+                }
+            }
+            // END_CHANGE: LIM-0008-1
+
             TryCatchStatement tcs = new TryCatchStatement(
                 tryStartLine,
                 new BlockStatement(tryStartLine, tryBody),
                 catchClauses,
                 finallyBody,
-                null);
+                resources);
 
             List<Statement> newStatements = new ArrayList<Statement>();
             newStatements.addAll(beforeTry);
@@ -758,4 +802,106 @@ public class TryCatchReconstructor {
         return filtered;
     }
     // END_CHANGE: BUG-2026-0021-1
+
+    // START_CHANGE: LIM-0008-20260326-2 - Helpers for try-with-resources resource extraction
+
+    /**
+     * Extract variable names that are closed in a finally block.
+     * Looks for patterns like: varName.close() in the finally body.
+     */
+    private List<String> extractCloseVariableNames(Statement finallyBody) {
+        List<String> names = new ArrayList<String>();
+        if (finallyBody instanceof BlockStatement) {
+            for (Statement s : ((BlockStatement) finallyBody).getStatements()) {
+                String name = extractCloseVarFromStatement(s);
+                if (name != null) {
+                    names.add(name);
+                }
+            }
+        } else {
+            String name = extractCloseVarFromStatement(finallyBody);
+            if (name != null) {
+                names.add(name);
+            }
+        }
+        return names;
+    }
+
+    private String extractCloseVarFromStatement(Statement s) {
+        // Direct close() call: var.close()
+        if (s instanceof ExpressionStatement) {
+            Expression expr = ((ExpressionStatement) s).getExpression();
+            if (expr instanceof MethodInvocationExpression) {
+                MethodInvocationExpression mie = (MethodInvocationExpression) expr;
+                if ("close".equals(mie.getMethodName()) && mie.getObject() instanceof LocalVariableExpression) {
+                    return ((LocalVariableExpression) mie.getObject()).getName();
+                }
+            }
+        }
+        // Guarded close: if (var != null) { var.close(); }
+        if (s instanceof IfStatement) {
+            IfStatement is = (IfStatement) s;
+            List<Statement> body = null;
+            if (is.getThenBody() instanceof BlockStatement) {
+                body = ((BlockStatement) is.getThenBody()).getStatements();
+            } else {
+                body = new ArrayList<Statement>();
+                body.add(is.getThenBody());
+            }
+            for (Statement bs : body) {
+                String name = extractCloseVarFromStatement(bs);
+                if (name != null) return name;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Get the variable name assigned by a statement (VarDecl or Assignment).
+     */
+    private String getAssignedVarName(Statement s) {
+        if (s instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) s;
+            if (vds.hasInitializer()) {
+                return vds.getName();
+            }
+        }
+        if (s instanceof ExpressionStatement) {
+            Expression expr = ((ExpressionStatement) s).getExpression();
+            if (expr instanceof AssignmentExpression) {
+                AssignmentExpression ae = (AssignmentExpression) expr;
+                if (ae.getLeft() instanceof LocalVariableExpression) {
+                    return ((LocalVariableExpression) ae.getLeft()).getName();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Filter out compiler-generated catch clauses from try-with-resources.
+     * Removes catches for Throwable and catches with only addSuppressed calls.
+     */
+    private List<TryCatchStatement.CatchClause> filterTWRCatchClauses(
+            List<TryCatchStatement.CatchClause> catchClauses) {
+        List<TryCatchStatement.CatchClause> filtered = new ArrayList<TryCatchStatement.CatchClause>();
+        for (TryCatchStatement.CatchClause cc : catchClauses) {
+            boolean isCompilerGenerated = false;
+            if (cc.exceptionTypes != null) {
+                for (Type t : cc.exceptionTypes) {
+                    if (t instanceof ObjectType) {
+                        String name = ((ObjectType) t).getInternalName();
+                        if ("java/lang/Throwable".equals(name) || "Throwable".equals(name)) {
+                            isCompilerGenerated = true;
+                        }
+                    }
+                }
+            }
+            if (!isCompilerGenerated) {
+                filtered.add(cc);
+            }
+        }
+        return filtered;
+    }
+    // END_CHANGE: LIM-0008-2
 }

@@ -668,11 +668,56 @@ public class StructuredFlowBuilder {
             }
             // END_CHANGE: ISS-2026-0007-3
 
-            // Add pre-condition statements
+            // START_CHANGE: BUG-2026-0016-20260326-1 - Merge assignment into while condition
+            // Detect pattern: last statement assigns a variable used in condition
+            // e.g. line = reader.readLine(); while(line != null) → while((line = reader.readLine()) != null)
             List<Statement> result = new ArrayList<Statement>();
-            result.addAll(condBlock.statements);
+            Expression mergedCondition = condition;
+            List<Statement> preStmts = condBlock.statements;
+            if (!preStmts.isEmpty()) {
+                Statement lastStmt = preStmts.get(preStmts.size() - 1);
+                String assignedVarName = null;
+                Expression assignmentExpr = null;
+                boolean isDeclaration = false;
+                Type declType = null;
+                String declName = null;
 
-            WhileStatement ws = new WhileStatement(line, condition,
+                if (lastStmt instanceof ExpressionStatement) {
+                    Expression expr = ((ExpressionStatement) lastStmt).getExpression();
+                    if (expr instanceof AssignmentExpression) {
+                        AssignmentExpression ae = (AssignmentExpression) expr;
+                        if (ae.getLeft() instanceof LocalVariableExpression && "=".equals(ae.getOperator())) {
+                            assignedVarName = ((LocalVariableExpression) ae.getLeft()).getName();
+                            assignmentExpr = expr;
+                        }
+                    }
+                } else if (lastStmt instanceof VariableDeclarationStatement) {
+                    VariableDeclarationStatement vds = (VariableDeclarationStatement) lastStmt;
+                    if (vds.hasInitializer()) {
+                        assignedVarName = vds.getName();
+                        isDeclaration = true;
+                        declType = vds.getType();
+                        declName = vds.getName();
+                        LocalVariableExpression lve = new LocalVariableExpression(vds.getLineNumber(), vds.getType(), vds.getName(), -1);
+                        assignmentExpr = new AssignmentExpression(vds.getLineNumber(), vds.getType(), lve, "=", vds.getInitializer());
+                    }
+                }
+
+                if (assignedVarName != null && conditionUsesVariable(condition, assignedVarName)) {
+                    for (int pi = 0; pi < preStmts.size() - 1; pi++) {
+                        result.add(preStmts.get(pi));
+                    }
+                    if (isDeclaration) {
+                        result.add(new VariableDeclarationStatement(lastStmt.getLineNumber(), declType, declName, null, false, false));
+                    }
+                    mergedCondition = replaceVariableInCondition(condition, assignedVarName, assignmentExpr);
+                } else {
+                    result.addAll(preStmts);
+                }
+            }
+            // END_CHANGE: BUG-2026-0016-1
+
+            WhileStatement ws = new WhileStatement(line, mergedCondition,
                 new BlockStatement(line, body));
             // START_CHANGE: ISS-2026-0007-20260324-4 - Wrap with label if labeled break targets this loop
             String label = labeledBreakLabels.remove(loopExitPc);
@@ -1319,4 +1364,55 @@ public class StructuredFlowBuilder {
          */
         void decodeBlock(BasicBlock block);
     }
+
+    // START_CHANGE: BUG-2026-0016-20260326-3 - Helper methods for assignment-in-condition merging
+    private static boolean conditionUsesVariable(Expression expr, String varName) {
+        if (expr instanceof LocalVariableExpression) {
+            return varName.equals(((LocalVariableExpression) expr).getName());
+        }
+        if (expr instanceof BinaryOperatorExpression) {
+            BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
+            return conditionUsesVariable(boe.getLeft(), varName) || conditionUsesVariable(boe.getRight(), varName);
+        }
+        if (expr instanceof UnaryOperatorExpression) {
+            return conditionUsesVariable(((UnaryOperatorExpression) expr).getExpression(), varName);
+        }
+        if (expr instanceof MethodInvocationExpression) {
+            MethodInvocationExpression mie = (MethodInvocationExpression) expr;
+            if (mie.getObject() != null && conditionUsesVariable(mie.getObject(), varName)) return true;
+            if (mie.getArguments() != null) {
+                for (Expression arg : mie.getArguments()) {
+                    if (conditionUsesVariable(arg, varName)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static Expression replaceVariableInCondition(Expression expr, String varName, Expression replacement) {
+        if (expr instanceof LocalVariableExpression) {
+            if (varName.equals(((LocalVariableExpression) expr).getName())) {
+                return replacement;
+            }
+            return expr;
+        }
+        if (expr instanceof BinaryOperatorExpression) {
+            BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
+            Expression newLeft = replaceVariableInCondition(boe.getLeft(), varName, replacement);
+            Expression newRight = replaceVariableInCondition(boe.getRight(), varName, replacement);
+            if (newLeft != boe.getLeft() || newRight != boe.getRight()) {
+                return new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(), newLeft, boe.getOperator(), newRight);
+            }
+            return expr;
+        }
+        if (expr instanceof UnaryOperatorExpression) {
+            UnaryOperatorExpression uoe = (UnaryOperatorExpression) expr;
+            Expression newInner = replaceVariableInCondition(uoe.getExpression(), varName, replacement);
+            if (newInner != uoe.getExpression()) {
+                return new UnaryOperatorExpression(uoe.getLineNumber(), uoe.getType(), uoe.getOperator(), newInner, uoe.isPrefix());
+            }
+        }
+        return expr;
+    }
+    // END_CHANGE: BUG-2026-0016-3
 }

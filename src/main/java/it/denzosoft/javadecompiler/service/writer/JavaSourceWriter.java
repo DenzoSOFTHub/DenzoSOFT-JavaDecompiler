@@ -913,6 +913,14 @@ public class JavaSourceWriter implements Processor {
 
     private void writeField(Printer printer, JavaSyntaxResult.FieldDeclaration field, String ownerInternalName) {
         writeAccessFlags(printer, field.accessFlags, false, true);
+        // START_CHANGE: LIM-0004-20260326-10 - Render field type annotations
+        if (field.typeAnnotations != null) {
+            for (AnnotationInfo ta : field.typeAnnotations) {
+                writeAnnotation(printer, ta, ownerInternalName);
+                printer.printText(" ");
+            }
+        }
+        // END_CHANGE: LIM-0004-10
         // Use generic signature if available
         if (field.signature != null) {
             String genericType = SignatureParser.parseFieldSignature(field.signature);
@@ -1030,6 +1038,14 @@ public class JavaSourceWriter implements Processor {
                 printer.printText(methodTypeParams);
                 printer.printText(" ");
             }
+            // START_CHANGE: LIM-0004-20260326-11 - Render return type annotations
+            if (method.returnTypeAnnotations != null) {
+                for (AnnotationInfo ta : method.returnTypeAnnotations) {
+                    writeAnnotation(printer, ta, ownerInternalName);
+                    printer.printText(" ");
+                }
+            }
+            // END_CHANGE: LIM-0004-11
             if (genericReturnType != null) {
                 printer.printText(genericReturnType);
             } else {
@@ -1151,6 +1167,62 @@ public class JavaSourceWriter implements Processor {
         return lineNumber;
     }
 
+    // START_CHANGE: IMP-2026-0002-20260326-2 - else-if chain rendering helper
+    private int writeIfElseChain(Printer printer, IfElseStatement ies, String ownerInternalName, int lineNumber, boolean isElseIf) {
+        int line = ies.getLineNumber() > 0 ? ies.getLineNumber() : lineNumber;
+        if (!isElseIf) {
+            printer.startLine(line);
+        }
+        printer.printKeyword("if");
+        printer.printText(" (");
+        writeExpression(printer, ies.getCondition(), ownerInternalName);
+        printer.printText(") {");
+        printer.endLine();
+        printer.indent();
+        lineNumber = writeStatement(printer, ies.getThenBody(), ownerInternalName, line + 1);
+        printer.unindent();
+        printer.startLine(lineNumber);
+        printer.printText("} ");
+        printer.printKeyword("else");
+        // Check if else body is a single IfElseStatement or IfStatement (else-if chain)
+        Statement elseBody = ies.getElseBody();
+        Statement unwrapped = elseBody;
+        if (unwrapped instanceof BlockStatement) {
+            List<Statement> elseStmts = ((BlockStatement) unwrapped).getStatements();
+            if (elseStmts.size() == 1) {
+                unwrapped = elseStmts.get(0);
+            }
+        }
+        if (unwrapped instanceof IfElseStatement) {
+            printer.printText(" ");
+            lineNumber = writeIfElseChain(printer, (IfElseStatement) unwrapped, ownerInternalName, lineNumber, true);
+        } else if (unwrapped instanceof IfStatement) {
+            printer.printText(" ");
+            IfStatement is = (IfStatement) unwrapped;
+            int isLine = is.getLineNumber() > 0 ? is.getLineNumber() : lineNumber;
+            printer.printKeyword("if");
+            printer.printText(" (");
+            writeExpression(printer, is.getCondition(), ownerInternalName);
+            printer.printText(") {");
+            printer.endLine();
+            printer.indent();
+            lineNumber = writeStatement(printer, is.getThenBody(), ownerInternalName, isLine + 1);
+            printer.unindent();
+            printer.startLine(lineNumber);
+            printer.printText("}");
+        } else {
+            printer.printText(" {");
+            printer.endLine();
+            printer.indent();
+            lineNumber = writeStatement(printer, elseBody, ownerInternalName, lineNumber + 1);
+            printer.unindent();
+            printer.startLine(lineNumber);
+            printer.printText("}");
+        }
+        return lineNumber;
+    }
+    // END_CHANGE: IMP-2026-0002-2
+
     private int writeStatement(Printer printer, Statement stmt, String ownerInternalName, int lineNumber) {
         int line = stmt.getLineNumber() > 0 ? stmt.getLineNumber() : lineNumber;
 
@@ -1214,25 +1286,8 @@ public class JavaSourceWriter implements Processor {
             printer.startLine(lineNumber);
             printer.printText("}");
         } else if (stmt instanceof IfElseStatement) {
-            IfElseStatement ies = (IfElseStatement) stmt;
-            printer.printKeyword("if");
-            printer.printText(" (");
-            writeExpression(printer, ies.getCondition(), ownerInternalName);
-            printer.printText(") {");
-            printer.endLine();
-            printer.indent();
-            lineNumber = writeStatement(printer, ies.getThenBody(), ownerInternalName, line + 1);
-            printer.unindent();
-            printer.startLine(lineNumber);
-            printer.printText("} ");
-            printer.printKeyword("else");
-            printer.printText(" {");
-            printer.endLine();
-            printer.indent();
-            lineNumber = writeStatement(printer, ies.getElseBody(), ownerInternalName, lineNumber + 1);
-            printer.unindent();
-            printer.startLine(lineNumber);
-            printer.printText("}");
+            // START_CHANGE: IMP-2026-0002-20260326-1 - Render else-if chains without extra nesting
+            lineNumber = writeIfElseChain(printer, (IfElseStatement) stmt, ownerInternalName, line, false);
         } else if (stmt instanceof WhileStatement) {
             WhileStatement ws = (WhileStatement) stmt;
             printer.printKeyword("while");
@@ -2014,6 +2069,9 @@ public class JavaSourceWriter implements Processor {
     }
 
     private boolean needsParentheses(Expression child, String parentOp, boolean isLeft) {
+        // START_CHANGE: BUG-2026-0016-20260326-4 - Assignment in condition needs parentheses
+        if (child instanceof AssignmentExpression) return true;
+        // END_CHANGE: BUG-2026-0016-4
         if (!(child instanceof BinaryOperatorExpression)) return false;
         String childOp = ((BinaryOperatorExpression) child).getOperator();
         int parentPrec = getOperatorPrecedence(parentOp);

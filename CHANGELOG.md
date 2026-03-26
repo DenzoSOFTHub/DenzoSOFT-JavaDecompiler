@@ -2,6 +2,23 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.4.0] - 2026-03-26
+
+### Added
+- Try-with-resources reconstruction: resource variables extracted from finally/close() patterns
+- Pattern matching for switch (Java 21+): type patterns from SwitchBootstraps reconstructed
+- Type annotations (Java 8+): rendered on field types and method return types
+- If-else-if chain rendering: `else if` instead of nested `else { if }`
+- While with assignment in condition: `while((line = readLine()) != null)`
+- Assignment expressions parenthesized correctly in conditions
+
+### Fixed
+- LIM-0004: Type annotations now parsed and rendered (field/method return types)
+- LIM-0005: Pattern matching for switch now detected via SwitchBootstraps
+- LIM-0008: Try-with-resources resource extraction from close() patterns
+- IMP-2026-0002: If-else-if chains show proper else-if syntax
+- BUG-2026-0016: While loops with assignment in condition reconstructed
+
 ## [1.3.0] - 2026-03-26
 
 ### Added
