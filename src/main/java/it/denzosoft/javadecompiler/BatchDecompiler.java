@@ -80,7 +80,16 @@ public class BatchDecompiler {
             }
 
             // Process with thread pool
-            ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+            // START_CHANGE: BUG-2026-0032-20260325-7 - Use ThreadFactory with 2MB stack for complex JDK classes
+            ExecutorService executor = Executors.newFixedThreadPool(threadCount, new java.util.concurrent.ThreadFactory() {
+                private int counter = 0;
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(null, r, "decompiler-" + (counter++), 2 * 1024 * 1024); // 2MB stack
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+            // END_CHANGE: BUG-2026-0032-7
             try {
                 List<Future> futures = new ArrayList<Future>();
                 for (int i = 0; i < classNames.size(); i++) {

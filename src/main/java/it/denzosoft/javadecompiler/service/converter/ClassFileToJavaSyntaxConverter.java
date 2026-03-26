@@ -20,6 +20,7 @@ import it.denzosoft.javadecompiler.service.deserializer.ClassFileDeserializer;
 import it.denzosoft.javadecompiler.util.ByteReader;
 import it.denzosoft.javadecompiler.util.StringConstants;
 import it.denzosoft.javadecompiler.util.TypeNameUtil;
+import it.denzosoft.javadecompiler.util.SignatureParser;
 
 import it.denzosoft.javadecompiler.DecompilerLimits;
 import it.denzosoft.javadecompiler.service.converter.cfg.BasicBlock;
@@ -365,6 +366,22 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             }
         }
 
+        // START_CHANGE: BUG-2026-0031-20260325-1 - Add generic type cast for type variable return types
+        if (signature != null) {
+            String genericReturnType = SignatureParser.parseMethodReturnType(signature);
+            if (genericReturnType != null && genericReturnType.length() <= 2
+                && !genericReturnType.contains(".") && !genericReturnType.contains("/")
+                && !"void".equals(genericReturnType) && !"int".equals(genericReturnType)
+                && !"long".equals(genericReturnType) && !"boolean".equals(genericReturnType)
+                && !"byte".equals(genericReturnType) && !"char".equals(genericReturnType)
+                && !"short".equals(genericReturnType) && !"float".equals(genericReturnType)
+                && !"double".equals(genericReturnType)) {
+                GenericType genRetType = new GenericType(genericReturnType);
+                addGenericReturnCasts(bodyStatements, genRetType);
+            }
+        }
+        // END_CHANGE: BUG-2026-0031-1
+
         return new JavaSyntaxResult.MethodDeclaration(
             method.getAccessFlags(), method.getName(), method.getDescriptor(),
             returnType, paramTypes, paramNames, thrownExceptions,
@@ -384,6 +401,46 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         }
         return result;
     }
+
+    /**
+     * Add casts to generic type variable for return statements in methods with generic return types.
+     * E.g., "return obj" becomes "return (T) obj" when method returns type variable T.
+     */
+    // START_CHANGE: BUG-2026-0031-20260325-2 - Recursively add generic return casts
+    private void addGenericReturnCasts(List<Statement> stmts, GenericType genType) {
+        if (stmts == null) return;
+        for (int i = 0; i < stmts.size(); i++) {
+            Statement stmt = stmts.get(i);
+            if (stmt instanceof ReturnStatement) {
+                ReturnStatement rs = (ReturnStatement) stmt;
+                if (rs.hasExpression()) {
+                    Expression expr = rs.getExpression();
+                    // Don't wrap if already a cast to the same type
+                    if (expr instanceof CastExpression) continue;
+                    // Don't wrap null (null doesn't need a cast)
+                    if (expr instanceof NullExpression) continue;
+                    stmts.set(i, new ReturnStatement(rs.getLineNumber(),
+                        new CastExpression(rs.getLineNumber(), genType, expr)));
+                }
+            } else if (stmt instanceof IfStatement) {
+                IfStatement is = (IfStatement) stmt;
+                if (is.getThenBody() instanceof BlockStatement) {
+                    addGenericReturnCasts(((BlockStatement) is.getThenBody()).getStatements(), genType);
+                }
+            } else if (stmt instanceof IfElseStatement) {
+                IfElseStatement ies = (IfElseStatement) stmt;
+                if (ies.getThenBody() instanceof BlockStatement) {
+                    addGenericReturnCasts(((BlockStatement) ies.getThenBody()).getStatements(), genType);
+                }
+                if (ies.getElseBody() instanceof BlockStatement) {
+                    addGenericReturnCasts(((BlockStatement) ies.getElseBody()).getStatements(), genType);
+                }
+            } else if (stmt instanceof BlockStatement) {
+                addGenericReturnCasts(((BlockStatement) stmt).getStatements(), genType);
+            }
+        }
+    }
+    // END_CHANGE: BUG-2026-0031-2
 
     /**
      * Decompile a method's bytecode into a list of statements.

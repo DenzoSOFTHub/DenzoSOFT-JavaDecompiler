@@ -30,6 +30,9 @@ public class JavaSourceWriter implements Processor {
     // START_CHANGE: LIM-0006-20260324-1 - Track major version for text block support
     private int currentMajorVersion;
     // END_CHANGE: LIM-0006-1
+    // START_CHANGE: BUG-2026-0029-20260325-1 - Map anonymous inner class names to their interface/superclass display name
+    private Map<String, String> anonymousClassDisplayNames = new HashMap<String, String>();
+    // END_CHANGE: BUG-2026-0029-1
 
     @Override
     public void process(Message message) throws Exception {
@@ -49,6 +52,37 @@ public class JavaSourceWriter implements Processor {
         printer.end();
     }
 
+    // START_CHANGE: BUG-2026-0029-20260325-3 - Build map of anonymous class internal names to display names
+    private void buildAnonymousClassMap(JavaSyntaxResult result) {
+        List<JavaSyntaxResult> inners = result.getInnerClassResults();
+        if (inners == null) return;
+        for (JavaSyntaxResult inner : inners) {
+            String innerName = inner.getInternalName();
+            if (innerName == null) continue;
+            String simple = TypeNameUtil.simpleNameFromInternal(innerName);
+            // Check if simple name is numeric (anonymous class)
+            boolean isAnonymous = simple.length() > 0;
+            for (int ci = 0; ci < simple.length(); ci++) {
+                if (!Character.isDigit(simple.charAt(ci))) {
+                    isAnonymous = false;
+                    break;
+                }
+            }
+            if (isAnonymous) {
+                // Use first interface or superclass as display name
+                String[] ifaces = inner.getInterfaces();
+                if (ifaces != null && ifaces.length > 0) {
+                    anonymousClassDisplayNames.put(innerName, TypeNameUtil.simpleNameFromInternal(ifaces[0]));
+                } else if (inner.getSuperName() != null && !"java/lang/Object".equals(inner.getSuperName())) {
+                    anonymousClassDisplayNames.put(innerName, TypeNameUtil.simpleNameFromInternal(inner.getSuperName()));
+                }
+            }
+            // Recurse into nested inner classes
+            buildAnonymousClassMap(inner);
+        }
+    }
+    // END_CHANGE: BUG-2026-0029-3
+
     private int computeMaxLine(JavaSyntaxResult result) {
         int max = 0;
         for (JavaSyntaxResult.MethodDeclaration m : result.getMethods()) {
@@ -62,6 +96,11 @@ public class JavaSourceWriter implements Processor {
         String packageName = TypeNameUtil.packageFromInternal(internalName);
         String simpleName = TypeNameUtil.simpleNameFromInternal(internalName);
         int lineNumber = 1;
+
+        // START_CHANGE: BUG-2026-0029-20260325-2 - Build anonymous class display name map from inner class results
+        anonymousClassDisplayNames.clear();
+        buildAnonymousClassMap(result);
+        // END_CHANGE: BUG-2026-0029-2
 
         // Module declaration
         if (result.isModule() || (result.getAccessFlags() & 0x8000) != 0) {
@@ -359,6 +398,18 @@ public class JavaSourceWriter implements Processor {
         List<JavaSyntaxResult> innerResults = result.getInnerClassResults();
         if (innerResults != null && !innerResults.isEmpty()) {
             for (JavaSyntaxResult inner : innerResults) {
+                // START_CHANGE: BUG-2026-0029-20260325-6 - Skip blank line for anonymous inner classes
+                String innerSimple = TypeNameUtil.simpleNameFromInternal(
+                    inner.getInternalName() != null ? inner.getInternalName() : "");
+                boolean innerIsAnon = innerSimple.length() > 0;
+                for (int ci = 0; ci < innerSimple.length(); ci++) {
+                    if (!Character.isDigit(innerSimple.charAt(ci))) {
+                        innerIsAnon = false;
+                        break;
+                    }
+                }
+                if (innerIsAnon) continue;
+                // END_CHANGE: BUG-2026-0029-6
                 printer.startLine(lineNumber++);
                 printer.endLine();
                 lineNumber = writeInnerClass(printer, inner, lineNumber, internalName);
@@ -375,6 +426,19 @@ public class JavaSourceWriter implements Processor {
                                  String outerInternalName) {
         String innerInternalName = inner.getInternalName();
         String simpleName = TypeNameUtil.simpleNameFromInternal(innerInternalName);
+
+        // START_CHANGE: BUG-2026-0029-20260325-5 - Skip anonymous inner class declarations (numeric simple names)
+        boolean isAnonymous = simpleName.length() > 0;
+        for (int ci = 0; ci < simpleName.length(); ci++) {
+            if (!Character.isDigit(simpleName.charAt(ci))) {
+                isAnonymous = false;
+                break;
+            }
+        }
+        if (isAnonymous) {
+            return lineNumber;
+        }
+        // END_CHANGE: BUG-2026-0029-5
 
         // Write access flags from inner class attribute (static, private, etc.)
         printer.startLine(lineNumber);
@@ -1471,21 +1535,42 @@ public class JavaSourceWriter implements Processor {
             NewExpression ne = (NewExpression) expr;
             printer.printKeyword("new");
             printer.printText(" ");
-            printer.printReference(Printer.TYPE, ne.getInternalTypeName(),
-                TypeNameUtil.simpleNameFromInternal(ne.getInternalTypeName()), "", ownerInternalName);
-            writeArguments(printer, ne.getArguments(), ownerInternalName);
+            // START_CHANGE: BUG-2026-0029-20260325-4 - Display anonymous classes using interface/superclass name
+            String displayName = anonymousClassDisplayNames.get(ne.getInternalTypeName());
+            if (displayName != null) {
+                printer.printReference(Printer.TYPE, ne.getInternalTypeName(),
+                    displayName, "", ownerInternalName);
+                // Suppress outer 'this' argument for anonymous classes
+                List<Expression> args = ne.getArguments();
+                List<Expression> filteredArgs = new ArrayList<Expression>();
+                if (args != null) {
+                    for (int ai = 0; ai < args.size(); ai++) {
+                        Expression arg = args.get(ai);
+                        if (arg instanceof ThisExpression) continue;
+                        filteredArgs.add(arg);
+                    }
+                }
+                writeArguments(printer, filteredArgs, ownerInternalName);
+            } else {
+                printer.printReference(Printer.TYPE, ne.getInternalTypeName(),
+                    TypeNameUtil.simpleNameFromInternal(ne.getInternalTypeName()), "", ownerInternalName);
+                writeArguments(printer, ne.getArguments(), ownerInternalName);
+            }
+            // END_CHANGE: BUG-2026-0029-4
         } else if (expr instanceof NewArrayExpression) {
             NewArrayExpression nae = (NewArrayExpression) expr;
             printer.printKeyword("new");
             printer.printText(" ");
             writeType(printer, nae.getType(), ownerInternalName);
-            // START_CHANGE: ISS-2026-0002-20260323-4 - Emit array initializer syntax when init values present
+            // START_CHANGE: BUG-2026-0032-20260325-4 - Write array init iteratively to avoid StackOverflow on large arrays
             if (nae.hasInitValues()) {
                 printer.printText("[]{");
                 List<Expression> initVals = nae.getInitValues();
                 for (int iv = 0; iv < initVals.size(); iv++) {
                     if (iv > 0) printer.printText(", ");
-                    writeExpression(printer, initVals.get(iv), ownerInternalName);
+                    // START_CHANGE: BUG-2026-0032-20260325-6 - Handle all value types iteratively
+                    Expression val = initVals.get(iv);
+                    writeExpressionSimple(printer, val, ownerInternalName);
                 }
                 printer.printText("}");
             } else {
@@ -1509,6 +1594,11 @@ public class JavaSourceWriter implements Processor {
 
             // Suppress redundant casts (same type)
             boolean redundant = false;
+            // START_CHANGE: BUG-2026-0031-20260325-1 - Never suppress casts to generic type variables (T)
+            if (castType instanceof GenericType) {
+                redundant = false;
+            } else
+            // END_CHANGE: BUG-2026-0031-1
             if (castType != null && exprType != null &&
                 castType.getDescriptor() != null &&
                 castType.getDescriptor().equals(exprType.getDescriptor())) {
@@ -1540,18 +1630,41 @@ public class JavaSourceWriter implements Processor {
                 printer.printText(ioe.getPatternVariableName());
             }
         } else if (expr instanceof BinaryOperatorExpression) {
-            // START_CHANGE: BUG-2026-0013-20260324-1 - Parenthesize based on operator precedence
-            BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
-            boolean needLeftParens = needsParentheses(boe.getLeft(), boe.getOperator(), true);
-            boolean needRightParens = needsParentheses(boe.getRight(), boe.getOperator(), false);
-            if (needLeftParens) printer.printText("(");
-            writeExpression(printer, boe.getLeft(), ownerInternalName);
-            if (needLeftParens) printer.printText(")");
-            printer.printText(" " + boe.getOperator() + " ");
-            if (needRightParens) printer.printText("(");
-            writeExpression(printer, boe.getRight(), ownerInternalName);
-            if (needRightParens) printer.printText(")");
-            // END_CHANGE: BUG-2026-0013-1
+            // START_CHANGE: BUG-2026-0032-20260325-5 - Iterative left-chain unrolling to prevent StackOverflow
+            // Collect left-associative chain iteratively: a + b + c + d → [a, b, c, d] with [+, +, +]
+            java.util.List<Expression> operands = new java.util.ArrayList<Expression>();
+            java.util.List<String> operators = new java.util.ArrayList<String>();
+            java.util.List<Boolean> needParens = new java.util.ArrayList<Boolean>();
+            Expression current = expr;
+            while (current instanceof BinaryOperatorExpression) {
+                BinaryOperatorExpression boe = (BinaryOperatorExpression) current;
+                operands.add(0, boe.getRight());
+                operators.add(0, boe.getOperator());
+                needParens.add(0, Boolean.valueOf(needsParentheses(boe.getRight(), boe.getOperator(), false)));
+                boolean leftNeedsP = needsParentheses(boe.getLeft(), boe.getOperator(), true);
+                if (leftNeedsP || !(boe.getLeft() instanceof BinaryOperatorExpression)) {
+                    // Can't unroll further: left is not a same-precedence binary op
+                    if (leftNeedsP) {
+                        printer.printText("(");
+                        writeExpression(printer, boe.getLeft(), ownerInternalName);
+                        printer.printText(")");
+                    } else {
+                        writeExpression(printer, boe.getLeft(), ownerInternalName);
+                    }
+                    current = null; // stop unrolling
+                } else {
+                    current = boe.getLeft();
+                }
+            }
+            // Write the collected operands
+            for (int oi = 0; oi < operands.size(); oi++) {
+                printer.printText(" " + operators.get(oi) + " ");
+                boolean np = ((Boolean) needParens.get(oi)).booleanValue();
+                if (np) printer.printText("(");
+                writeExpression(printer, operands.get(oi), ownerInternalName);
+                if (np) printer.printText(")");
+            }
+            // END_CHANGE: BUG-2026-0032-5
         } else if (expr instanceof UnaryOperatorExpression) {
             UnaryOperatorExpression uoe = (UnaryOperatorExpression) expr;
             if (uoe.isPrefix()) {
@@ -1814,6 +1927,87 @@ public class JavaSourceWriter implements Processor {
     // END_CHANGE: BUG-2026-0019-1
 
     // START_CHANGE: BUG-2026-0013-20260324-2 - Operator precedence helpers
+    /**
+     * Write a simple expression without deep recursion.
+     * Used for array init values and other contexts where expressions are typically leaves.
+     * Falls back to writeExpression only for complex types that won't recurse deeply.
+     */
+    private void writeExpressionSimple(Printer printer, Expression val, String ownerInternalName) {
+        if (val instanceof IntegerConstantExpression) {
+            printer.printNumericConstant(String.valueOf(((IntegerConstantExpression) val).getValue()));
+        } else if (val instanceof LongConstantExpression) {
+            printer.printNumericConstant(((LongConstantExpression) val).getValue() + "L");
+        } else if (val instanceof FloatConstantExpression) {
+            printer.printNumericConstant(((FloatConstantExpression) val).getValue() + "F");
+        } else if (val instanceof DoubleConstantExpression) {
+            printer.printNumericConstant(String.valueOf(((DoubleConstantExpression) val).getValue()));
+        } else if (val instanceof StringConstantExpression) {
+            printer.printStringConstant("\"" + escapeString(((StringConstantExpression) val).getValue()) + "\"", ownerInternalName);
+        } else if (val instanceof NullExpression) {
+            printer.printKeyword("null");
+        } else if (val instanceof BooleanExpression) {
+            printer.printKeyword(String.valueOf(((BooleanExpression) val).getValue()));
+        } else if (val instanceof LocalVariableExpression) {
+            printer.printText(((LocalVariableExpression) val).getName());
+        } else if (val instanceof CastExpression) {
+            CastExpression ce = (CastExpression) val;
+            printer.printText("(");
+            writeType(printer, ce.getType(), ownerInternalName);
+            printer.printText(") ");
+            writeExpressionSimple(printer, ce.getExpression(), ownerInternalName);
+        } else if (val instanceof FieldAccessExpression) {
+            FieldAccessExpression fae = (FieldAccessExpression) val;
+            if (fae.getObject() != null) {
+                writeExpressionSimple(printer, fae.getObject(), ownerInternalName);
+                printer.printText(".");
+            } else if (fae.getOwnerInternalName() != null && !fae.getOwnerInternalName().isEmpty()
+                       && !fae.getOwnerInternalName().equals(ownerInternalName)) {
+                // Static field from different class
+                printer.printText(TypeNameUtil.simpleNameFromInternal(fae.getOwnerInternalName()));
+                printer.printText(".");
+            }
+            printer.printText(fae.getName());
+        } else if (val instanceof ThisExpression) {
+            printer.printKeyword("this");
+        } else if (val instanceof MethodInvocationExpression) {
+            MethodInvocationExpression mie = (MethodInvocationExpression) val;
+            writeExpressionSimple(printer, mie.getObject(), ownerInternalName);
+            printer.printText(".");
+            printer.printText(mie.getMethodName());
+            printer.printText("(/* ... */)");
+        } else if (val instanceof StaticMethodInvocationExpression) {
+            StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) val;
+            if (smie.getOwnerInternalName() != null && !smie.getOwnerInternalName().isEmpty()) {
+                printer.printText(TypeNameUtil.simpleNameFromInternal(smie.getOwnerInternalName()));
+                printer.printText(".");
+            }
+            printer.printText(smie.getMethodName());
+            printer.printText("(/* ... */)");
+        } else if (val instanceof NewExpression) {
+            NewExpression ne = (NewExpression) val;
+            printer.printKeyword("new");
+            printer.printText(" ");
+            printer.printText(TypeNameUtil.simpleNameFromInternal(ne.getInternalTypeName()));
+            printer.printText("(/* ... */)");
+        } else if (val instanceof NewArrayExpression) {
+            // Prevent recursion: emit a simplified representation
+            NewArrayExpression innerNae = (NewArrayExpression) val;
+            printer.printKeyword("new");
+            printer.printText(" ");
+            writeType(printer, innerNae.getType(), ownerInternalName);
+            if (innerNae.hasInitValues()) {
+                printer.printText("[]{/* " + innerNae.getInitValues().size() + " elements */}");
+            } else {
+                printer.printText("[...]");
+            }
+        } else {
+            // Final fallback - just print the class name to avoid recursion
+            printer.printText("/* " + val.getClass().getSimpleName() + " */");
+            // Fallback for complex expressions - these should not be deeply nested
+            writeExpression(printer, val, ownerInternalName);
+        }
+    }
+
     private boolean needsParentheses(Expression child, String parentOp, boolean isLeft) {
         if (!(child instanceof BinaryOperatorExpression)) return false;
         String childOp = ((BinaryOperatorExpression) child).getOperator();

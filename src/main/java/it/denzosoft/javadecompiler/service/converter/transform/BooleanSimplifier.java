@@ -307,8 +307,19 @@ public final class BooleanSimplifier {
     }
 
     public static boolean looksBoolean(Expression expr) {
-        if (expr instanceof MethodInvocationExpression) return true;
-        if (expr instanceof StaticMethodInvocationExpression) return true;
+        // START_CHANGE: BUG-2026-0027-20260325-1 - Only treat method calls as boolean if return type is boolean or unknown (not int)
+        if (expr instanceof MethodInvocationExpression) {
+            Type mt = expr.getType();
+            // If we know the return type is int, don't treat as boolean
+            if (mt == PrimitiveType.INT) return false;
+            return true;
+        }
+        if (expr instanceof StaticMethodInvocationExpression) {
+            Type mt = expr.getType();
+            if (mt == PrimitiveType.INT) return false;
+            return true;
+        }
+        // END_CHANGE: BUG-2026-0027-1
         if (expr instanceof InstanceOfExpression) return true;
         if (expr instanceof FieldAccessExpression) return true;
         if (expr instanceof LocalVariableExpression) {

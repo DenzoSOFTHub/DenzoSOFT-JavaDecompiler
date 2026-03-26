@@ -30,6 +30,9 @@ public class StructuredFlowBuilder {
     private final ControlFlowGraph cfg;
     private final BytecodeDecoder decoder;
     private Set<Integer> doWhileHeaders = new HashSet<Integer>();
+    // START_CHANGE: BUG-2026-0026-20260325-1 - Track while(true) loop headers (targets of unconditional backward gotos)
+    private Map<Integer, Integer> whileTrueHeaders = new HashMap<Integer, Integer>(); // header PC -> goto source PC
+    // END_CHANGE: BUG-2026-0026-1
     private Map<Integer, Integer> precomputedMergePoints = new HashMap<Integer, Integer>();
     private int lastEffectiveMergePoint = -1;
     private int recursionDepth = 0;
@@ -71,6 +74,33 @@ public class StructuredFlowBuilder {
                 }
             }
         }
+
+        // START_CHANGE: BUG-2026-0026-20260325-2 - Pre-scan: identify while(true) headers (targets of unconditional backward gotos)
+        // Only mark as while(true) if the header is NOT already a while(condition) header
+        whileTrueHeaders.clear();
+        for (BasicBlock block : blocks) {
+            if (block.isGoto() && block.trueSuccessor != null
+                && block.trueSuccessor.startPc <= block.startPc
+                && !doWhileHeaders.contains(block.trueSuccessor.startPc)) {
+                BasicBlock header = block.trueSuccessor;
+                // Skip if header is a conditional that forms a while(condition) loop
+                // (i.e., one of its successors has a back-edge to it)
+                boolean isWhileCondition = false;
+                if (header.isConditional()) {
+                    BasicBlock trueSucc = header.falseSuccessor; // fall-through
+                    if (trueSucc != null && hasBackEdgeTo(header.startPc, trueSucc)) {
+                        isWhileCondition = true;
+                    }
+                }
+                if (isWhileCondition) continue;
+                int headerPc = header.startPc;
+                Integer existing = whileTrueHeaders.get(headerPc);
+                if (existing == null || block.startPc > existing.intValue()) {
+                    whileTrueHeaders.put(headerPc, Integer.valueOf(block.startPc));
+                }
+            }
+        }
+        // END_CHANGE: BUG-2026-0026-2
 
         // Pre-compute merge points for conditional blocks to avoid repeated O(n) scans
         precomputedMergePoints.clear();
@@ -180,6 +210,51 @@ public class StructuredFlowBuilder {
                     return;
                 }
             }
+
+            // START_CHANGE: BUG-2026-0026-20260325-3 - Detect while(true) loops from unconditional backward gotos
+            if (whileTrueHeaders.containsKey(block.startPc) && !visited.contains(block.startPc)) {
+                int gotoSourcePc = whileTrueHeaders.get(block.startPc).intValue();
+                whileTrueHeaders.remove(block.startPc);
+                // Find the block after the goto (the exit point of the loop)
+                BasicBlock gotoBlock = null;
+                int exitPc = -1;
+                for (BasicBlock b : cfg.getBlocks()) {
+                    if (b.isGoto() && b.startPc == gotoSourcePc) {
+                        gotoBlock = b;
+                        // Exit is the next block after the goto block
+                        if (b.endPc < cfg.getBlocks().get(cfg.getBlocks().size() - 1).endPc) {
+                            BasicBlock exitBlock = cfg.getBlockAtPc(b.endPc);
+                            if (exitBlock != null) {
+                                exitPc = exitBlock.startPc;
+                            }
+                        }
+                        break;
+                    }
+                }
+                // Build the loop body: from block up to the goto source block (inclusive)
+                // Use a new visited set for the body but share the goto-block boundary
+                List<Statement> bodyStmts = new ArrayList<Statement>();
+                // The stopPc for the body is: the block AFTER the goto block
+                // We use the goto block's endPc as a reasonable boundary
+                int bodyStopPc = gotoBlock != null ? gotoBlock.endPc : -1;
+                buildFromBlock(block, bodyStmts, visited, bodyStopPc);
+
+                int bodyLine = block.lineNumber > 0 ? block.lineNumber : 0;
+                output.add(new WhileStatement(bodyLine,
+                    new BooleanExpression(bodyLine, true),
+                    new BlockStatement(bodyLine, bodyStmts)));
+
+                // Continue from exit block if any
+                if (exitPc >= 0) {
+                    BasicBlock exitBlock = cfg.getBlockAtPc(exitPc);
+                    if (exitBlock != null && !visited.contains(exitBlock.startPc)) {
+                        block = exitBlock;
+                        continue;
+                    }
+                }
+                return;
+            }
+            // END_CHANGE: BUG-2026-0026-3
 
             visited.add(block.startPc);
 
@@ -525,6 +600,13 @@ public class StructuredFlowBuilder {
                             visited.add(mergeBlock.startPc);
                             boolean pureReturn = mergeBlock.isReturn()
                                 && (mergeBlock.statements == null || mergeBlock.statements.isEmpty());
+                            // START_CHANGE: BUG-2026-0025-20260325-1 - Treat merge block with single ReturnStatement as pure return for ternary
+                            if (!pureReturn && mergeBlock.isReturn()
+                                && mergeBlock.statements != null && mergeBlock.statements.size() == 1
+                                && mergeBlock.statements.get(0) instanceof ReturnStatement) {
+                                pureReturn = true;
+                            }
+                            // END_CHANGE: BUG-2026-0025-1
                             if (pureReturn) {
                                 // return condition ? A : B;
                                 preStatements.add(new ReturnStatement(line, ternary));
@@ -730,8 +812,19 @@ public class StructuredFlowBuilder {
 
         // If branch target is after all the then-block, it's the merge point
         if (falseTarget.startPc > trueTarget.startPc) {
-            // Check if there's a goto at the end of the true path that goes to false target or beyond
-            BasicBlock endOfTrue = findBlockEnd(trueTarget, falseTarget.startPc);
+            // START_CHANGE: BUG-2026-0032-20260325-2 - Non-recursive end-of-true scan
+            // Find the last goto in the true-path region (without calling findBlockEnd to avoid recursion)
+            BasicBlock endOfTrue = null;
+            for (BasicBlock b : cfg.getBlocks()) {
+                if (b.startPc >= trueTarget.startPc && b.startPc < falseTarget.startPc) {
+                    if (b.isGoto()) {
+                        if (endOfTrue == null || b.startPc > endOfTrue.startPc) {
+                            endOfTrue = b;
+                        }
+                    }
+                }
+            }
+            // END_CHANGE: BUG-2026-0032-2
             if (endOfTrue != null && endOfTrue.isGoto()) {
                 return endOfTrue.branchTargetPc;
             }
@@ -800,33 +893,49 @@ public class StructuredFlowBuilder {
             last = current;
 
             if (current.isGoto() || current.isReturn() || current.isThrow()) break;
-            // START_CHANGE: ISS-2026-0001-20260323-2 - Skip past nested conditionals by finding their merge point
+            // START_CHANGE: BUG-2026-0032-20260325-1 - Skip nested conditionals without recursion
             if (current.isConditional()) {
-                // Try to find the merge point of this nested conditional and continue from there
-                int nestedMerge = computeMergePointImpl(current,
-                    current.falseSuccessor, current.trueSuccessor);
-                if (nestedMerge >= 0 && nestedMerge < beforePc) {
-                    BasicBlock mergeBlock = cfg.getBlockAtPc(nestedMerge);
-                    if (mergeBlock != null && !seen.contains(mergeBlock.startPc)) {
-                        current = mergeBlock;
-                        continue;
-                    }
-                }
-                // If the nested merge equals beforePc, find the last goto block in the
-                // nested region that targets the merge point (this is the effective end)
-                if (nestedMerge >= 0 && nestedMerge == beforePc) {
-                    BasicBlock bestGoto = null;
+                // Instead of recursively computing merge points (which causes StackOverflow
+                // on deeply nested JDK classes), use a simple heuristic:
+                // Scan forward from the conditional's branch target to find the first block
+                // that both branches can reach (the goto targets in the region)
+                BasicBlock branchTarget = current.trueSuccessor; // branch target (usually farther)
+                BasicBlock fallThrough = current.falseSuccessor;
+
+                if (branchTarget != null && branchTarget.startPc < beforePc
+                    && fallThrough != null && fallThrough.startPc < beforePc) {
+                    // The merge is likely the farther of the two targets
+                    int candidateMerge = Math.max(branchTarget.startPc, fallThrough.startPc);
+                    // Or look for goto targets in the region that point beyond the conditional
+                    int bestMerge = -1;
                     for (BasicBlock b : cfg.getBlocks()) {
-                        if (b.startPc >= current.startPc && b.startPc < beforePc) {
-                            if (b.isGoto() && b.branchTargetPc == beforePc) {
+                        if (b.startPc >= current.startPc && b.startPc < beforePc && b.isGoto()) {
+                            if (b.branchTargetPc >= candidateMerge && b.branchTargetPc <= beforePc) {
+                                if (bestMerge < 0 || b.branchTargetPc < bestMerge) {
+                                    bestMerge = b.branchTargetPc;
+                                }
+                            }
+                        }
+                    }
+                    if (bestMerge > 0 && bestMerge < beforePc) {
+                        BasicBlock mergeBlock = cfg.getBlockAtPc(bestMerge);
+                        if (mergeBlock != null && !seen.contains(mergeBlock.startPc)) {
+                            current = mergeBlock;
+                            continue;
+                        }
+                    }
+                    if (bestMerge > 0 && bestMerge == beforePc) {
+                        // The merge IS the beforePc - find the last goto pointing there
+                        BasicBlock bestGoto = null;
+                        for (BasicBlock b : cfg.getBlocks()) {
+                            if (b.startPc >= current.startPc && b.startPc < beforePc
+                                && b.isGoto() && b.branchTargetPc == beforePc) {
                                 if (bestGoto == null || b.startPc > bestGoto.startPc) {
                                     bestGoto = b;
                                 }
                             }
                         }
-                    }
-                    if (bestGoto != null) {
-                        return bestGoto;
+                        if (bestGoto != null) return bestGoto;
                     }
                 }
                 break;
@@ -1028,27 +1137,39 @@ public class StructuredFlowBuilder {
      * Check if a conditional block can form a ternary expression.
      * Both of its branches must produce values (or be nested ternaries themselves).
      */
+    // START_CHANGE: BUG-2026-0032-20260325-3 - Fix infinite recursion in ternary detection
     private boolean canFormTernary(BasicBlock condBlock, Set<Integer> visited) {
+        // Guard: if we've already visited this block, it's a cycle (loop), not a ternary
+        if (visited.contains(condBlock.startPc)) return false;
+        visited.add(condBlock.startPc);
+
         BasicBlock tTrue = condBlock.falseSuccessor;  // fall-through = true
         BasicBlock tFalse = condBlock.trueSuccessor;   // branch = false
         if (tTrue == null || tFalse == null) return false;
 
+        // A ternary branch must be a "value producer": has a stackTopExpression and no statements
         boolean trueOk = tTrue.stackTopExpression != null &&
             (tTrue.statements == null || tTrue.statements.isEmpty()) &&
             (tTrue.isGoto() || tTrue.type == BasicBlock.FALL_THROUGH);
         boolean falseOk = tFalse.stackTopExpression != null &&
             (tFalse.statements == null || tFalse.statements.isEmpty());
 
-        // Allow one level of nesting
-        if (!trueOk && tTrue.isConditional() && !visited.contains(tTrue.startPc)) {
-            trueOk = canFormTernarySimple(tTrue);
+        // Nested ternary: a branch is itself a conditional that forms a ternary
+        // Only recurse on FORWARD conditionals (target PC > current PC) to prevent loops
+        if (!trueOk && tTrue.isConditional()
+            && tTrue.startPc > condBlock.startPc
+            && !visited.contains(tTrue.startPc)) {
+            trueOk = canFormTernary(tTrue, visited);
         }
-        if (!falseOk && tFalse.isConditional() && !visited.contains(tFalse.startPc)) {
-            falseOk = canFormTernarySimple(tFalse);
+        if (!falseOk && tFalse.isConditional()
+            && tFalse.startPc > condBlock.startPc
+            && !visited.contains(tFalse.startPc)) {
+            falseOk = canFormTernary(tFalse, visited);
         }
 
         return trueOk && falseOk;
     }
+    // END_CHANGE: BUG-2026-0032-3
 
     /**
      * Simple (non-recursive) check: both branches of condBlock produce values.
