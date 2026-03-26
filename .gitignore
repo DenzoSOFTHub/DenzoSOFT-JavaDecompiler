@@ -8,6 +8,5 @@ target/
 .project
 .classpath
 .claude/
-CLAUDE.md
 *.trace
 /tmp/
