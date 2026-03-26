@@ -2,6 +2,28 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.3.0] - 2026-03-26
+
+### Added
+- Line number alignment: decompiled output preserves original source line numbers
+- Implicit `super()` to Object suppressed (not shown when redundant)
+- `while(true)` loop reconstruction
+- Nested ternary support (3+ levels): `x > 0 ? "pos" : x < 0 ? "neg" : "zero"`
+- 4+ chained `&&`/`||` operators fully combined
+- Anonymous class display name: `new Comparator()` instead of `new 1()`
+- Generic cast preservation: `return (T) obj`
+
+### Fixed
+- StackOverflow on complex JDK classes (iterative expression writing)
+- Mutual recursion in CFG merge point computation eliminated
+- Lambda predicate body: `s -> !s.isEmpty()` correctly decompiled
+- Multi-field `equals()`: `id == t.id && Double.compare(score, t.score) == 0`
+- Method reference: `String::compareToIgnoreCase`
+
+### Performance
+- 27,034 JDK 25 classes decompiled with ZERO errors in 7.2 seconds
+- 3,770 classes/sec throughput on JDK
+
 ## [1.2.0] - 2026-03-25
 
 ### Added
