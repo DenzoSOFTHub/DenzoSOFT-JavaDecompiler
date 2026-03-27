@@ -220,7 +220,7 @@ public class DecompilerGui extends JFrame {
         JLabel welcomeLabel = new JLabel(
                 "<html><center><h1>DenzoSOFT Java Decompiler</h1>"
                 + "<p>Open a JAR file using File &rarr; Open JAR (Ctrl+O)</p>"
-                + "<p>or drag and drop a .jar file onto this window.</p>"
+                + "<p>or drag and drop a .jar/.war/.ear/.apk file onto this window.</p>"
                 + "<br/><p style='color:gray'>Version " + DenzoDecompiler.getVersion() + "</p></center></html>",
                 SwingConstants.CENTER);
         welcomePanel.add(welcomeLabel, BorderLayout.CENTER);
@@ -239,7 +239,8 @@ public class DecompilerGui extends JFrame {
                         List files = (List) t.getTransferData(DataFlavor.javaFileListFlavor);
                         for (int i = 0; i < files.size(); i++) {
                             File f = (File) files.get(i);
-                            if (f.getName().endsWith(".jar")) {
+                            String fn = f.getName().toLowerCase();
+                            if (fn.endsWith(".jar") || fn.endsWith(".war") || fn.endsWith(".ear") || fn.endsWith(".apk")) {
                                 openJar(f);
                             }
                         }
@@ -280,14 +281,19 @@ public class DecompilerGui extends JFrame {
 
     private void doOpenJar() {
         JFileChooser chooser = new JFileChooser();
+        // START_CHANGE: IMP-2026-0010-20260327-4 - Support JAR, WAR, EAR, APK files
         chooser.setFileFilter(new javax.swing.filechooser.FileFilter() {
             public boolean accept(File f) {
-                return f.isDirectory() || f.getName().endsWith(".jar");
+                if (f.isDirectory()) return true;
+                String name = f.getName().toLowerCase();
+                return name.endsWith(".jar") || name.endsWith(".war")
+                    || name.endsWith(".ear") || name.endsWith(".apk");
             }
             public String getDescription() {
-                return "JAR Files (*.jar)";
+                return "Archives (*.jar, *.war, *.ear, *.apk)";
             }
         });
+        // END_CHANGE: IMP-2026-0010-4
         chooser.setMultiSelectionEnabled(true);
         int result = chooser.showOpenDialog(this);
         if (result == JFileChooser.APPROVE_OPTION) {
@@ -375,7 +381,8 @@ public class DecompilerGui extends JFrame {
                 DecompilerGui gui = new DecompilerGui();
                 gui.setVisible(true);
                 for (int i = 0; i < args.length; i++) {
-                    if (args[i].endsWith(".jar")) {
+                    String argLower = args[i].toLowerCase();
+                    if (argLower.endsWith(".jar") || argLower.endsWith(".war") || argLower.endsWith(".ear") || argLower.endsWith(".apk")) {
                         gui.openJar(new File(args[i]));
                     }
                 }

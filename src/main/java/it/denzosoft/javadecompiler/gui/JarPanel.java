@@ -46,38 +46,225 @@ public class JarPanel extends JPanel {
     private JSplitPane splitPane;
     private DecompilerGui parentGui;
     private Map openedTabs; // entryName -> tab index tracking
+    // START_CHANGE: IMP-2026-0010-20260327-1 - Multi-tab navigation: content/classes/libraries
+    private JTabbedPane navTabs;
+    private String archiveType; // "jar", "war", "ear", "apk", "springboot"
+    // END_CHANGE: IMP-2026-0010-1
 
     public JarPanel(File file, DecompilerGui parentGui) throws IOException {
         this.jarFileRef = file;
         this.jarFile = new JarFile(file);
         this.parentGui = parentGui;
         this.openedTabs = new HashMap();
+        this.archiveType = detectArchiveType(file);
 
         setLayout(new BorderLayout());
 
         editorTabs = new JTabbedPane();
         editorTabs.setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
 
-        buildTree();
+        // START_CHANGE: IMP-2026-0010-20260327-2 - Build multi-tab navigation panel
+        navTabs = new JTabbedPane(JTabbedPane.BOTTOM);
+        buildContentTree();
+        buildClassTree();
+        buildLibTree();
+        navTabs.setMinimumSize(new Dimension(250, 100));
+        // END_CHANGE: IMP-2026-0010-2
 
-        JScrollPane treeScroll = new JScrollPane(tree);
-        treeScroll.setMinimumSize(new Dimension(250, 100));
-
-        splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, treeScroll, editorTabs);
+        splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, navTabs, editorTabs);
         splitPane.setDividerLocation(300);
         splitPane.setOneTouchExpandable(true);
 
         add(splitPane, BorderLayout.CENTER);
     }
 
-    private void buildTree() {
+    // START_CHANGE: IMP-2026-0010-20260327-3 - Detect archive type
+    private static String detectArchiveType(File file) {
+        String name = file.getName().toLowerCase();
+        if (name.endsWith(".war")) return "war";
+        if (name.endsWith(".ear")) return "ear";
+        if (name.endsWith(".apk")) return "apk";
+        // Spring Boot fat JAR: contains BOOT-INF/
+        // Check lazily when building tree
+        return "jar";
+    }
+    // END_CHANGE: IMP-2026-0010-3
+
+    private void buildContentTree() {
         DefaultMutableTreeNode root = buildTreeFromJar();
         tree = new JTree(root);
         tree.setRootVisible(true);
         tree.setShowsRootHandles(true);
+        setupTreeRenderer(tree);
+        setupTreeListener(tree);
+        navTabs.addTab("Content", new JScrollPane(tree));
+    }
 
-        // Custom cell renderer for icons
-        tree.setCellRenderer(new DefaultTreeCellRenderer() {
+    private void buildClassTree() {
+        // START_CHANGE: IMP-2026-0011-20260327-2 - For APK, show DEX class list
+        if ("apk".equals(archiveType)) {
+            DefaultMutableTreeNode root = buildDexClassTree();
+            if (root != null) {
+                JTree dexTree = new JTree(root);
+                dexTree.setRootVisible(true);
+                dexTree.setShowsRootHandles(true);
+                setupTreeRenderer(dexTree);
+                navTabs.addTab("DEX Classes", new JScrollPane(dexTree));
+                return;
+            }
+        }
+        // END_CHANGE: IMP-2026-0011-2
+        DefaultMutableTreeNode root = buildFilteredTree(true, false);
+        JTree classTree = new JTree(root);
+        classTree.setRootVisible(true);
+        classTree.setShowsRootHandles(true);
+        setupTreeRenderer(classTree);
+        setupTreeListener(classTree);
+        navTabs.addTab("Classes", new JScrollPane(classTree));
+    }
+
+    private void buildLibTree() {
+        DefaultMutableTreeNode root = buildFilteredTree(false, true);
+        JTree libTree = new JTree(root);
+        libTree.setRootVisible(true);
+        libTree.setShowsRootHandles(true);
+        setupTreeRenderer(libTree);
+        setupTreeListener(libTree);
+        navTabs.addTab("Libraries", new JScrollPane(libTree));
+    }
+
+    /**
+     * Build a filtered tree.
+     * @param classesOnly if true, show only .class files not in lib directories
+     * @param libsOnly if true, show only .jar files from lib directories
+     */
+    private DefaultMutableTreeNode buildFilteredTree(boolean classesOnly, boolean libsOnly) {
+        String jarName = jarFileRef.getName();
+        DefaultMutableTreeNode root = new DefaultMutableTreeNode(
+                new TreeNodeData(jarName, "", true, false, false));
+        Map packageNodes = new HashMap();
+
+        Enumeration entries = jarFile.entries();
+        List entryList = new ArrayList();
+        while (entries.hasMoreElements()) {
+            JarEntry entry = (JarEntry) entries.nextElement();
+            if (entry.isDirectory()) continue;
+            String name = entry.getName();
+
+            if (classesOnly) {
+                // Show .class files NOT in lib directories
+                if (!name.endsWith(".class")) continue;
+                if (isLibPath(name)) continue;
+                // Strip WAR/Spring Boot prefix for clean display
+                String stripped = stripContainerPrefix(name);
+                if (stripped != null) name = stripped;
+            }
+            if (libsOnly) {
+                // Show .jar files from lib directories
+                if (!name.endsWith(".jar")) continue;
+                if (!isLibPath(name) && !name.endsWith(".jar")) continue;
+            }
+            entryList.add(new String[]{name, ((JarEntry)entry).getName()});
+        }
+
+        Collections.sort(entryList, new Comparator() {
+            public int compare(Object o1, Object o2) {
+                return ((String[]) o1)[0].compareTo(((String[]) o2)[0]);
+            }
+        });
+
+        for (int i = 0; i < entryList.size(); i++) {
+            String[] info = (String[]) entryList.get(i);
+            String displayName = info[0];
+            String fullPath = info[1];
+
+            String pkg = "";
+            String fileName = displayName;
+            int lastSlash = displayName.lastIndexOf('/');
+            if (lastSlash >= 0) {
+                pkg = displayName.substring(0, lastSlash);
+                fileName = displayName.substring(lastSlash + 1);
+            }
+
+            DefaultMutableTreeNode parent = getOrCreatePackageNode(root, packageNodes, pkg);
+            boolean isClass = fileName.endsWith(".class");
+            boolean isJar = fileName.endsWith(".jar");
+            parent.add(new DefaultMutableTreeNode(
+                    new TreeNodeData(fileName, fullPath, false, isClass, isJar)));
+        }
+
+        sortTreeNode(root);
+        return root;
+    }
+
+    // START_CHANGE: IMP-2026-0011-20260327-3 - Build DEX class tree for APK
+    private DefaultMutableTreeNode buildDexClassTree() {
+        try {
+            DefaultMutableTreeNode root = new DefaultMutableTreeNode(
+                new TreeNodeData("DEX Classes", "", true, false, false));
+            Map packageNodes = new HashMap();
+
+            // Find all classes.dex files in the APK
+            Enumeration entries = jarFile.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry entry = (JarEntry) entries.nextElement();
+                if (entry.getName().endsWith(".dex")) {
+                    java.io.InputStream is = jarFile.getInputStream(entry);
+                    byte[] dexData;
+                    try {
+                        dexData = it.denzosoft.javadecompiler.util.DexParser.readAllBytes(is);
+                    } finally {
+                        is.close();
+                    }
+                    it.denzosoft.javadecompiler.util.DexParser.DexInfo info =
+                        it.denzosoft.javadecompiler.util.DexParser.parse(dexData);
+
+                    for (int i = 0; i < info.classNames.size(); i++) {
+                        String className = (String) info.classNames.get(i);
+                        String pkg = "";
+                        String simpleName = className;
+                        int lastDot = className.lastIndexOf('.');
+                        if (lastDot >= 0) {
+                            pkg = className.substring(0, lastDot).replace('.', '/');
+                            simpleName = className.substring(lastDot + 1);
+                        }
+                        DefaultMutableTreeNode parent = getOrCreatePackageNode(root, packageNodes, pkg);
+                        parent.add(new DefaultMutableTreeNode(
+                            new TreeNodeData(simpleName, "dex:" + className, false, true, false)));
+                    }
+                }
+            }
+            sortTreeNode(root);
+            return root;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+    // END_CHANGE: IMP-2026-0011-3
+
+    private boolean isLibPath(String name) {
+        // WAR: WEB-INF/lib/
+        if (name.startsWith("WEB-INF/lib/")) return true;
+        // Spring Boot: BOOT-INF/lib/
+        if (name.startsWith("BOOT-INF/lib/")) return true;
+        // EAR: lib/
+        if (name.startsWith("lib/") && "ear".equals(archiveType)) return true;
+        // APK: lib/
+        if (name.startsWith("lib/") && "apk".equals(archiveType)) return true;
+        return false;
+    }
+
+    private String stripContainerPrefix(String name) {
+        // WAR: WEB-INF/classes/ → strip prefix
+        if (name.startsWith("WEB-INF/classes/")) return name.substring(16);
+        // Spring Boot: BOOT-INF/classes/
+        if (name.startsWith("BOOT-INF/classes/")) return name.substring(17);
+        return null;
+    }
+
+    private void setupTreeRenderer(JTree targetTree) {
+
+        targetTree.setCellRenderer(new DefaultTreeCellRenderer() {
             private Icon packageIcon = UIManager.getIcon("FileView.directoryIcon");
             private Icon classIcon = UIManager.getIcon("FileView.fileIcon");
             private Icon jarIcon = UIManager.getIcon("FileView.hardDriveIcon");
@@ -103,12 +290,13 @@ public class JarPanel extends JPanel {
                 return comp;
             }
         });
+    }
 
-        // Double-click to open
-        tree.addMouseListener(new MouseAdapter() {
+    private void setupTreeListener(final JTree targetTree) {
+        targetTree.addMouseListener(new MouseAdapter() {
             public void mouseClicked(MouseEvent e) {
                 if (e.getClickCount() == 2) {
-                    TreePath path = tree.getPathForLocation(e.getX(), e.getY());
+                    TreePath path = targetTree.getPathForLocation(e.getX(), e.getY());
                     if (path != null) {
                         DefaultMutableTreeNode node = (DefaultMutableTreeNode) path.getLastPathComponent();
                         Object userObj = node.getUserObject();
@@ -241,6 +429,21 @@ public class JarPanel extends JPanel {
         if (entryName == null || entryName.length() == 0) {
             return;
         }
+        // START_CHANGE: IMP-2026-0011-20260327-4 - Handle DEX class entries (info only)
+        if (entryName.startsWith("dex:")) {
+            String className = entryName.substring(4);
+            String info = "// DEX Class: " + className + "\n"
+                + "// Source: " + jarFileRef.getName() + "\n"
+                + "//\n"
+                + "// This class is in Dalvik DEX format (Android bytecode).\n"
+                + "// Full decompilation of DEX bytecode is not yet supported.\n"
+                + "// Use --deobfuscate with dex2jar to convert to JAR first.\n";
+            SourcePanel panel = new SourcePanel(entryName, info);
+            editorTabs.addTab(className.substring(className.lastIndexOf('.') + 1), panel);
+            editorTabs.setSelectedIndex(editorTabs.getTabCount() - 1);
+            return;
+        }
+        // END_CHANGE: IMP-2026-0011-4
 
         // Check if already open
         for (int i = 0; i < editorTabs.getTabCount(); i++) {

@@ -132,10 +132,13 @@ public class Main {
                 BatchDecompiler.BatchResult result;
                 if (input.isDirectory()) {
                     result = batch.decompileDirectory(input);
-                } else if (input.getName().endsWith(".jar")) {
+                // START_CHANGE: IMP-2026-0010-20260327-5 - Support WAR/EAR/APK in batch mode
+                } else if (input.getName().endsWith(".jar") || input.getName().endsWith(".war")
+                        || input.getName().endsWith(".ear") || input.getName().endsWith(".apk")) {
                     result = batch.decompileJar(input);
+                // END_CHANGE: IMP-2026-0010-5
                 } else {
-                    System.err.println("Error: batch input must be a .jar file or directory");
+                    System.err.println("Error: batch input must be a .jar/.war/.ear/.apk file or directory");
                     System.exit(1);
                     return;
                 }
