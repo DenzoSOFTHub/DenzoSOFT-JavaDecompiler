@@ -40,22 +40,29 @@ public class BatchDecompiler {
     private boolean alignLines;
     private boolean showBytecode;
     private boolean showNativeInfo;
+    private boolean deobfuscate;
 
     public BatchDecompiler(File outputDir, int threadCount) {
-        this(outputDir, threadCount, true, false, false);
+        this(outputDir, threadCount, true, false, false, false);
     }
 
     public BatchDecompiler(File outputDir, int threadCount, boolean alignLines) {
-        this(outputDir, threadCount, alignLines, false, false);
+        this(outputDir, threadCount, alignLines, false, false, false);
     }
 
     public BatchDecompiler(File outputDir, int threadCount, boolean alignLines,
                            boolean showBytecode, boolean showNativeInfo) {
+        this(outputDir, threadCount, alignLines, showBytecode, showNativeInfo, false);
+    }
+
+    public BatchDecompiler(File outputDir, int threadCount, boolean alignLines,
+                           boolean showBytecode, boolean showNativeInfo, boolean deobfuscate) {
         this.outputDir = outputDir;
         this.threadCount = threadCount;
         this.alignLines = alignLines;
         this.showBytecode = showBytecode;
         this.showNativeInfo = showNativeInfo;
+        this.deobfuscate = deobfuscate;
     }
     // END_CHANGE: IMP-LINES-3
 
@@ -70,33 +77,32 @@ public class BatchDecompiler {
 
         final JarFile jar = new JarFile(jarFile);
         try {
-            // Collect all class entries
-            List<JarEntry> classEntries = new ArrayList<JarEntry>();
+            // START_CHANGE: BUG-2026-0037-20260327-1 - Load all classes, decompile only top-level
+            // Pre-read ALL class data into a shared map (for inner class resolution)
+            final Map<String, byte[]> allClassData = new HashMap<String, byte[]>();
+            List<String> topLevelClasses = new ArrayList<String>();
             Enumeration entries = jar.entries();
             while (entries.hasMoreElements()) {
                 JarEntry entry = (JarEntry) entries.nextElement();
-                if (entry.getName().endsWith(".class")) {
-                    classEntries.add(entry);
-                }
-            }
-
-            result.totalClasses = classEntries.size();
-
-            // Pre-read all class data (JarFile is not thread-safe for concurrent reads)
-            final List<String> classNames = new ArrayList<String>();
-            final List<byte[]> classDataList = new ArrayList<byte[]>();
-            for (int i = 0; i < classEntries.size(); i++) {
-                JarEntry entry = classEntries.get(i);
                 String entryName = entry.getName();
-                String className = entryName.substring(0, entryName.length() - 6); // remove .class
-                classNames.add(className);
-                InputStream is = jar.getInputStream(entry);
-                try {
-                    classDataList.add(readAllBytes(is));
-                } finally {
-                    is.close();
+                if (entryName.endsWith(".class")) {
+                    String className = entryName.substring(0, entryName.length() - 6);
+                    InputStream is = jar.getInputStream(entry);
+                    try {
+                        allClassData.put(className, readAllBytes(is));
+                    } finally {
+                        is.close();
+                    }
+                    // Only decompile top-level classes (inner classes are inlined by the decompiler)
+                    if (className.indexOf('$') < 0) {
+                        topLevelClasses.add(className);
+                    }
                 }
             }
+
+            final List<String> classNames = topLevelClasses;
+            result.totalClasses = classNames.size();
+            // END_CHANGE: BUG-2026-0037-1
 
             // Process with thread pool
             // START_CHANGE: BUG-2026-0032-20260325-7 - Use ThreadFactory with 2MB stack for complex JDK classes
@@ -112,14 +118,12 @@ public class BatchDecompiler {
             try {
                 List<Future> futures = new ArrayList<Future>();
                 for (int i = 0; i < classNames.size(); i++) {
-                    final int idx = i;
-                    final String className = classNames.get(idx);
-                    final byte[] classData = classDataList.get(idx);
+                    final String className = classNames.get(i);
 
                     futures.add(executor.submit(new Callable<Object>() {
                         public Object call() {
                             try {
-                                decompileClass(className, classData);
+                                decompileClassWithLoader(className, allClassData);
                             } catch (Exception e) {
                                 errors.add(className);
                             }
@@ -154,31 +158,39 @@ public class BatchDecompiler {
         final BatchResult result = new BatchResult();
         final List<String> errors = Collections.synchronizedList(new ArrayList<String>());
 
-        // Collect all .class files recursively
-        List<File> classFiles = new ArrayList<File>();
-        collectClassFiles(classDir, classFiles);
-        result.totalClasses = classFiles.size();
+        // START_CHANGE: BUG-2026-0037-20260327-4 - Pre-load all classes for inner class resolution
+        List<File> allClassFiles = new ArrayList<File>();
+        collectClassFiles(classDir, allClassFiles);
+        final Map<String, byte[]> allClassData = new HashMap<String, byte[]>();
+        List<String> topLevelClasses = new ArrayList<String>();
+        for (int i = 0; i < allClassFiles.size(); i++) {
+            File classFile = allClassFiles.get(i);
+            String relativePath = getRelativePath(classDir, classFile);
+            String className = relativePath.substring(0, relativePath.length() - 6);
+            FileInputStream fis = new FileInputStream(classFile);
+            try {
+                allClassData.put(className, readAllBytes(fis));
+            } finally {
+                fis.close();
+            }
+            if (className.indexOf('$') < 0) {
+                topLevelClasses.add(className);
+            }
+        }
+        result.totalClasses = topLevelClasses.size();
+        // END_CHANGE: BUG-2026-0037-4
 
         // Process with thread pool
         ExecutorService executor = Executors.newFixedThreadPool(threadCount);
         try {
             List<Future> futures = new ArrayList<Future>();
-            for (int i = 0; i < classFiles.size(); i++) {
-                final File classFile = classFiles.get(i);
-                final String relativePath = getRelativePath(classDir, classFile);
-                final String className = relativePath.substring(0, relativePath.length() - 6); // remove .class
+            for (int i = 0; i < topLevelClasses.size(); i++) {
+                final String className = topLevelClasses.get(i);
 
                 futures.add(executor.submit(new Callable<Object>() {
                     public Object call() {
                         try {
-                            FileInputStream fis = new FileInputStream(classFile);
-                            byte[] data;
-                            try {
-                                data = readAllBytes(fis);
-                            } finally {
-                                fis.close();
-                            }
-                            decompileClass(className, data);
+                            decompileClassWithLoader(className, allClassData);
                         } catch (Exception e) {
                             errors.add(className);
                         }
@@ -202,27 +214,30 @@ public class BatchDecompiler {
         return result;
     }
 
-    private void decompileClass(String className, final byte[] classData) throws Exception {
+    // START_CHANGE: BUG-2026-0037-20260327-3 - Loader with access to all classes for inner class resolution
+    private void decompileClassWithLoader(String className, final Map<String, byte[]> allClassData) throws Exception {
         DenzoDecompiler decompiler = new DenzoDecompiler();
         StringCollector collector = new StringCollector(alignLines);
 
         Loader loader = new Loader() {
             public boolean canLoad(String internalName) {
-                return true;
+                return allClassData.containsKey(internalName);
             }
 
             public byte[] load(String internalName) {
-                return classData;
+                return (byte[]) allClassData.get(internalName);
             }
         };
 
         Map<String, Object> config = null;
-        if (showBytecode || showNativeInfo) {
+        if (showBytecode || showNativeInfo || deobfuscate) {
             config = new HashMap<String, Object>();
             if (showBytecode) config.put("showBytecode", Boolean.TRUE);
             if (showNativeInfo) config.put("showNativeInfo", Boolean.TRUE);
+            if (deobfuscate) config.put("deobfuscate", Boolean.TRUE);
         }
         decompiler.decompile(loader, collector, className, config);
+    // END_CHANGE: BUG-2026-0037-3
 
         // Write output maintaining package directory structure
         String outputPath = className.replace('/', File.separatorChar) + ".java";

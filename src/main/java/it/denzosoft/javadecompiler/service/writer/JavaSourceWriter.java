@@ -13,6 +13,7 @@ import it.denzosoft.javadecompiler.model.javasyntax.type.*;
 import it.denzosoft.javadecompiler.model.message.Message;
 import it.denzosoft.javadecompiler.model.processor.Processor;
 import it.denzosoft.javadecompiler.service.converter.JavaSyntaxResult;
+import it.denzosoft.javadecompiler.util.IdentifierSanitizer;
 import it.denzosoft.javadecompiler.util.SignatureParser;
 import it.denzosoft.javadecompiler.util.StringConstants;
 import it.denzosoft.javadecompiler.util.TypeNameUtil;
@@ -36,6 +37,12 @@ public class JavaSourceWriter implements Processor {
     // START_CHANGE: IMP-LINES-20260326-7 - Output flags from configuration
     private boolean showBytecode;
     private boolean showNativeInfo;
+    private boolean deobfuscate;
+    // START_CHANGE: BUG-2026-0044-20260327-2 - Current result for anonymous class body inlining
+    private JavaSyntaxResult currentResult;
+    // END_CHANGE: BUG-2026-0044-2
+    /** Current method's bytecode instructions map (line -> instructions), null if not showing bytecode */
+    private java.util.Map<Integer, java.util.List<String>> currentBytecodeInstructions;
     // END_CHANGE: IMP-LINES-7
 
     @Override
@@ -51,6 +58,7 @@ public class JavaSourceWriter implements Processor {
         Map<String, Object> config = message.getHeader("configuration");
         showBytecode = config != null && Boolean.TRUE.equals(config.get("showBytecode"));
         showNativeInfo = config != null && Boolean.TRUE.equals(config.get("showNativeInfo"));
+        deobfuscate = config != null && Boolean.TRUE.equals(config.get("deobfuscate"));
         // END_CHANGE: IMP-LINES-8
 
         // START_CHANGE: LIM-0006-20260324-2 - Store major version for text block detection
@@ -93,6 +101,62 @@ public class JavaSourceWriter implements Processor {
     }
     // END_CHANGE: BUG-2026-0029-3
 
+    // START_CHANGE: IMP-2026-0005-20260327-2 - Deobfuscation: sanitize identifiers
+    /** Sanitize a name if deobfuscation is enabled. */
+    private String sn(String name, String category) {
+        if (deobfuscate && name != null) {
+            return IdentifierSanitizer.sanitize(name, category);
+        }
+        return name;
+    }
+
+    /** Emit a declaration with sanitized name. */
+    private void emitDecl(Printer printer, int type, String internalName, String name, String descriptor) {
+        String cat = type == Printer.TYPE ? "cls" : (type == Printer.METHOD || type == Printer.CONSTRUCTOR) ? "mtd" : "fld";
+        printer.printDeclaration(type, internalName, sn(name, cat), descriptor);
+    }
+
+    /** Emit a reference with sanitized name. For inner class types, use Outer.Inner format. */
+    private void emitRef(Printer printer, int type, String internalName, String name, String descriptor, String owner) {
+        // START_CHANGE: BUG-2026-0039-20260327-2 - Inner class references use Outer.Inner format
+        String displayName = name;
+        if (type == Printer.TYPE && internalName != null && internalName.indexOf('$') >= 0) {
+            // For anonymous inner classes, use the display name (interface/superclass) if available
+            String anonDisplay = anonymousClassDisplayNames.get(internalName);
+            if (anonDisplay != null) {
+                displayName = sn(anonDisplay, "cls");
+            } else {
+                // Convert "pkg/Outer$Inner$Nested" -> sanitize each part then join with .
+                int lastSlash = internalName.lastIndexOf('/');
+                String afterPkg = lastSlash >= 0 ? internalName.substring(lastSlash + 1) : internalName;
+                String[] parts = afterPkg.split("\\$");
+                StringBuilder sb = new StringBuilder();
+                for (int pi = 0; pi < parts.length; pi++) {
+                    if (pi > 0) sb.append(".");
+                    sb.append(sn(parts[pi], "cls"));
+                }
+                displayName = sb.toString();
+            }
+        } else {
+            displayName = sn(displayName, type == Printer.TYPE ? "cls" : "fld");
+        }
+        // END_CHANGE: BUG-2026-0039-2
+        printer.printReference(type, internalName, displayName, descriptor, owner);
+    }
+    // END_CHANGE: IMP-2026-0005-2
+
+    // START_CHANGE: BUG-2026-0044-20260327-3 - Find inner class result for anonymous class inlining
+    private JavaSyntaxResult findInnerClassResult(JavaSyntaxResult parent, String internalName) {
+        if (parent == null || parent.getInnerClassResults() == null) return null;
+        for (JavaSyntaxResult inner : parent.getInnerClassResults()) {
+            if (internalName.equals(inner.getInternalName())) return inner;
+            JavaSyntaxResult nested = findInnerClassResult(inner, internalName);
+            if (nested != null) return nested;
+        }
+        return null;
+    }
+    // END_CHANGE: BUG-2026-0044-3
+
     private int computeMaxLine(JavaSyntaxResult result) {
         int max = 0;
         for (JavaSyntaxResult.MethodDeclaration m : result.getMethods()) {
@@ -102,6 +166,7 @@ public class JavaSourceWriter implements Processor {
     }
 
     private void writeCompilationUnit(Printer printer, JavaSyntaxResult result) {
+        this.currentResult = result;
         String internalName = result.getInternalName();
         String packageName = TypeNameUtil.packageFromInternal(internalName);
         String simpleName = TypeNameUtil.simpleNameFromInternal(internalName);
@@ -190,7 +255,7 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("class");
         }
         printer.printText(" ");
-        printer.printDeclaration(Printer.TYPE, internalName, simpleName, "");
+        emitDecl(printer,Printer.TYPE, internalName, simpleName, "");
 
         // Type parameters from generic signature
         if (result.getSignature() != null) {
@@ -209,7 +274,7 @@ public class JavaSourceWriter implements Processor {
                 JavaSyntaxResult.RecordComponentInfo comp = comps.get(i);
                 writeType(printer, comp.type, internalName);
                 printer.printText(" ");
-                printer.printText(comp.name);
+                printer.printText(sn(comp.name, "fld"));
             }
             printer.printText(")");
         }
@@ -221,7 +286,7 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             printer.printKeyword("extends");
             printer.printText(" ");
-            printer.printReference(Printer.TYPE, superName, TypeNameUtil.simpleNameFromInternal(superName), "", null);
+            emitRef(printer,Printer.TYPE, superName, TypeNameUtil.simpleNameFromInternal(superName), "", null);
         }
 
         // Implements / extends interfaces
@@ -232,7 +297,7 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             for (int i = 0; i < interfaces.length; i++) {
                 if (i > 0) printer.printText(", ");
-                printer.printReference(Printer.TYPE, interfaces[i],
+                emitRef(printer,Printer.TYPE, interfaces[i],
                     TypeNameUtil.simpleNameFromInternal(interfaces[i]), "", null);
             }
         }
@@ -245,7 +310,7 @@ public class JavaSourceWriter implements Processor {
             for (int i = 0; i < result.getPermittedSubclasses().size(); i++) {
                 if (i > 0) printer.printText(", ");
                 String sub = result.getPermittedSubclasses().get(i);
-                printer.printReference(Printer.TYPE, sub, TypeNameUtil.simpleNameFromInternal(sub), "", null);
+                emitRef(printer,Printer.TYPE, sub, TypeNameUtil.simpleNameFromInternal(sub), "", null);
             }
         }
 
@@ -293,7 +358,7 @@ public class JavaSourceWriter implements Processor {
                         printer.endLine();
                     }
                     printer.startLine(lineNumber++);
-                    printer.printDeclaration(Printer.FIELD, internalName, field.name, field.descriptor);
+                    emitDecl(printer,Printer.FIELD, internalName, field.name, field.descriptor);
                     // Extract constructor arguments from static initializer
                     Expression initExpr = staticInits.get(field.name);
                     if (initExpr instanceof NewExpression) {
@@ -408,18 +473,21 @@ public class JavaSourceWriter implements Processor {
         List<JavaSyntaxResult> innerResults = result.getInnerClassResults();
         if (innerResults != null && !innerResults.isEmpty()) {
             for (JavaSyntaxResult inner : innerResults) {
-                // START_CHANGE: BUG-2026-0029-20260325-6 - Skip blank line for anonymous inner classes
-                String innerSimple = TypeNameUtil.simpleNameFromInternal(
-                    inner.getInternalName() != null ? inner.getInternalName() : "");
-                boolean innerIsAnon = innerSimple.length() > 0;
-                for (int ci = 0; ci < innerSimple.length(); ci++) {
-                    if (!Character.isDigit(innerSimple.charAt(ci))) {
+                // START_CHANGE: BUG-2026-0038-20260327-1 - Skip anonymous inner classes (check after last $)
+                String innerName = inner.getInternalName() != null ? inner.getInternalName() : "";
+                String innerSimple = TypeNameUtil.simpleNameFromInternal(innerName);
+                // Check the part after the last $ for numeric-only (anonymous class indicator)
+                int lastDollar = innerSimple.lastIndexOf('$');
+                String anonPart = lastDollar >= 0 ? innerSimple.substring(lastDollar + 1) : innerSimple;
+                boolean innerIsAnon = anonPart.length() > 0;
+                for (int ci = 0; ci < anonPart.length(); ci++) {
+                    if (!Character.isDigit(anonPart.charAt(ci))) {
                         innerIsAnon = false;
                         break;
                     }
                 }
                 if (innerIsAnon) continue;
-                // END_CHANGE: BUG-2026-0029-6
+                // END_CHANGE: BUG-2026-0038-1
                 printer.startLine(lineNumber++);
                 printer.endLine();
                 lineNumber = writeInnerClass(printer, inner, lineNumber, internalName);
@@ -495,7 +563,7 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("class");
         }
         printer.printText(" ");
-        printer.printDeclaration(Printer.TYPE, innerInternalName, simpleName, "");
+        emitDecl(printer,Printer.TYPE, innerInternalName, simpleName, "");
 
         // Type parameters from generic signature
         if (inner.getSignature() != null) {
@@ -514,7 +582,7 @@ public class JavaSourceWriter implements Processor {
                 JavaSyntaxResult.RecordComponentInfo comp = comps.get(i);
                 writeType(printer, comp.type, innerInternalName);
                 printer.printText(" ");
-                printer.printText(comp.name);
+                printer.printText(sn(comp.name, "fld"));
             }
             printer.printText(")");
         }
@@ -526,7 +594,7 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             printer.printKeyword("extends");
             printer.printText(" ");
-            printer.printReference(Printer.TYPE, superName,
+            emitRef(printer,Printer.TYPE, superName,
                 TypeNameUtil.simpleNameFromInternal(superName), "", null);
         }
 
@@ -538,7 +606,7 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             for (int i = 0; i < interfaces.length; i++) {
                 if (i > 0) printer.printText(", ");
-                printer.printReference(Printer.TYPE, interfaces[i],
+                emitRef(printer,Printer.TYPE, interfaces[i],
                     TypeNameUtil.simpleNameFromInternal(interfaces[i]), "", null);
             }
         }
@@ -587,7 +655,7 @@ public class JavaSourceWriter implements Processor {
                         printer.endLine();
                     }
                     printer.startLine(lineNumber++);
-                    printer.printDeclaration(Printer.FIELD, innerInternalName, field.name, field.descriptor);
+                    emitDecl(printer,Printer.FIELD, innerInternalName, field.name, field.descriptor);
                     // Extract constructor arguments from static initializer
                     Expression initExpr = innerStaticInits.get(field.name);
                     if (initExpr instanceof NewExpression) {
@@ -794,6 +862,7 @@ public class JavaSourceWriter implements Processor {
         printer.endLine();
     }
 
+    // START_CHANGE: BUG-2026-0036-20260327-1 - Collect imports from all types used in class
     private Set<String> collectImports(JavaSyntaxResult result) {
         Set<String> imports = new TreeSet<String>();
         String thisPackage = TypeNameUtil.packageFromInternal(result.getInternalName());
@@ -810,16 +879,194 @@ public class JavaSourceWriter implements Processor {
             }
         }
 
+        // Class generic signature
+        if (result.getSignature() != null) {
+            collectSignatureImports(imports, result.getSignature(), thisPackage);
+        }
+
+        // Collect from fields
+        for (JavaSyntaxResult.FieldDeclaration field : result.getFields()) {
+            addTypeImport(imports, field.type, thisPackage);
+            // START_CHANGE: BUG-2026-0040-20260327-1 - Collect types from generic signatures
+            if (field.signature != null) {
+                collectSignatureImports(imports, field.signature, thisPackage);
+            }
+            // END_CHANGE: BUG-2026-0040-1
+        }
+
+        // Collect from methods
+        for (JavaSyntaxResult.MethodDeclaration method : result.getMethods()) {
+            // Return type
+            addTypeImport(imports, method.returnType, thisPackage);
+            // Parameter types
+            for (Type pt : method.parameterTypes) {
+                addTypeImport(imports, pt, thisPackage);
+            }
+            // Thrown exceptions
+            for (String exc : method.thrownExceptions) {
+                addImport(imports, exc, thisPackage);
+            }
+            // Generic signature types
+            if (method.signature != null) {
+                collectSignatureImports(imports, method.signature, thisPackage);
+            }
+            // Walk body statements for types used in expressions
+            if (method.body != null) {
+                for (Statement stmt : method.body) {
+                    collectStatementImports(imports, stmt, thisPackage);
+                }
+            }
+        }
+
+        // START_CHANGE: BUG-2026-0041-20260327-1 - Collect imports from inner class results too
+        List<JavaSyntaxResult> innerResults = result.getInnerClassResults();
+        if (innerResults != null) {
+            for (JavaSyntaxResult inner : innerResults) {
+                Set<String> innerImports = collectImports(inner);
+                imports.addAll(innerImports);
+            }
+        }
+        // END_CHANGE: BUG-2026-0041-1
+
         return imports;
     }
 
-    private void addImport(Set<String> imports, String internalName, String thisPackage) {
-        if (internalName == null) return;
-        String pkg = TypeNameUtil.packageFromInternal(internalName);
-        if (!pkg.isEmpty() && !"java.lang".equals(pkg) && !pkg.equals(thisPackage)) {
-            imports.add(TypeNameUtil.internalToQualified(internalName));
+    private void addTypeImport(Set<String> imports, Type type, String thisPackage) {
+        if (type instanceof ObjectType) {
+            addImport(imports, ((ObjectType) type).getInternalName(), thisPackage);
+        } else if (type instanceof ArrayType) {
+            Type elem = ((ArrayType) type).getElementType();
+            addTypeImport(imports, elem, thisPackage);
         }
     }
+
+    private void collectStatementImports(Set<String> imports, Statement stmt, String thisPackage) {
+        if (stmt instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) stmt;
+            addTypeImport(imports, vds.getType(), thisPackage);
+            if (vds.hasInitializer()) { collectExprImports(imports, vds.getInitializer(), thisPackage); }
+        } else if (stmt instanceof BlockStatement) {
+            for (Statement s : ((BlockStatement) stmt).getStatements()) {
+                collectStatementImports(imports, s, thisPackage);
+            }
+        } else if (stmt instanceof IfStatement) {
+            collectStatementImports(imports, ((IfStatement) stmt).getThenBody(), thisPackage);
+        } else if (stmt instanceof IfElseStatement) {
+            collectStatementImports(imports, ((IfElseStatement) stmt).getThenBody(), thisPackage);
+            collectStatementImports(imports, ((IfElseStatement) stmt).getElseBody(), thisPackage);
+        } else if (stmt instanceof WhileStatement) {
+            collectStatementImports(imports, ((WhileStatement) stmt).getBody(), thisPackage);
+        } else if (stmt instanceof ForStatement) {
+            collectStatementImports(imports, ((ForStatement) stmt).getBody(), thisPackage);
+            if (((ForStatement) stmt).getInit() != null) collectStatementImports(imports, ((ForStatement) stmt).getInit(), thisPackage);
+        } else if (stmt instanceof ForEachStatement) {
+            addTypeImport(imports, ((ForEachStatement) stmt).getVariableType(), thisPackage);
+            collectStatementImports(imports, ((ForEachStatement) stmt).getBody(), thisPackage);
+        } else if (stmt instanceof TryCatchStatement) {
+            TryCatchStatement tcs = (TryCatchStatement) stmt;
+            collectStatementImports(imports, tcs.getTryBody(), thisPackage);
+            for (TryCatchStatement.CatchClause cc : tcs.getCatchClauses()) {
+                for (Type et : cc.exceptionTypes) { addTypeImport(imports, et, thisPackage); }
+                collectStatementImports(imports, cc.body, thisPackage);
+            }
+        } else if (stmt instanceof DoWhileStatement) {
+            collectStatementImports(imports, ((DoWhileStatement) stmt).getBody(), thisPackage);
+        } else if (stmt instanceof SwitchStatement) {
+            for (SwitchStatement.SwitchCase sc : ((SwitchStatement) stmt).getCases()) {
+                for (Statement s : sc.getStatements()) { collectStatementImports(imports, s, thisPackage); }
+            }
+        }
+        // Collect from expressions in ExpressionStatement
+        if (stmt instanceof ExpressionStatement) {
+            collectExprImports(imports, ((ExpressionStatement) stmt).getExpression(), thisPackage);
+        } else if (stmt instanceof ReturnStatement && ((ReturnStatement) stmt).hasExpression()) {
+            collectExprImports(imports, ((ReturnStatement) stmt).getExpression(), thisPackage);
+        }
+    }
+
+    private void collectExprImports(Set<String> imports, Expression expr, String thisPackage) {
+        if (expr == null) return;
+        if (expr instanceof NewExpression) {
+            addImport(imports, ((NewExpression) expr).getInternalTypeName(), thisPackage);
+            NewExpression ne = (NewExpression) expr;
+            if (ne.getArguments() != null) {
+                for (Expression arg : ne.getArguments()) { collectExprImports(imports, arg, thisPackage); }
+            }
+        } else if (expr instanceof CastExpression) {
+            addTypeImport(imports, ((CastExpression) expr).getType(), thisPackage);
+            collectExprImports(imports, ((CastExpression) expr).getExpression(), thisPackage);
+        } else if (expr instanceof StaticMethodInvocationExpression) {
+            StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) expr;
+            addImport(imports, smie.getOwnerInternalName(), thisPackage);
+            if (smie.getArguments() != null) {
+                for (Expression arg : smie.getArguments()) { collectExprImports(imports, arg, thisPackage); }
+            }
+        } else if (expr instanceof FieldAccessExpression) {
+            FieldAccessExpression fae = (FieldAccessExpression) expr;
+            if (fae.getObject() == null) {
+                addImport(imports, fae.getOwnerInternalName(), thisPackage);
+            } else {
+                collectExprImports(imports, fae.getObject(), thisPackage);
+            }
+        } else if (expr instanceof AssignmentExpression) {
+            AssignmentExpression ae = (AssignmentExpression) expr;
+            collectExprImports(imports, ae.getLeft(), thisPackage);
+            collectExprImports(imports, ae.getRight(), thisPackage);
+        } else if (expr instanceof MethodInvocationExpression) {
+            MethodInvocationExpression mie = (MethodInvocationExpression) expr;
+            collectExprImports(imports, mie.getObject(), thisPackage);
+            if (mie.getArguments() != null) {
+                for (Expression arg : mie.getArguments()) { collectExprImports(imports, arg, thisPackage); }
+            }
+        } else if (expr instanceof BinaryOperatorExpression) {
+            BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
+            collectExprImports(imports, boe.getLeft(), thisPackage);
+            collectExprImports(imports, boe.getRight(), thisPackage);
+        } else if (expr instanceof TernaryExpression) {
+            TernaryExpression te = (TernaryExpression) expr;
+            collectExprImports(imports, te.getCondition(), thisPackage);
+            collectExprImports(imports, te.getTrueExpression(), thisPackage);
+            collectExprImports(imports, te.getFalseExpression(), thisPackage);
+        } else if (expr instanceof NewArrayExpression) {
+            addTypeImport(imports, ((NewArrayExpression) expr).getType(), thisPackage);
+        }
+    }
+    // END_CHANGE: BUG-2026-0036-1
+
+    // START_CHANGE: BUG-2026-0040-20260327-2 - Extract class names from generic signatures for imports
+    private void collectSignatureImports(Set<String> imports, String signature, String thisPackage) {
+        // Parse class names from JVM generic signature: Ljava/util/List<Ljava/lang/String;>;
+        int i = 0;
+        while (i < signature.length()) {
+            if (signature.charAt(i) == 'L') {
+                int end = i + 1;
+                while (end < signature.length() && signature.charAt(end) != ';' && signature.charAt(end) != '<') {
+                    end++;
+                }
+                if (end > i + 1) {
+                    String internalName = signature.substring(i + 1, end);
+                    addImport(imports, internalName, thisPackage);
+                }
+                i = end;
+            } else {
+                i++;
+            }
+        }
+    }
+    // END_CHANGE: BUG-2026-0040-2
+
+    // START_CHANGE: BUG-2026-0039-20260327-1 - Fix inner class import: import outer class, use Outer.Inner in code
+    private void addImport(Set<String> imports, String internalName, String thisPackage) {
+        if (internalName == null) return;
+        // For inner classes (Outer$Inner), import the outer class only
+        int dollar = internalName.indexOf('$');
+        String importName = dollar >= 0 ? internalName.substring(0, dollar) : internalName;
+        String pkg = TypeNameUtil.packageFromInternal(importName);
+        if (!pkg.isEmpty() && !"java.lang".equals(pkg) && !pkg.equals(thisPackage)) {
+            imports.add(TypeNameUtil.internalToQualified(importName));
+        }
+    }
+    // END_CHANGE: BUG-2026-0039-1
 
     private void writeAccessFlags(Printer printer, int accessFlags, boolean isClass) {
         writeAccessFlags(printer, accessFlags, isClass, false);
@@ -888,7 +1135,7 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("void");
         } else if (type instanceof ObjectType) {
             ObjectType ot = (ObjectType) type;
-            printer.printReference(Printer.TYPE, ot.getInternalName(), ot.getName(), "", ownerInternalName);
+            emitRef(printer,Printer.TYPE, ot.getInternalName(), ot.getName(), "", ownerInternalName);
         } else if (type instanceof ArrayType) {
             ArrayType at = (ArrayType) type;
             writeType(printer, at.getElementType(), ownerInternalName);
@@ -915,7 +1162,7 @@ public class JavaSourceWriter implements Processor {
             writeType(printer, field.type, ownerInternalName);
         }
         printer.printText(" ");
-        printer.printDeclaration(Printer.FIELD, ownerInternalName, field.name, field.descriptor);
+        emitDecl(printer,Printer.FIELD, ownerInternalName, field.name, field.descriptor);
         printer.printText(" = ");
         writeExpression(printer, initValue, ownerInternalName);
         printer.printText(";");
@@ -943,7 +1190,7 @@ public class JavaSourceWriter implements Processor {
             writeType(printer, field.type, ownerInternalName);
         }
         printer.printText(" ");
-        printer.printDeclaration(Printer.FIELD, ownerInternalName, field.name, field.descriptor);
+        emitDecl(printer,Printer.FIELD, ownerInternalName, field.name, field.descriptor);
 
         if (field.initialValue != null) {
             printer.printText(" = ");
@@ -1062,9 +1309,9 @@ public class JavaSourceWriter implements Processor {
                 writeType(printer, method.returnType, ownerInternalName);
             }
             printer.printText(" ");
-            printer.printDeclaration(Printer.METHOD, ownerInternalName, method.name, method.descriptor);
+            emitDecl(printer,Printer.METHOD, ownerInternalName, method.name, method.descriptor);
         } else {
-            printer.printDeclaration(Printer.CONSTRUCTOR, ownerInternalName, simpleName, method.descriptor);
+            emitDecl(printer,Printer.CONSTRUCTOR, ownerInternalName, simpleName, method.descriptor);
         }
 
         // Parameters
@@ -1101,7 +1348,7 @@ public class JavaSourceWriter implements Processor {
                 writeType(printer, method.parameterTypes.get(i), ownerInternalName);
             }
             printer.printText(" ");
-            printer.printText(method.parameterNames.get(i));
+            printer.printText(sn(method.parameterNames.get(i), "var"));
         }
         printer.printText(")");
 
@@ -1113,7 +1360,7 @@ public class JavaSourceWriter implements Processor {
             for (int i = 0; i < method.thrownExceptions.size(); i++) {
                 if (i > 0) printer.printText(", ");
                 String exc = method.thrownExceptions.get(i);
-                printer.printReference(Printer.TYPE, exc, TypeNameUtil.simpleNameFromInternal(exc), "", ownerInternalName);
+                emitRef(printer,Printer.TYPE, exc, TypeNameUtil.simpleNameFromInternal(exc), "", ownerInternalName);
             }
         }
 
@@ -1151,15 +1398,9 @@ public class JavaSourceWriter implements Processor {
             printer.indent();
             lineNumber++;
 
-            // START_CHANGE: IMP-LINES-20260326-10 - Bytecode metadata comment
-            if (showBytecode && method.bytecodeLength > 0) {
-                printer.startLine(lineNumber);
-                printer.printText("// Bytecode: " + method.bytecodeLength + " bytes"
-                    + ", max_stack=" + method.maxStack
-                    + ", max_locals=" + method.maxLocals);
-                printer.endLine();
-                lineNumber++;
-            }
+            // START_CHANGE: IMP-LINES-20260326-10 - Store bytecode instructions for inline display
+            currentBytecodeInstructions = (showBytecode && method.bytecodeInstructions != null)
+                ? method.bytecodeInstructions : null;
             // END_CHANGE: IMP-LINES-10
 
             for (Statement stmt : method.body) {
@@ -1258,6 +1499,21 @@ public class JavaSourceWriter implements Processor {
             return lineNumber;
         }
 
+        // START_CHANGE: IMP-2026-0008-20260327-2 - Emit bytecode instructions as comments before each line
+        if (currentBytecodeInstructions != null && line > 0) {
+            java.util.List<String> instrs = currentBytecodeInstructions.get(line);
+            if (instrs != null) {
+                for (int bi = 0; bi < instrs.size(); bi++) {
+                    printer.startLine(lineNumber);
+                    printer.printText("// " + (String) instrs.get(bi));
+                    printer.endLine();
+                    lineNumber++;
+                }
+                currentBytecodeInstructions.remove(line); // emit only once per line
+            }
+        }
+        // END_CHANGE: IMP-2026-0008-2
+
         printer.startLine(line);
 
         if (stmt instanceof ReturnStatement) {
@@ -1270,7 +1526,14 @@ public class JavaSourceWriter implements Processor {
             printer.printText(";");
         } else if (stmt instanceof ExpressionStatement) {
             ExpressionStatement es = (ExpressionStatement) stmt;
-            writeExpression(printer, es.getExpression(), ownerInternalName);
+            // START_CHANGE: BUG-2026-0035-20260327-1 - Ternary expression cannot be a standalone statement
+            Expression esExpr = es.getExpression();
+            if (esExpr instanceof TernaryExpression) {
+                // Wrap in variable assignment to make it compilable
+                printer.printText("Object _ternary" + line + " = ");
+            }
+            // END_CHANGE: BUG-2026-0035-1
+            writeExpression(printer, esExpr, ownerInternalName);
             printer.printText(";");
         } else if (stmt instanceof ThrowStatement) {
             ThrowStatement ts = (ThrowStatement) stmt;
@@ -1290,7 +1553,7 @@ public class JavaSourceWriter implements Processor {
                 writeType(printer, vds.getType(), ownerInternalName);
             }
             printer.printText(" ");
-            printer.printText(vds.getName());
+            printer.printText(sn(vds.getName(), "var"));
             if (vds.hasInitializer()) {
                 printer.printText(" = ");
                 writeExpression(printer, vds.getInitializer(), ownerInternalName);
@@ -1387,7 +1650,7 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" (");
             writeType(printer, fes.getVariableType(), ownerInternalName);
             printer.printText(" ");
-            printer.printText(fes.getVariableName());
+            printer.printText(sn(fes.getVariableName(), "var"));
             printer.printText(" : ");
             writeExpression(printer, fes.getIterable(), ownerInternalName);
             printer.printText(") {");
@@ -1458,7 +1721,7 @@ public class JavaSourceWriter implements Processor {
                     writeType(printer, cc.exceptionTypes.get(ti), ownerInternalName);
                 }
                 printer.printText(" ");
-                printer.printText(cc.variableName);
+                printer.printText(sn(cc.variableName, "var"));
                 printer.printText(") {");
                 printer.endLine();
                 printer.indent();
@@ -1558,21 +1821,34 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("this");
         } else if (expr instanceof LocalVariableExpression) {
             LocalVariableExpression lve = (LocalVariableExpression) expr;
-            printer.printText(lve.getName());
+            printer.printText(sn(lve.getName(), "var"));
         } else if (expr instanceof FieldAccessExpression) {
             FieldAccessExpression fae = (FieldAccessExpression) expr;
-            if (fae.getObject() != null) {
-                writeExpression(printer, fae.getObject(), ownerInternalName);
-                printer.printText(".");
+            String fieldName = fae.getName();
+            // START_CHANGE: BUG-2026-0045-20260327-1 - Handle synthetic inner class fields
+            if (fieldName != null && fieldName.startsWith("this$")) {
+                // this$0 is the outer class reference - just write the object (usually 'this')
+                // Skip entirely - the outer reference is implicit in inlined anonymous classes
+                printer.printKeyword("this");
+            } else if (fieldName != null && fieldName.startsWith("val$")) {
+                // val$xxx is a captured variable from outer scope - write just the variable name
+                String capturedName = fieldName.substring(4);
+                printer.printText(sn(capturedName, "var"));
             } else {
-                // Static field access
-                String owner = fae.getOwnerInternalName();
-                if (!owner.equals(ownerInternalName)) {
-                    printer.printReference(Printer.TYPE, owner, TypeNameUtil.simpleNameFromInternal(owner), "", ownerInternalName);
+            // END_CHANGE: BUG-2026-0045-1
+                if (fae.getObject() != null) {
+                    writeExpression(printer, fae.getObject(), ownerInternalName);
                     printer.printText(".");
+                } else {
+                    // Static field access
+                    String owner = fae.getOwnerInternalName();
+                    if (!owner.equals(ownerInternalName)) {
+                        emitRef(printer,Printer.TYPE, owner, TypeNameUtil.simpleNameFromInternal(owner), "", ownerInternalName);
+                        printer.printText(".");
+                    }
                 }
+                emitRef(printer,Printer.FIELD, fae.getOwnerInternalName(), fieldName, fae.getDescriptor(), ownerInternalName);
             }
-            printer.printReference(Printer.FIELD, fae.getOwnerInternalName(), fae.getName(), fae.getDescriptor(), ownerInternalName);
         } else if (expr instanceof MethodInvocationExpression) {
             MethodInvocationExpression mie = (MethodInvocationExpression) expr;
             String mName = mie.getMethodName();
@@ -1580,6 +1856,11 @@ public class JavaSourceWriter implements Processor {
             if ("super".equals(mName) || "this".equals(mName)) {
                 printer.printKeyword(mName);
                 writeArguments(printer, mie.getArguments(), ownerInternalName);
+            // START_CHANGE: BUG-2026-0045-20260327-4 - Suppress instance access$NNN (duplicate of static call)
+            } else if (mName.startsWith("access$")) {
+                // This is a phantom instance call - the static version emits the actual code
+                // Don't emit anything
+            // END_CHANGE: BUG-2026-0045-4
             } else {
                 // START_CHANGE: ISS-2026-0003-20260323-1 - Parenthesize cast expressions used as method receiver
                 if (mie.getObject() instanceof CastExpression) {
@@ -1591,11 +1872,35 @@ public class JavaSourceWriter implements Processor {
                 }
                 // END_CHANGE: ISS-2026-0003-1
                 printer.printText(".");
-                printer.printReference(Printer.METHOD, mie.getOwnerInternalName(), mName, mie.getDescriptor(), ownerInternalName);
+                emitRef(printer,Printer.METHOD, mie.getOwnerInternalName(), mName, mie.getDescriptor(), ownerInternalName);
                 writeArguments(printer, mie.getArguments(), ownerInternalName);
             }
         } else if (expr instanceof StaticMethodInvocationExpression) {
             StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) expr;
+            // START_CHANGE: BUG-2026-0045-20260327-2 - Inline synthetic access$NNN methods
+            if (smie.getMethodName().startsWith("access$") && smie.getArguments().size() >= 1) {
+                // access$000(outerRef) -> outerRef.privateMethod() or outerRef.privateField
+                // access$002(outerRef, value) -> outerRef.privateField = value
+                Expression outerRef = smie.getArguments().get(0);
+                writeExpression(printer, outerRef, ownerInternalName);
+                if (smie.getArguments().size() == 1) {
+                    // Getter: access$000(ref) -> ref.field or ref.method()
+                    printer.printText("." + sn(smie.getMethodName(), "mtd") + "()");
+                } else if (smie.getArguments().size() == 2) {
+                    // Setter: access$002(ref, value) -> ref.field = value
+                    printer.printText("." + sn(smie.getMethodName(), "fld") + " = ");
+                    writeExpression(printer, smie.getArguments().get(1), ownerInternalName);
+                } else {
+                    // Multi-arg: fallback
+                    printer.printText("." + sn(smie.getMethodName(), "mtd"));
+                    List<Expression> remainingArgs = new ArrayList<Expression>();
+                    for (int rai = 1; rai < smie.getArguments().size(); rai++) {
+                        remainingArgs.add(smie.getArguments().get(rai));
+                    }
+                    writeArguments(printer, remainingArgs, ownerInternalName);
+                }
+                // END_CHANGE: BUG-2026-0045-2
+            } else
             // Simplify autoboxing: Integer.valueOf(1) -> 1, etc.
             if ("valueOf".equals(smie.getMethodName()) && smie.getArguments().size() == 1) {
                 String autoboxOwner = smie.getOwnerInternalName();
@@ -1609,10 +1914,10 @@ public class JavaSourceWriter implements Processor {
             }
             String owner = smie.getOwnerInternalName();
             if (owner != null && !owner.isEmpty() && !owner.equals(ownerInternalName)) {
-                printer.printReference(Printer.TYPE, owner, TypeNameUtil.simpleNameFromInternal(owner), "", ownerInternalName);
+                emitRef(printer,Printer.TYPE, owner, TypeNameUtil.simpleNameFromInternal(owner), "", ownerInternalName);
                 printer.printText(".");
             }
-            printer.printReference(Printer.METHOD, owner, smie.getMethodName(), smie.getDescriptor(), ownerInternalName);
+            emitRef(printer,Printer.METHOD, owner, smie.getMethodName(), smie.getDescriptor(), ownerInternalName);
             writeArguments(printer, smie.getArguments(), ownerInternalName);
         } else if (expr instanceof NewExpression) {
             NewExpression ne = (NewExpression) expr;
@@ -1621,7 +1926,7 @@ public class JavaSourceWriter implements Processor {
             // START_CHANGE: BUG-2026-0029-20260325-4 - Display anonymous classes using interface/superclass name
             String displayName = anonymousClassDisplayNames.get(ne.getInternalTypeName());
             if (displayName != null) {
-                printer.printReference(Printer.TYPE, ne.getInternalTypeName(),
+                emitRef(printer,Printer.TYPE, ne.getInternalTypeName(),
                     displayName, "", ownerInternalName);
                 // Suppress outer 'this' argument for anonymous classes
                 List<Expression> args = ne.getArguments();
@@ -1633,9 +1938,32 @@ public class JavaSourceWriter implements Processor {
                         filteredArgs.add(arg);
                     }
                 }
-                writeArguments(printer, filteredArgs, ownerInternalName);
+                // For anonymous class implementing interface, always use empty args
+                printer.printText("()");
+                // START_CHANGE: BUG-2026-0044-20260327-1 - Inline anonymous class body
+                JavaSyntaxResult anonResult = findInnerClassResult(currentResult, ne.getInternalTypeName());
+                if (anonResult != null && anonResult.getMethods() != null && !anonResult.getMethods().isEmpty()) {
+                    printer.printText(" {");
+                    printer.endLine();
+                    printer.indent();
+                    int anonLine = 1;
+                    for (int mi = 0; mi < anonResult.getMethods().size(); mi++) {
+                        JavaSyntaxResult.MethodDeclaration m = anonResult.getMethods().get(mi);
+                        if ("<init>".equals(m.name)) continue;
+                        if (m.name.startsWith("$")) continue;
+                        if (mi > 0) { printer.startLine(anonLine++); printer.endLine(); }
+                        anonLine = writeMethod(printer, m, anonResult,
+                            anonResult.getInternalName() != null ? anonResult.getInternalName() : ownerInternalName, anonLine);
+                    }
+                    printer.unindent();
+                    printer.startLine(anonLine);
+                    printer.printText("}");
+                } else {
+                    printer.printText(" { }");
+                }
+                // END_CHANGE: BUG-2026-0044-1
             } else {
-                printer.printReference(Printer.TYPE, ne.getInternalTypeName(),
+                emitRef(printer,Printer.TYPE, ne.getInternalTypeName(),
                     TypeNameUtil.simpleNameFromInternal(ne.getInternalTypeName()), "", ownerInternalName);
                 writeArguments(printer, ne.getArguments(), ownerInternalName);
             }
@@ -1644,10 +1972,33 @@ public class JavaSourceWriter implements Processor {
             NewArrayExpression nae = (NewArrayExpression) expr;
             printer.printKeyword("new");
             printer.printText(" ");
-            writeType(printer, nae.getType(), ownerInternalName);
+            // START_CHANGE: BUG-2026-0034-20260327-1 - Fix multi-dimensional array syntax: new T[n][] not new T[][n]
+            Type arrType = nae.getType();
+            int totalDims = arrType.getDimension();
+            // Array with init values must have at least 1 dimension
+            if (totalDims == 0 && (nae.hasInitValues() || !nae.getDimensionExpressions().isEmpty())) {
+                totalDims = 1;
+            }
+            // Write the base element type (without array brackets)
+            // For ArrayType: unwrap to element; for ObjectType with dimension: use dimension=0 copy
+            Type baseType = arrType;
+            if (baseType instanceof ArrayType) {
+                while (baseType instanceof ArrayType) {
+                    baseType = ((ArrayType) baseType).getElementType();
+                }
+            } else if (baseType instanceof ObjectType && totalDims > 0) {
+                ObjectType ot = (ObjectType) baseType;
+                baseType = new ObjectType(ot.getInternalName(), ot.getQualifiedName(), ot.getName(), 0);
+            }
+            writeType(printer, baseType, ownerInternalName);
+            // END_CHANGE: BUG-2026-0034-1
             // START_CHANGE: BUG-2026-0032-20260325-4 - Write array init iteratively to avoid StackOverflow on large arrays
             if (nae.hasInitValues()) {
-                printer.printText("[]{");
+                // Write all dimension brackets empty, then init values
+                for (int di = 0; di < totalDims; di++) {
+                    printer.printText("[]");
+                }
+                printer.printText("{");
                 List<Expression> initVals = nae.getInitValues();
                 for (int iv = 0; iv < initVals.size(); iv++) {
                     if (iv > 0) printer.printText(", ");
@@ -1657,10 +2008,15 @@ public class JavaSourceWriter implements Processor {
                 }
                 printer.printText("}");
             } else {
+                // Write specified dimensions first, then empty brackets for remaining
+                int specifiedDims = nae.getDimensionExpressions().size();
                 for (Expression dim : nae.getDimensionExpressions()) {
                     printer.printText("[");
                     writeExpression(printer, dim, ownerInternalName);
                     printer.printText("]");
+                }
+                for (int di = specifiedDims; di < totalDims; di++) {
+                    printer.printText("[]");
                 }
             }
             // END_CHANGE: ISS-2026-0002-4
@@ -1863,7 +2219,7 @@ public class JavaSourceWriter implements Processor {
             if (mre.getObject() != null) {
                 writeExpression(printer, mre.getObject(), ownerInternalName);
             } else {
-                printer.printReference(Printer.TYPE, mre.getOwnerInternalName(),
+                emitRef(printer,Printer.TYPE, mre.getOwnerInternalName(),
                     TypeNameUtil.simpleNameFromInternal(mre.getOwnerInternalName()), "", ownerInternalName);
             }
             printer.printText("::");
@@ -1885,7 +2241,7 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             writeType(printer, pme.getPatternType(), ownerInternalName);
             printer.printText(" ");
-            printer.printText(pme.getVariableName());
+            printer.printText(sn(pme.getVariableName(), "var"));
         } else {
             printer.printText("/* expr */");
         }
@@ -1898,7 +2254,7 @@ public class JavaSourceWriter implements Processor {
             VariableDeclarationStatement vds = (VariableDeclarationStatement) stmt;
             writeType(printer, vds.getType(), ownerInternalName);
             printer.printText(" ");
-            printer.printText(vds.getName());
+            printer.printText(sn(vds.getName(), "var"));
             if (vds.hasInitializer()) {
                 printer.printText(" = ");
                 writeExpression(printer, vds.getInitializer(), ownerInternalName);
@@ -1921,7 +2277,7 @@ public class JavaSourceWriter implements Processor {
                 VariableDeclarationStatement firstDecl = (VariableDeclarationStatement) stmts.get(0);
                 writeType(printer, firstDecl.getType(), ownerInternalName);
                 printer.printText(" ");
-                printer.printText(firstDecl.getName());
+                printer.printText(sn(firstDecl.getName(), "var"));
                 if (firstDecl.hasInitializer()) {
                     printer.printText(" = ");
                     writeExpression(printer, firstDecl.getInitializer(), ownerInternalName);
@@ -1930,7 +2286,7 @@ public class JavaSourceWriter implements Processor {
                     printer.printText(", ");
                     if (stmts.get(bi) instanceof VariableDeclarationStatement) {
                         VariableDeclarationStatement vds2 = (VariableDeclarationStatement) stmts.get(bi);
-                        printer.printText(vds2.getName());
+                        printer.printText(sn(vds2.getName(), "var"));
                         if (vds2.hasInitializer()) {
                             printer.printText(" = ");
                             writeExpression(printer, vds2.getInitializer(), ownerInternalName);

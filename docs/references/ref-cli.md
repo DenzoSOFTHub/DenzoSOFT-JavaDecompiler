@@ -17,8 +17,9 @@ java -jar denzosoft-decompiler.jar [options] <command>
 | Option | Description |
 |---|---|
 | `--compact` | Compact output without line number alignment. By default, the decompiler preserves original source line numbers by inserting blank lines. |
-| `--show-bytecode` | Show bytecode metadata (size, max\_stack, max\_locals) as a comment at the start of each method body. |
+| `--show-bytecode` | Show JVM bytecode instructions as comments before each decompiled line, with Java-level explanations (variable names, field accesses, method calls). |
 | `--show-native-info` | Show JNI function names and parameter types as comments on native method declarations. |
+| `--deobfuscate` | Sanitize obfuscated identifiers to produce compilable output. Java keywords (`do`, `if`, `int`, etc.) get a `_` prefix; illegal characters are replaced with `_`. Applies to variables, fields, methods, and class names. |
 
 Options can appear anywhere on the command line, before or after the command. Multiple options can be combined.
 
@@ -139,7 +140,7 @@ Prints the decompiler version and the maximum supported Java version, then exits
 **Output:**
 
 ```
-DenzoSOFT Java Decompiler v1.4.0
+DenzoSOFT Java Decompiler v1.6.0
 Supports Java 1.0 through Java 25
 ```
 

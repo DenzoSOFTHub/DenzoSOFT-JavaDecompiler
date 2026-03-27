@@ -30,6 +30,24 @@ public class DecompilerGui extends JFrame {
     private JTabbedPane mainTabs;
     private JMenuBar menuBar;
     private JToolBar toolBar;
+    // START_CHANGE: IMP-2026-0007-20260327-1 - GUI options for decompiler flags
+    private boolean optCompact = false;
+    private boolean optShowBytecode = false;
+    private boolean optShowNativeInfo = false;
+    private boolean optDeobfuscate = false;
+
+    /** Build configuration map from current GUI options. */
+    public java.util.Map<String, Object> getDecompilerConfig() {
+        java.util.Map<String, Object> config = new java.util.HashMap<String, Object>();
+        if (optShowBytecode) config.put("showBytecode", Boolean.TRUE);
+        if (optShowNativeInfo) config.put("showNativeInfo", Boolean.TRUE);
+        if (optDeobfuscate) config.put("deobfuscate", Boolean.TRUE);
+        return config.isEmpty() ? null : config;
+    }
+
+    /** Returns true if compact (no line alignment) mode is selected. */
+    public boolean isCompactMode() { return optCompact; }
+    // END_CHANGE: IMP-2026-0007-1
 
     public DecompilerGui() {
         setTitle("DenzoSOFT Java Decompiler v" + DenzoDecompiler.getVersion());
@@ -113,6 +131,41 @@ public class DecompilerGui extends JFrame {
         editMenu.add(selectAllItem);
 
         menuBar.add(editMenu);
+
+        // START_CHANGE: IMP-2026-0007-20260327-2 - Options menu with decompiler flags
+        JMenu optionsMenu = new JMenu("Options");
+        optionsMenu.setMnemonic(KeyEvent.VK_P);
+
+        final JCheckBoxMenuItem compactItem = new JCheckBoxMenuItem("Compact Output");
+        compactItem.setToolTipText("Remove line number alignment blank lines");
+        compactItem.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) { optCompact = compactItem.isSelected(); }
+        });
+        optionsMenu.add(compactItem);
+
+        final JCheckBoxMenuItem bytecodeItem = new JCheckBoxMenuItem("Show Bytecode Info");
+        bytecodeItem.setToolTipText("Show bytecode metadata in method bodies");
+        bytecodeItem.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) { optShowBytecode = bytecodeItem.isSelected(); }
+        });
+        optionsMenu.add(bytecodeItem);
+
+        final JCheckBoxMenuItem nativeItem = new JCheckBoxMenuItem("Show Native Method Info");
+        nativeItem.setToolTipText("Show JNI function names on native methods");
+        nativeItem.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) { optShowNativeInfo = nativeItem.isSelected(); }
+        });
+        optionsMenu.add(nativeItem);
+
+        final JCheckBoxMenuItem deobfItem = new JCheckBoxMenuItem("Deobfuscate");
+        deobfItem.setToolTipText("Sanitize obfuscated identifiers for compilable output");
+        deobfItem.addActionListener(new ActionListener() {
+            public void actionPerformed(ActionEvent e) { optDeobfuscate = deobfItem.isSelected(); }
+        });
+        optionsMenu.add(deobfItem);
+
+        menuBar.add(optionsMenu);
+        // END_CHANGE: IMP-2026-0007-2
 
         // Help menu
         JMenu helpMenu = new JMenu("Help");

@@ -294,7 +294,10 @@ public class JarPanel extends JPanel {
             StringPrinter printer = new StringPrinter();
 
             Loader loader = new JarLoader();
-            decompiler.decompile(loader, printer, className);
+            // START_CHANGE: IMP-2026-0007-20260327-3 - Pass GUI options to decompiler
+            java.util.Map<String, Object> config = parentGui != null ? parentGui.getDecompilerConfig() : null;
+            decompiler.decompile(loader, printer, className, config);
+            // END_CHANGE: IMP-2026-0007-3
             return printer.getResult();
         } catch (Exception e) {
             return "// Error decompiling " + entryName + ": " + e.getMessage();

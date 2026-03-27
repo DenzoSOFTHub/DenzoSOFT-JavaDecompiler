@@ -13,6 +13,7 @@ import it.denzosoft.javadecompiler.model.classfile.attribute.*;
 import it.denzosoft.javadecompiler.model.javasyntax.expression.*;
 import it.denzosoft.javadecompiler.model.javasyntax.statement.*;
 import it.denzosoft.javadecompiler.model.javasyntax.type.*;
+import it.denzosoft.javadecompiler.util.BytecodeDisassembler;
 import it.denzosoft.javadecompiler.api.loader.Loader;
 import it.denzosoft.javadecompiler.model.message.Message;
 import it.denzosoft.javadecompiler.model.processor.Processor;
@@ -400,6 +401,36 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             md.bytecodeLength = code.getCode().length;
             md.maxStack = code.getMaxStack();
             md.maxLocals = code.getMaxLocals();
+            // Disassemble bytecode for --show-bytecode feature
+            LineNumberTableAttribute lnt = null;
+            for (Attribute codeAttr : code.getAttributes()) {
+                if (codeAttr instanceof LineNumberTableAttribute) {
+                    lnt = (LineNumberTableAttribute) codeAttr;
+                    break;
+                }
+            }
+            Map<Integer, String> lvNames = new HashMap<Integer, String>();
+            LocalVariableTableAttribute lvt = null;
+            for (Attribute codeAttr : code.getAttributes()) {
+                if (codeAttr instanceof LocalVariableTableAttribute) {
+                    lvt = (LocalVariableTableAttribute) codeAttr;
+                    break;
+                }
+            }
+            if (lvt != null) {
+                for (LocalVariableTableAttribute.LocalVariable lv : lvt.getLocalVariables()) {
+                    lvNames.put(lv.index, lv.name);
+                }
+            }
+            // Add fallback param names
+            int pSlot = method.isStatic() ? 0 : 1;
+            String[] pDescs = TypeNameUtil.parseMethodParameterDescriptors(method.getDescriptor());
+            for (int pi2 = 0; pi2 < pDescs.length; pi2++) {
+                if (!lvNames.containsKey(pSlot)) lvNames.put(pSlot, "arg" + pi2);
+                pSlot += ("D".equals(pDescs[pi2]) || "J".equals(pDescs[pi2])) ? 2 : 1;
+            }
+            md.bytecodeInstructions = BytecodeDisassembler.disassemble(
+                code.getCode(), classFile.getConstantPool(), lnt, lvNames);
         }
         // END_CHANGE: IMP-LINES-6
         // START_CHANGE: LIM-0004-20260326-9 - Populate method return type annotations
@@ -566,6 +597,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         int paramSlot = method.isStatic() ? 0 : 1;
         for (int pi = 0; pi < paramDescs.length; pi++) {
             declaredVars.add(paramSlot);
+            // START_CHANGE: BUG-2026-0033-20260327-1 - Populate localVarNames with param names when LVT absent
+            if (!localVarNames.containsKey(paramSlot)) {
+                localVarNames.put(paramSlot, "arg" + pi);
+                if (pi < paramDescs.length) {
+                    localVarDescriptors.put(paramSlot, paramDescs[pi]);
+                }
+            }
+            // END_CHANGE: BUG-2026-0033-1
             paramSlot += ("D".equals(paramDescs[pi]) || "J".equals(paramDescs[pi])) ? 2 : 1;
         }
         if (!method.isStatic()) {
@@ -1560,7 +1599,18 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
                 List<Expression> args = new ArrayList<Expression>();
                 for (int i = paramDescs.length - 1; i >= 0; i--) {
-                    args.add(0, stack.isEmpty() ? NullExpression.INSTANCE : stack.pop());
+                    Expression arg = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                    // START_CHANGE: BUG-2026-0043-20260327-2 - Convert int constants to correct types for typed params
+                    if (arg instanceof IntegerConstantExpression) {
+                        int v = ((IntegerConstantExpression) arg).getValue();
+                        if ("Z".equals(paramDescs[i]) && (v == 0 || v == 1)) {
+                            arg = v != 0 ? BooleanExpression.TRUE : BooleanExpression.FALSE;
+                        } else if ("C".equals(paramDescs[i])) {
+                            arg = new CastExpression(arg.getLineNumber(), PrimitiveType.CHAR, arg);
+                        }
+                    }
+                    // END_CHANGE: BUG-2026-0043-2
+                    args.add(0, arg);
                 }
                 Expression obj = stack.isEmpty() ? new ThisExpression(line, ObjectType.OBJECT) : stack.pop();
 
@@ -1612,7 +1662,18 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
                 List<Expression> args = new ArrayList<Expression>();
                 for (int i = paramDescs.length - 1; i >= 0; i--) {
-                    args.add(0, stack.isEmpty() ? NullExpression.INSTANCE : stack.pop());
+                    Expression arg = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                    // START_CHANGE: BUG-2026-0043-20260327-3 - Convert int constants to correct types for typed params (static)
+                    if (arg instanceof IntegerConstantExpression) {
+                        int v = ((IntegerConstantExpression) arg).getValue();
+                        if ("Z".equals(paramDescs[i]) && (v == 0 || v == 1)) {
+                            arg = v != 0 ? BooleanExpression.TRUE : BooleanExpression.FALSE;
+                        } else if ("C".equals(paramDescs[i])) {
+                            arg = new CastExpression(arg.getLineNumber(), PrimitiveType.CHAR, arg);
+                        }
+                    }
+                    // END_CHANGE: BUG-2026-0043-3
+                    args.add(0, arg);
                 }
 
                 Expression invocation = new StaticMethodInvocationExpression(

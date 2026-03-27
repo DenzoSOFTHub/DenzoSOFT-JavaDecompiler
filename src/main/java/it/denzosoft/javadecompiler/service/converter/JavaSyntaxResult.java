@@ -166,6 +166,8 @@ public class JavaSyntaxResult {
         public int bytecodeLength;
         public int maxStack;
         public int maxLocals;
+        /** Map from source line number to list of disassembled bytecode instructions for that line. */
+        public java.util.Map<Integer, java.util.List<String>> bytecodeInstructions;
         // END_CHANGE: IMP-LINES-5
 
         public MethodDeclaration(int accessFlags, String name, String descriptor,

@@ -230,6 +230,17 @@ public final class BooleanSimplifier {
                         }
                     }
                 }
+                // START_CHANGE: BUG-2026-0043-20260327-1 - Convert int 0/1 to boolean for field assignments
+                if (ae.getLeft() instanceof FieldAccessExpression) {
+                    String fDesc = ((FieldAccessExpression) ae.getLeft()).getDescriptor();
+                    if ("Z".equals(fDesc) && ae.getRight() instanceof IntegerConstantExpression) {
+                        int val = ((IntegerConstantExpression) ae.getRight()).getValue();
+                        Expression boolVal = val != 0 ? BooleanExpression.TRUE : BooleanExpression.FALSE;
+                        return new ExpressionStatement(new AssignmentExpression(ae.getLineNumber(),
+                            ae.getType(), ae.getLeft(), ae.getOperator(), boolVal));
+                    }
+                }
+                // END_CHANGE: BUG-2026-0043-1
             }
         }
         if (stmt instanceof VariableDeclarationStatement) {

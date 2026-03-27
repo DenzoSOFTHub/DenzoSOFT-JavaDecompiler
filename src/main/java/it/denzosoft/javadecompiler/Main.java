@@ -28,17 +28,19 @@ import java.util.jar.JarFile;
 public class Main {
 
     // START_CHANGE: IMP-LINES-20260326-1 - Add --align-lines flag for optional line number preservation
+    // START_CHANGE: IMP-2026-0006-20260327-1 - Default to GUI when no arguments
     public static void main(String[] args) {
         if (args.length < 1) {
-            printUsage();
-            System.exit(1);
+            // Default: launch GUI
+            it.denzosoft.javadecompiler.gui.DecompilerGui.main(new String[0]);
+            return;
         }
 
         // Parse global flags
-        // Default: align lines ON, bytecode OFF, native info OFF
         boolean alignLines = true;
         boolean showBytecode = false;
         boolean showNativeInfo = false;
+        boolean deobfuscate = false;
         List<String> filteredArgs = new ArrayList<String>();
         for (int i = 0; i < args.length; i++) {
             if ("--align-lines".equals(args[i])) {
@@ -49,6 +51,8 @@ public class Main {
                 showBytecode = true;
             } else if ("--show-native-info".equals(args[i])) {
                 showNativeInfo = true;
+            } else if ("--deobfuscate".equals(args[i])) {
+                deobfuscate = true;
             } else {
                 filteredArgs.add(args[i]);
             }
@@ -88,7 +92,7 @@ public class Main {
                 decompiler.setTraceDir(traceDir);
                 StringPrinter printer = new StringPrinter(alignLines);
 
-                Map<String, Object> config = buildConfig(showBytecode, showNativeInfo);
+                Map<String, Object> config = buildConfig(showBytecode, showNativeInfo, deobfuscate);
                 String target = args[2];
                 if (target.endsWith(".class")) {
                     decompileClassFile(decompiler, printer, target, config);
@@ -124,7 +128,7 @@ public class Main {
                     outputDir.mkdirs();
                 }
                 int threads = Runtime.getRuntime().availableProcessors();
-                BatchDecompiler batch = new BatchDecompiler(outputDir, threads, alignLines, showBytecode, showNativeInfo);
+                BatchDecompiler batch = new BatchDecompiler(outputDir, threads, alignLines, showBytecode, showNativeInfo, deobfuscate);
                 BatchDecompiler.BatchResult result;
                 if (input.isDirectory()) {
                     result = batch.decompileDirectory(input);
@@ -157,7 +161,7 @@ public class Main {
         try {
             DenzoDecompiler decompiler = new DenzoDecompiler();
             StringPrinter printer = new StringPrinter(alignLines);
-            Map<String, Object> config = buildConfig(showBytecode, showNativeInfo);
+            Map<String, Object> config = buildConfig(showBytecode, showNativeInfo, deobfuscate);
 
             if (path.endsWith(".class")) {
                 decompileClassFile(decompiler, printer, path, config);
@@ -198,10 +202,11 @@ public class Main {
         return baos.toByteArray();
     }
 
-    private static Map<String, Object> buildConfig(boolean showBytecode, boolean showNativeInfo) {
+    private static Map<String, Object> buildConfig(boolean showBytecode, boolean showNativeInfo, boolean deobfuscate) {
         Map<String, Object> config = new HashMap<String, Object>();
         if (showBytecode) config.put("showBytecode", Boolean.TRUE);
         if (showNativeInfo) config.put("showNativeInfo", Boolean.TRUE);
+        if (deobfuscate) config.put("deobfuscate", Boolean.TRUE);
         return config.isEmpty() ? null : config;
     }
 
@@ -303,6 +308,7 @@ public class Main {
         System.out.println("  --compact           Compact output without line number alignment");
         System.out.println("  --show-bytecode     Show bytecode metadata as comments in method bodies");
         System.out.println("  --show-native-info  Show JNI function names and parameter types for native methods");
+        System.out.println("  --deobfuscate       Sanitize obfuscated identifiers to produce compilable output");
         System.out.println();
         System.out.println("Examples:");
         System.out.println("  java -jar denzosoft-decompiler.jar MyClass.class");

@@ -140,8 +140,10 @@ public final class SignatureParser {
             }
             case 'L': {
                 // Class type with optional type arguments
+                // START_CHANGE: BUG-2026-0042-20260327-1 - Track package vs inner class separators
                 pos[0]++;
                 StringBuilder sb = new StringBuilder();
+                int lastPkgDot = -1; // position of last package separator (from /)
                 while (pos[0] < sig.length()) {
                     char ch = sig.charAt(pos[0]);
                     if (ch == ';') {
@@ -172,30 +174,25 @@ public final class SignatureParser {
                         if (pos[0] < sig.length()) pos[0]++; // skip '>'
                         sb.append('>');
                     } else if (ch == '.' || ch == '$') {
-                        // Inner class separator
+                        // Inner class separator - use . but don't mark as package
                         sb.append('.');
                         pos[0]++;
                     } else if (ch == '/') {
                         sb.append('.');
+                        lastPkgDot = sb.length() - 1;
                         pos[0]++;
                     } else {
                         sb.append(ch);
                         pos[0]++;
                     }
                 }
-                // Return simple name (last part after dot)
+                // Return simple name: class name after package (preserving inner class dots)
                 String fullName = sb.toString();
-                int lastDot = fullName.lastIndexOf('.');
-                // Check if generics part contains a dot (don't split on dots inside <>)
-                int angleBracket = fullName.indexOf('<');
-                if (angleBracket >= 0 && lastDot > angleBracket) {
-                    // The dot is inside the generic part, find the last dot before '<'
-                    lastDot = fullName.lastIndexOf('.', angleBracket);
-                }
-                if (lastDot >= 0) {
-                    return fullName.substring(lastDot + 1);
+                if (lastPkgDot >= 0) {
+                    return fullName.substring(lastPkgDot + 1);
                 }
                 return fullName;
+                // END_CHANGE: BUG-2026-0042-1
             }
             default:
                 pos[0]++;

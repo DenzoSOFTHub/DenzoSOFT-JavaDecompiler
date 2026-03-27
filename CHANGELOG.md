@@ -2,12 +2,41 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.6.0] - 2026-03-27
+
+### Added
+- `--deobfuscate` CLI option: sanitize obfuscated identifiers (Java keywords, illegal chars) for compilable output
+- `--show-bytecode` now shows inline bytecode instructions with Java-level explanations before each decompiled line
+- Options menu in GUI: Compact, Show Bytecode, Show Native Info, Deobfuscate checkboxes
+- Default JAR launch is now GUI mode (no arguments = GUI)
+- Identifier sanitizer: `do` → `_do`, `if` → `_if`, illegal chars → `_`
+- Anonymous inner class body inlining: `new ActionListener() { public void actionPerformed(...) { ... } }`
+- Synthetic `this$0` and `val$xxx` fields resolved to outer class reference and captured variables
+- Synthetic `access$NNN` methods inlined as direct outer class calls
+
+### Fixed
+- Variable naming without LocalVariableTable: `arg0`/`var1` mismatch (parameters now consistent between signature and body)
+- Import collector: now traverses fields, methods, body expressions, generic signatures, and inner class results
+- Multi-dimensional array syntax: `new T[n][]` instead of `new T[][n]`
+- Array initializer without dimension: `new int[]{1,2}` instead of `new int{1,2}`
+- Inner class `$` handling: imports use outer class, type references use `Outer.Inner` dot notation
+- Generic signature parser: preserves `Outer.Inner` format instead of truncating to `Inner`
+- Boolean/int conversion: `iconst_0`/`iconst_1` correctly emitted as `false`/`true` for boolean fields and method params
+- Char/int conversion: `bipush 46` emitted as `(char)46` for char method parameters (fixes `String.replace`)
+- Batch decompilation: inner classes no longer decompiled as separate files (shared Loader resolves inner class bytecode)
+- Anonymous inner class filter: correctly detects `$N` suffix after outer class name
+- Ternary-as-statement workaround: orphan ternary expressions wrapped in variable assignment
+
+### Performance
+- 15,071 JDK 25 top-level classes decompiled with ZERO errors
+- Project self-decompilation: 130/135 files compile (96%)
+
 ## [1.5.0] - 2026-03-26
 
 ### Added
 - Line number alignment is now the default output mode (preserves original source line numbers)
 - `--compact` CLI option: produces dense output without line number alignment
-- `--show-bytecode` CLI option: shows bytecode metadata (size, max_stack, max_locals) per method
+- `--show-bytecode` CLI option (metadata only, enhanced in v1.6.0)
 - `--show-native-info` CLI option: shows JNI function names and parameter types on native methods
 
 ### Fixed

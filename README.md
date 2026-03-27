@@ -1,4 +1,4 @@
-# DenzoSOFT Java Decompiler
+# DenzoSOFT Java Decompiler v1.6.0
 
 A Java bytecode decompiler supporting **Java 1.0 through Java 25**, with zero external dependencies.
 
@@ -199,23 +199,35 @@ public class ByteReader {
 
 #### `--show-bytecode`
 
-Adds a comment at the start of each method body showing bytecode size, operand stack depth, and local variable count:
+Shows JVM bytecode instructions as comments before each decompiled line, with Java-level explanations of what each instruction does:
 
 ```java
 public ByteReader(byte[] data) {
-    // Bytecode: 15 bytes, max_stack=2, max_locals=2
+    // 4: aload_0  // push ref this
+    // 5: aload_1  // push ref data
+    // 6: putfield #2  // set field ByteReader.data
     this.data = data;
+    // 9: aload_0  // push ref this
+    // 10: iconst_0  // push int 0
+    // 11: putfield #3  // set field ByteReader.offset
     this.offset = 0;
 }
 
 public int getOffset() {
-    // Bytecode: 5 bytes, max_stack=1, max_locals=1
+    // 0: aload_0  // push ref this
+    // 1: getfield #3  // get field ByteReader.offset
+    // 4: ireturn  // return int
     return this.offset;
 }
 
-public int remaining() {
-    // Bytecode: 11 bytes, max_stack=2, max_locals=1
-    return this.data.length - this.offset;
+public void skip(int count) {
+    // 0: aload_0  // push ref this
+    // 1: dup  // duplicate top
+    // 2: getfield #3  // get field ByteReader.offset
+    // 5: iload_1  // push int count
+    // 6: iadd  // int add
+    // 7: putfield #3  // set field ByteReader.offset
+    this.offset += count;
 }
 ```
 
@@ -237,6 +249,27 @@ Without `--show-native-info`, native methods are shown without the JNI comment:
 private static native void registerNatives();
 public static native long currentTimeMillis();
 public static native void arraycopy(Object arg0, int arg1, Object arg2, int arg3, int arg4);
+```
+
+#### `--deobfuscate`
+
+Sanitizes identifiers from obfuscated bytecode to produce compilable Java source. Java keywords used as names get a `_` prefix, illegal characters are replaced:
+
+```java
+// Original obfuscated bytecode has fields named 'do' and 'if' (valid in JVM, invalid in Java)
+// Without --deobfuscate:
+public class KwTest {
+    public int do;        // won't compile
+    public String if;     // won't compile
+    public int do() { return do; }
+}
+
+// With --deobfuscate:
+public class KwTest {
+    public int _do;       // compiles
+    public String _if;    // compiles
+    public int _do() { return this._do; }
+}
 ```
 
 ### Library API
@@ -350,24 +383,68 @@ ClassFile cf = cls.getClassFile();
 
 ### Decompilation Pipeline
 
+The decompiler transforms binary `.class` files into Java source code through a 5-stage pipeline. Each stage is a `Processor` that reads and writes data via a shared `Message` context.
+
 ```
 .class file (binary bytecode)
-        |
-        v
-  [Deserializer] ── Parse class file format into ClassFile model
-        |
-        v
-   [CFG Builder] ── Build Control Flow Graph from bytecode
-        |
-        v
-  [Flow Builder] ── Reconstruct if/else, while, for, do-while, switch, try-catch
-        |
-        v
-  [Transformers] ── Post-processing: for-each, boolean simplify, for-loop, variable merge
-        |
-        v
-    [Writer]     ── Generate readable Java source code
+        │
+        ▼
+  ┌─────────────┐
+  │ Deserializer │  Parse class file format (magic, version, constant pool,
+  │              │  fields, methods, attributes) into a ClassFile model
+  └──────┬──────┘
+         │  ClassFile + ConstantPool + MethodInfo[] + attributes
+         ▼
+  ┌──────────────────────────────┐
+  │ ClassFileToJavaSyntaxConverter│  For each method:
+  │                              │  1. Read bytecode + LineNumberTable + LocalVariableTable
+  │  ┌─ CFG Builder ───────────┐ │  2. Build Control Flow Graph (basic blocks + edges)
+  │  │  ControlFlowGraph.build()│ │  3. Pattern-match: if/else, while, for, switch, ternary,
+  │  └─────────────────────────┘ │     do-while, try-catch from CFG structure
+  │  ┌─ StructuredFlowBuilder ─┐ │  4. Decode bytecode instructions into AST expressions
+  │  │  Pattern matching       │ │     (BinaryOp, MethodInvocation, FieldAccess, New, etc.)
+  │  └─────────────────────────┘ │  5. Apply transformers:
+  │  ┌─ Transformers ──────────┐ │     - BooleanSimplifier: x!=0 → x, 0/1 → false/true
+  │  │  ForEachDetector        │ │     - ForEachDetector: Iterator/array pattern → for-each
+  │  │  ForLoopDetector        │ │     - ForLoopDetector: init+while+update → for loop
+  │  │  TryCatchReconstructor  │ │     - TryCatchReconstructor: exception table → try-catch
+  │  │  StringSwitchRecon.     │ │     - StringSwitchReconstructor: hashCode/equals → switch
+  │  │  CompoundAssignment     │ │     - CompoundAssignment: x = x + 1 → x += 1
+  │  └─────────────────────────┘ │
+  └──────┬───────────────────────┘
+         │  JavaSyntaxResult (AST: statements + expressions + types)
+         ▼
+  ┌────────────────┐
+  │ JavaSourceWriter│  Walk the AST and emit Java source via Printer interface:
+  │                │  - Collect imports (types from fields, methods, generics, expressions)
+  │                │  - Write package, imports, class/interface/enum/record declaration
+  │                │  - Write fields (with static initializer inlining)
+  │                │  - Write methods (signature + body statements)
+  │                │  - Inline inner classes (named and anonymous with body)
+  │                │  - Apply deobfuscation (keyword sanitization) when enabled
+  │                │  - Emit bytecode instructions as comments when enabled
+  └──────┬─────────┘
+         │  Java source text (via Printer callbacks)
+         ▼
+  ┌─────────┐
+  │ Printer  │  Collects output into a String. Handles line alignment
+  │          │  (inserts blank lines to match original source line numbers)
+  └─────────┘
 ```
+
+### Data Flow
+
+| Stage | Input | Output | Key Classes |
+|-------|-------|--------|-------------|
+| **Deserialize** | `byte[]` (class file) | `ClassFile` (parsed model) | `ClassFileDeserializer`, `AttributeParser` |
+| **Convert** | `ClassFile` + `ConstantPool` | `JavaSyntaxResult` (AST) | `ClassFileToJavaSyntaxConverter`, `ControlFlowGraph`, `StructuredFlowBuilder` |
+| **Transform** | `List<Statement>` | `List<Statement>` (simplified) | `BooleanSimplifier`, `ForEachDetector`, `ForLoopDetector`, `TryCatchReconstructor` |
+| **Write** | `JavaSyntaxResult` | Java source text | `JavaSourceWriter`, `Printer` |
+| **Output** | Printer callbacks | `String` | `Main.StringPrinter`, `BatchDecompiler.StringCollector` |
+
+### Thread Safety
+
+`DenzoDecompiler` is the main entry point and is thread-safe. Each `decompile()` call creates a fresh `ClassFileToJavaSyntaxConverter` (which holds mutable state) and a fresh `Message` context. The `Deserializer` and `Writer` are stateless singletons. `BatchDecompiler` uses a thread pool with a shared `Loader` that provides class data to all threads.
 
 ### Package Structure
 
