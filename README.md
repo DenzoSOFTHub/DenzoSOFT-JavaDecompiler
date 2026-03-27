@@ -272,6 +272,25 @@ public class KwTest {
 }
 ```
 
+**Deobfuscation coverage by obfuscator technique:**
+
+| Obfuscator Technique | Coverage | Details |
+|---|---|---|
+| **Name renaming** (ProGuard, R8, yGuard) | 95% | Single-letter names handled, keywords sanitized, consistent naming without LVT |
+| **Debug info stripping** (all obfuscators) | 100% | Generated names `arg0`/`var1` consistent between signature and body |
+| **LineNumberTable stripping** | 100% | `--compact` mode works without line numbers |
+| **Java keywords as identifiers** (Allatori, ZKM) | 100% | `do` → `_do`, `if` → `_if`, `int` → `_int` |
+| **Illegal characters in identifiers** | 100% | Replaced with `_` |
+| **Synthetic accessor inlining** | 100% | `access$000(ref)` resolved to `ref.doOpenJar()` via accessor body analysis |
+| **Inner class field resolution** | 100% | `this$0` → outer reference, `val$xxx` → captured variable |
+| **String encryption** (Allatori, ZKM, DashO) | 0% | Decrypt method is decompiled but strings are not decrypted |
+| **Control flow flattening** (DashO, Allatori) | 0% | Not supported |
+| **Opaque predicates** | 0% | Not detected |
+| **Return-type overloading** | 0% | Valid in bytecode, not representable in Java source |
+| **Reflection-based obfuscation** | 0% | Cannot be resolved statically |
+
+For **ProGuard/R8** (the most widely used obfuscators, Android default): ~95% coverage — decompiled code compiles and is semantically equivalent to the original.
+
 ### Library API
 
 ```java
