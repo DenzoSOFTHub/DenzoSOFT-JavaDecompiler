@@ -444,8 +444,19 @@ public class JavaSourceWriter implements Processor {
         // END_CHANGE: BUG-2026-0022-1
 
         // Fields (non-enum)
+        // START_CHANGE: BUG-2026-0049-20260327-1 - Build record component name set to suppress duplicate fields
+        Set<String> recordComponentNames = new HashSet<String>();
+        if (result.isRecord() && result.getRecordComponents() != null) {
+            for (int rci = 0; rci < result.getRecordComponents().size(); rci++) {
+                recordComponentNames.add(((JavaSyntaxResult.RecordComponentInfo) result.getRecordComponents().get(rci)).name);
+            }
+        }
+        // END_CHANGE: BUG-2026-0049-1
         for (JavaSyntaxResult.FieldDeclaration field : result.getFields()) {
             if (field.isEnum()) continue;
+            // START_CHANGE: BUG-2026-0049-20260327-2 - Skip record component fields (already in record declaration)
+            if (result.isRecord() && recordComponentNames.contains(field.name)) continue;
+            // END_CHANGE: BUG-2026-0049-2
             // START_CHANGE: ISS-2026-0011-20260323-3 - Suppress synthetic $assertionsDisabled field
             if ("$assertionsDisabled".equals(field.name) && field.isSynthetic()) continue;
             // END_CHANGE: ISS-2026-0011-3
@@ -739,9 +750,16 @@ public class JavaSourceWriter implements Processor {
         }
         // END_CHANGE: BUG-2026-0022-2
 
-        // Fields (non-enum)
+        // Fields (non-enum, non-record-component)
+        Set<String> innerRecordCompNames = new HashSet<String>();
+        if (inner.isRecord() && inner.getRecordComponents() != null) {
+            for (int rci = 0; rci < inner.getRecordComponents().size(); rci++) {
+                innerRecordCompNames.add(((JavaSyntaxResult.RecordComponentInfo) inner.getRecordComponents().get(rci)).name);
+            }
+        }
         for (JavaSyntaxResult.FieldDeclaration field : inner.getFields()) {
             if (field.isEnum()) continue;
+            if (inner.isRecord() && innerRecordCompNames.contains(field.name)) continue;
             // START_CHANGE: ISS-2026-0012-20260324-9 - Suppress synthetic $ fields in inner enum classes
             if (inner.isEnum() && field.name.startsWith("$")) continue;
             // END_CHANGE: ISS-2026-0012-9
@@ -1719,7 +1737,28 @@ public class JavaSourceWriter implements Processor {
             SwitchStatement ss = (SwitchStatement) stmt;
             printer.printKeyword("switch");
             printer.printText(" (");
-            writeExpression(printer, ss.getSelector(), ownerInternalName);
+            // START_CHANGE: BUG-2026-0048-20260327-1 - Simplify enum switch map selector
+            Expression switchSel = ss.getSelector();
+            if (switchSel instanceof ArrayAccessExpression) {
+                ArrayAccessExpression aae = (ArrayAccessExpression) switchSel;
+                // Check if array is a $SwitchMap$ field
+                Expression arr = aae.getArray();
+                boolean isSwitchMap = false;
+                if (arr instanceof FieldAccessExpression) {
+                    String fn = ((FieldAccessExpression) arr).getName();
+                    if (fn != null && fn.contains("$SwitchMap$")) isSwitchMap = true;
+                }
+                if (isSwitchMap) {
+                    // Extract the .ordinal() call's object as the real selector
+                    Expression idx = aae.getIndex();
+                    if (idx instanceof MethodInvocationExpression
+                        && "ordinal".equals(((MethodInvocationExpression) idx).getMethodName())) {
+                        switchSel = ((MethodInvocationExpression) idx).getObject();
+                    }
+                }
+            }
+            writeExpression(printer, switchSel, ownerInternalName);
+            // END_CHANGE: BUG-2026-0048-1
             printer.printText(") {");
             printer.endLine();
             printer.indent();
