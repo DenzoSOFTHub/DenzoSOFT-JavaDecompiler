@@ -258,6 +258,30 @@ public final class BooleanSimplifier {
     }
 
     public static Expression simplifyBooleanExpr(Expression expr) {
+        // START_CHANGE: BUG-2026-0047-20260327-1 - Simplify ternary boolean patterns
+        if (expr instanceof TernaryExpression) {
+            TernaryExpression te = (TernaryExpression) expr;
+            Expression cond = simplifyBooleanExpr(te.getCondition());
+            // cond ? 1 : 0 → cond
+            if (isIntConstant(te.getTrueExpression(), 1) && isIntConstant(te.getFalseExpression(), 0)) {
+                return cond;
+            }
+            // cond ? 0 : 1 → !cond
+            if (isIntConstant(te.getTrueExpression(), 0) && isIntConstant(te.getFalseExpression(), 1)) {
+                return new UnaryOperatorExpression(te.getLineNumber(), PrimitiveType.BOOLEAN, "!", cond, true);
+            }
+            // cond ? true : false → cond (when true/false are BooleanExpression)
+            if (te.getTrueExpression() instanceof BooleanExpression && te.getFalseExpression() instanceof BooleanExpression) {
+                if (((BooleanExpression) te.getTrueExpression()).getValue() && !((BooleanExpression) te.getFalseExpression()).getValue()) {
+                    return cond;
+                }
+            }
+            if (cond != te.getCondition()) {
+                return new TernaryExpression(te.getLineNumber(), te.getType(), cond, te.getTrueExpression(), te.getFalseExpression());
+            }
+            return expr;
+        }
+        // END_CHANGE: BUG-2026-0047-1
         if (!(expr instanceof BinaryOperatorExpression)) return expr;
         BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
         Expression left = boe.getLeft();
