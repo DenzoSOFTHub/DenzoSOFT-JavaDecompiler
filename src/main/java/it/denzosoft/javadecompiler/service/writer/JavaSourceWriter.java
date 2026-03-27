@@ -1214,11 +1214,43 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("void");
         } else if (type instanceof ObjectType) {
             ObjectType ot = (ObjectType) type;
+            String intName = ot.getInternalName();
+            // START_CHANGE: BUG-2026-0054-20260327-1 - Handle array descriptors as ObjectType
+            if (intName != null && intName.startsWith("[")) {
+                // Array type stored as ObjectType: [I → int[], [Lcom/Foo; → Foo[]
+                String arrDesc = intName;
+                int dims = 0;
+                while (dims < arrDesc.length() && arrDesc.charAt(dims) == '[') dims++;
+                String elemDesc = arrDesc.substring(dims);
+                String elemName;
+                if (elemDesc.length() == 1) {
+                    switch (elemDesc.charAt(0)) {
+                        case 'B': elemName = "byte"; break;
+                        case 'C': elemName = "char"; break;
+                        case 'D': elemName = "double"; break;
+                        case 'F': elemName = "float"; break;
+                        case 'I': elemName = "int"; break;
+                        case 'J': elemName = "long"; break;
+                        case 'S': elemName = "short"; break;
+                        case 'Z': elemName = "boolean"; break;
+                        default: elemName = elemDesc;
+                    }
+                    printer.printKeyword(elemName);
+                } else if (elemDesc.startsWith("L") && elemDesc.endsWith(";")) {
+                    String className = elemDesc.substring(1, elemDesc.length() - 1);
+                    emitRef(printer, Printer.TYPE, className, TypeNameUtil.simpleNameFromInternal(className), "", ownerInternalName);
+                } else {
+                    printer.printText(elemDesc);
+                }
+                for (int d = 0; d < dims; d++) printer.printText("[]");
+            } else {
+            // END_CHANGE: BUG-2026-0054-1
             // START_CHANGE: BUG-2026-0052-20260327-1 - Strip trailing ; from descriptor-derived names
             String typeName = ot.getName();
             if (typeName.endsWith(";")) typeName = typeName.substring(0, typeName.length() - 1);
             // END_CHANGE: BUG-2026-0052-1
-            emitRef(printer,Printer.TYPE, ot.getInternalName(), typeName, "", ownerInternalName);
+            emitRef(printer,Printer.TYPE, intName, typeName, "", ownerInternalName);
+            }
         } else if (type instanceof ArrayType) {
             ArrayType at = (ArrayType) type;
             writeType(printer, at.getElementType(), ownerInternalName);
