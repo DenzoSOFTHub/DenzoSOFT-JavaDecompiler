@@ -139,7 +139,13 @@ public class JavaSourceWriter implements Processor {
                 StringBuilder sb = new StringBuilder();
                 for (int pi = 0; pi < parts.length; pi++) {
                     if (pi > 0) sb.append(".");
-                    sb.append(sn(parts[pi], "cls"));
+                    String part = sn(parts[pi], "cls");
+                    // START_CHANGE: BUG-2026-0053-20260327-1 - Always prefix numeric inner class names
+                    if (part.length() > 0 && Character.isDigit(part.charAt(0))) {
+                        part = "_" + part;
+                    }
+                    // END_CHANGE: BUG-2026-0053-1
+                    sb.append(part);
                 }
                 displayName = sb.toString();
             }

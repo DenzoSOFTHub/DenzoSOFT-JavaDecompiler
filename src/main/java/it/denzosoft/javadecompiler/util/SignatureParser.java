@@ -188,10 +188,25 @@ public final class SignatureParser {
                 }
                 // Return simple name: class name after package (preserving inner class dots)
                 String fullName = sb.toString();
-                if (lastPkgDot >= 0) {
-                    return fullName.substring(lastPkgDot + 1);
+                String simpleName = lastPkgDot >= 0 ? fullName.substring(lastPkgDot + 1) : fullName;
+                // START_CHANGE: BUG-2026-0053-20260327-2 - Prefix numeric inner class names in signatures
+                if (simpleName.indexOf('.') >= 0) {
+                    String[] sigParts = simpleName.split("\\.");
+                    StringBuilder sigSb = new StringBuilder();
+                    for (int sp = 0; sp < sigParts.length; sp++) {
+                        if (sp > 0) sigSb.append(".");
+                        String sigPart = sigParts[sp];
+                        if (sigPart.length() > 0 && Character.isDigit(sigPart.charAt(0))) {
+                            sigPart = "_" + sigPart;
+                        }
+                        sigSb.append(sigPart);
+                    }
+                    simpleName = sigSb.toString();
+                } else if (simpleName.length() > 0 && Character.isDigit(simpleName.charAt(0))) {
+                    simpleName = "_" + simpleName;
                 }
-                return fullName;
+                // END_CHANGE: BUG-2026-0053-2
+                return simpleName;
                 // END_CHANGE: BUG-2026-0042-1
             }
             default:
