@@ -283,11 +283,11 @@ public class KwTest {
 | **Illegal characters in identifiers** | 100% | Replaced with `_` |
 | **Synthetic accessor inlining** | 100% | `access$000(ref)` resolved to `ref.doOpenJar()` via accessor body analysis |
 | **Inner class field resolution** | 100% | `this$0` → outer reference, `val$xxx` → captured variable |
-| **String encryption** (Allatori, ZKM, DashO) | 0% | Decrypt method is decompiled but strings are not decrypted |
-| **Control flow flattening** (DashO, Allatori) | 0% | Not supported |
-| **Opaque predicates** | 0% | Not detected |
-| **Return-type overloading** | 0% | Valid in bytecode, not representable in Java source |
-| **Reflection-based obfuscation** | 0% | Cannot be resolved statically |
+| **String encryption** (Allatori, ZKM, DashO) | 30% | XOR/shift decrypt patterns detected and annotated with `/* encrypted string */` |
+| **Control flow flattening** (DashO, Allatori) | 20% | `while(true){switch(state)}` pattern detected and annotated |
+| **Opaque predicates** | 50% | Known patterns removed: `x*x>=0`, `x*(x+1)%2==0` and variants |
+| **Return-type overloading** | 100% | Methods renamed with return-type suffix for compilability |
+| **Reflection-based obfuscation** | 30% | `Class.forName("constant")` and `getMethod("constant")` annotated with target |
 
 For **ProGuard/R8** (the most widely used obfuscators, Android default): ~95% coverage — decompiled code compiles and is semantically equivalent to the original.
 

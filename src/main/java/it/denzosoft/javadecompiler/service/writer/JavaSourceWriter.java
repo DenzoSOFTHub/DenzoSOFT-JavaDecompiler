@@ -61,6 +61,12 @@ public class JavaSourceWriter implements Processor {
         deobfuscate = config != null && Boolean.TRUE.equals(config.get("deobfuscate"));
         // END_CHANGE: IMP-LINES-8
 
+        // START_CHANGE: IMP-2026-0009-20260327-4 - Apply deobfuscation transformations
+        if (deobfuscate) {
+            it.denzosoft.javadecompiler.service.converter.transform.DeobfuscationTransformer.transform(result);
+        }
+        // END_CHANGE: IMP-2026-0009-4
+
         // START_CHANGE: LIM-0006-20260324-2 - Store major version for text block detection
         currentMajorVersion = result.getMajorVersion();
         // END_CHANGE: LIM-0006-2
@@ -1824,6 +1830,10 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             writeExpression(printer, ys.getExpression(), ownerInternalName);
             printer.printText(";");
+        // START_CHANGE: IMP-2026-0009-20260327-5 - Handle CommentStatement from deobfuscation
+        } else if (stmt instanceof CommentStatement) {
+            printer.printText(((CommentStatement) stmt).getComment());
+        // END_CHANGE: IMP-2026-0009-5
         } else {
             printer.printText("/* unsupported statement */");
         }
@@ -1972,8 +1982,19 @@ public class JavaSourceWriter implements Processor {
                 emitRef(printer,Printer.TYPE, owner, TypeNameUtil.simpleNameFromInternal(owner), "", ownerInternalName);
                 printer.printText(".");
             }
-            emitRef(printer,Printer.METHOD, owner, smie.getMethodName(), smie.getDescriptor(), ownerInternalName);
+            // START_CHANGE: IMP-2026-0009-20260327-6 - Annotate encrypted string method calls
+            String methodNameForCall = smie.getMethodName();
+            if (currentResult != null && currentResult.getReturnTypeOverloadRenames() != null) {
+                String renamed = (String) currentResult.getReturnTypeOverloadRenames().get(methodNameForCall + smie.getDescriptor());
+                if (renamed != null) methodNameForCall = renamed;
+            }
+            emitRef(printer,Printer.METHOD, owner, methodNameForCall, smie.getDescriptor(), ownerInternalName);
             writeArguments(printer, smie.getArguments(), ownerInternalName);
+            if (deobfuscate && currentResult != null && currentResult.getEncryptedStringMethods() != null
+                && currentResult.getEncryptedStringMethods().contains(smie.getMethodName())) {
+                printer.printText(" /* encrypted string */");
+            }
+            // END_CHANGE: IMP-2026-0009-6
             } // close else from access$ check
         } else if (expr instanceof NewExpression) {
             NewExpression ne = (NewExpression) expr;

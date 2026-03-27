@@ -34,6 +34,14 @@ public class JavaSyntaxResult {
     private List<AnnotationInfo> classAnnotations;
     private List<JavaSyntaxResult> innerClassResults = new ArrayList<JavaSyntaxResult>();
     private boolean isInnerClass;
+    // START_CHANGE: IMP-2026-0009-20260327-3 - Deobfuscation metadata
+    private java.util.Map<String, String> returnTypeOverloadRenames;
+    private java.util.Set<String> encryptedStringMethods;
+    public java.util.Map<String, String> getReturnTypeOverloadRenames() { return returnTypeOverloadRenames; }
+    public void setReturnTypeOverloadRenames(java.util.Map<String, String> m) { returnTypeOverloadRenames = m; }
+    public java.util.Set<String> getEncryptedStringMethods() { return encryptedStringMethods; }
+    public void setEncryptedStringMethods(java.util.Set<String> s) { encryptedStringMethods = s; }
+    // END_CHANGE: IMP-2026-0009-3
     private int innerClassAccessFlags;
 
     // Module info fields
