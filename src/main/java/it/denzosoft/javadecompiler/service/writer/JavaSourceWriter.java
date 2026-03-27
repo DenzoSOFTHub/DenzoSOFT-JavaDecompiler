@@ -1208,7 +1208,11 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("void");
         } else if (type instanceof ObjectType) {
             ObjectType ot = (ObjectType) type;
-            emitRef(printer,Printer.TYPE, ot.getInternalName(), ot.getName(), "", ownerInternalName);
+            // START_CHANGE: BUG-2026-0052-20260327-1 - Strip trailing ; from descriptor-derived names
+            String typeName = ot.getName();
+            if (typeName.endsWith(";")) typeName = typeName.substring(0, typeName.length() - 1);
+            // END_CHANGE: BUG-2026-0052-1
+            emitRef(printer,Printer.TYPE, ot.getInternalName(), typeName, "", ownerInternalName);
         } else if (type instanceof ArrayType) {
             ArrayType at = (ArrayType) type;
             writeType(printer, at.getElementType(), ownerInternalName);
@@ -1599,8 +1603,18 @@ public class JavaSourceWriter implements Processor {
             printer.printText(";");
         } else if (stmt instanceof ExpressionStatement) {
             ExpressionStatement es = (ExpressionStatement) stmt;
-            // START_CHANGE: BUG-2026-0035-20260327-1 - Ternary expression cannot be a standalone statement
             Expression esExpr = es.getExpression();
+            // START_CHANGE: BUG-2026-0050-20260327-1 - Emit monitor markers and string-only statements as comments
+            if (esExpr instanceof StringConstantExpression) {
+                String sval = ((StringConstantExpression) esExpr).getValue();
+                if (sval.contains("__MONITOR") || sval.startsWith("/*")) {
+                    printer.printText(sval);
+                    printer.endLine();
+                    return Math.max(line + 1, lineNumber + 1);
+                }
+            }
+            // END_CHANGE: BUG-2026-0050-1
+            // START_CHANGE: BUG-2026-0035-20260327-1 - Ternary expression cannot be a standalone statement
             if (esExpr instanceof TernaryExpression) {
                 // Wrap in variable assignment to make it compilable
                 printer.printText("Object _ternary" + line + " = ");
@@ -2190,6 +2204,20 @@ public class JavaSourceWriter implements Processor {
                 printer.printText(ioe.getPatternVariableName());
             }
         } else if (expr instanceof BinaryOperatorExpression) {
+            // START_CHANGE: BUG-2026-0051-20260327-1 - Convert <=> (lcmp/dcmp) to valid Java comparison
+            if ("<=>".equals(((BinaryOperatorExpression) expr).getOperator())) {
+                BinaryOperatorExpression cmpExpr = (BinaryOperatorExpression) expr;
+                String cmpClass = "Long";
+                Type lt = cmpExpr.getLeft().getType();
+                if (lt == PrimitiveType.DOUBLE) cmpClass = "Double";
+                else if (lt == PrimitiveType.FLOAT) cmpClass = "Float";
+                printer.printText(cmpClass + ".compare(");
+                writeExpression(printer, cmpExpr.getLeft(), ownerInternalName);
+                printer.printText(", ");
+                writeExpression(printer, cmpExpr.getRight(), ownerInternalName);
+                printer.printText(")");
+            } else {
+            // END_CHANGE: BUG-2026-0051-1
             // START_CHANGE: BUG-2026-0032-20260325-5 - Iterative left-chain unrolling to prevent StackOverflow
             // Collect left-associative chain iteratively: a + b + c + d → [a, b, c, d] with [+, +, +]
             java.util.List<Expression> operands = new java.util.ArrayList<Expression>();
@@ -2225,6 +2253,7 @@ public class JavaSourceWriter implements Processor {
                 if (np) printer.printText(")");
             }
             // END_CHANGE: BUG-2026-0032-5
+            } // close else from <=> check
         } else if (expr instanceof UnaryOperatorExpression) {
             UnaryOperatorExpression uoe = (UnaryOperatorExpression) expr;
             if (uoe.isPrefix()) {
