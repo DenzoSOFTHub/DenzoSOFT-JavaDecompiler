@@ -1900,7 +1900,7 @@ public class JavaSourceWriter implements Processor {
                     writeArguments(printer, remainingArgs, ownerInternalName);
                 }
                 // END_CHANGE: BUG-2026-0045-2
-            } else
+            } else {
             // Simplify autoboxing: Integer.valueOf(1) -> 1, etc.
             if ("valueOf".equals(smie.getMethodName()) && smie.getArguments().size() == 1) {
                 String autoboxOwner = smie.getOwnerInternalName();
@@ -1919,6 +1919,7 @@ public class JavaSourceWriter implements Processor {
             }
             emitRef(printer,Printer.METHOD, owner, smie.getMethodName(), smie.getDescriptor(), ownerInternalName);
             writeArguments(printer, smie.getArguments(), ownerInternalName);
+            } // close else from access$ check
         } else if (expr instanceof NewExpression) {
             NewExpression ne = (NewExpression) expr;
             printer.printKeyword("new");
