@@ -2136,8 +2136,14 @@ public class JavaSourceWriter implements Processor {
                 }
                 // END_CHANGE: BUG-2026-0044-1
             } else {
+                // START_CHANGE: BUG-2026-0055-20260327-1 - Fix numeric local class names in new expressions
+                String newTypeName = TypeNameUtil.simpleNameFromInternal(ne.getInternalTypeName());
+                if (newTypeName.length() > 0 && Character.isDigit(newTypeName.charAt(0))) {
+                    newTypeName = "_" + newTypeName;
+                }
+                // END_CHANGE: BUG-2026-0055-1
                 emitRef(printer,Printer.TYPE, ne.getInternalTypeName(),
-                    TypeNameUtil.simpleNameFromInternal(ne.getInternalTypeName()), "", ownerInternalName);
+                    newTypeName, "", ownerInternalName);
                 writeArguments(printer, ne.getArguments(), ownerInternalName);
             }
             // END_CHANGE: BUG-2026-0029-4
@@ -2614,7 +2620,13 @@ public class JavaSourceWriter implements Processor {
             NewExpression ne = (NewExpression) val;
             printer.printKeyword("new");
             printer.printText(" ");
-            printer.printText(TypeNameUtil.simpleNameFromInternal(ne.getInternalTypeName()));
+            // START_CHANGE: BUG-2026-0055-20260327-2 - Fix numeric class names in simple new expressions
+            String simpleNewName = TypeNameUtil.simpleNameFromInternal(ne.getInternalTypeName());
+            if (simpleNewName.length() > 0 && Character.isDigit(simpleNewName.charAt(0))) {
+                simpleNewName = "_" + simpleNewName;
+            }
+            printer.printText(simpleNewName);
+            // END_CHANGE: BUG-2026-0055-2
             printer.printText("(/* ... */)");
         } else if (val instanceof NewArrayExpression) {
             // Prevent recursion: emit a simplified representation
