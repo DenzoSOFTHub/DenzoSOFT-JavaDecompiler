@@ -253,11 +253,13 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         }
 
         // Methods
+        // START_CHANGE: BUG-2026-0046-20260327-3 - Include access$ synthetic methods for resolver
         for (MethodInfo method : classFile.getMethods()) {
-            if (method.isSynthetic() && !method.isBridge()) continue;
             if (method.isBridge()) continue; // bridge methods are compiler-generated, suppress
+            if (method.isSynthetic() && !method.getName().startsWith("access$")) continue;
             result.addMethod(convertMethod(method, classFile));
         }
+        // END_CHANGE: BUG-2026-0046-3
 
         return result;
     }

@@ -145,6 +145,55 @@ public class JavaSourceWriter implements Processor {
     }
     // END_CHANGE: IMP-2026-0005-2
 
+    // START_CHANGE: BUG-2026-0046-20260327-2 - Resolve access$NNN to actual private member name
+    private String resolveAccessorName(String ownerInternalName, String accessMethodName) {
+        if (currentResult == null) return null;
+        // Search in the parent result's methods for the synthetic accessor
+        JavaSyntaxResult target = currentResult;
+        if (!ownerInternalName.equals(currentResult.getInternalName())) {
+            // Try inner class results
+            target = findInnerClassResult(currentResult, ownerInternalName);
+        }
+        if (target == null) return null;
+        for (JavaSyntaxResult.MethodDeclaration md : target.getMethods()) {
+            if (accessMethodName.equals(md.name) && md.body != null && !md.body.isEmpty()) {
+                // The accessor body typically has one statement: return obj.field or obj.method()
+                for (Statement stmt : md.body) {
+                    String resolved = extractAccessTarget(stmt);
+                    if (resolved != null) return resolved;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String extractAccessTarget(Statement stmt) {
+        Expression expr = null;
+        if (stmt instanceof ReturnStatement && ((ReturnStatement) stmt).hasExpression()) {
+            expr = ((ReturnStatement) stmt).getExpression();
+        } else if (stmt instanceof ExpressionStatement) {
+            expr = ((ExpressionStatement) stmt).getExpression();
+        }
+        if (expr == null) return null;
+        // Field access: return arg0.privateField
+        if (expr instanceof FieldAccessExpression) {
+            return ((FieldAccessExpression) expr).getName();
+        }
+        // Method call: arg0.privateMethod(...)
+        if (expr instanceof MethodInvocationExpression) {
+            return ((MethodInvocationExpression) expr).getMethodName();
+        }
+        // Assignment: arg0.privateField = arg1
+        if (expr instanceof AssignmentExpression) {
+            Expression left = ((AssignmentExpression) expr).getLeft();
+            if (left instanceof FieldAccessExpression) {
+                return ((FieldAccessExpression) left).getName();
+            }
+        }
+        return null;
+    }
+    // END_CHANGE: BUG-2026-0046-2
+
     // START_CHANGE: BUG-2026-0044-20260327-3 - Find inner class result for anonymous class inlining
     private JavaSyntaxResult findInnerClassResult(JavaSyntaxResult parent, String internalName) {
         if (parent == null || parent.getInnerClassResults() == null) return null;
@@ -1879,27 +1928,33 @@ public class JavaSourceWriter implements Processor {
             StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) expr;
             // START_CHANGE: BUG-2026-0045-20260327-2 - Inline synthetic access$NNN methods
             if (smie.getMethodName().startsWith("access$") && smie.getArguments().size() >= 1) {
-                // access$000(outerRef) -> outerRef.privateMethod() or outerRef.privateField
-                // access$002(outerRef, value) -> outerRef.privateField = value
+                // START_CHANGE: BUG-2026-0046-20260327-1 - Resolve access$NNN to actual method/field via parent result
+                String resolvedName = resolveAccessorName(smie.getOwnerInternalName(), smie.getMethodName());
                 Expression outerRef = smie.getArguments().get(0);
-                writeExpression(printer, outerRef, ownerInternalName);
-                if (smie.getArguments().size() == 1) {
-                    // Getter: access$000(ref) -> ref.field or ref.method()
-                    printer.printText("." + sn(smie.getMethodName(), "mtd") + "()");
-                } else if (smie.getArguments().size() == 2) {
-                    // Setter: access$002(ref, value) -> ref.field = value
-                    printer.printText("." + sn(smie.getMethodName(), "fld") + " = ");
+                if (smie.getArguments().size() == 1 && resolvedName != null && "V".equals(TypeNameUtil.parseMethodReturnDescriptor(smie.getDescriptor()))) {
+                    // Void method call: outerRef.resolvedMethod()
+                    writeExpression(printer, outerRef, ownerInternalName);
+                    printer.printText("." + sn(resolvedName, "mtd") + "()");
+                } else if (smie.getArguments().size() == 1 && resolvedName != null) {
+                    // Getter: outerRef.resolvedField
+                    writeExpression(printer, outerRef, ownerInternalName);
+                    printer.printText("." + sn(resolvedName, "fld"));
+                } else if (smie.getArguments().size() == 2 && resolvedName != null) {
+                    // Setter: outerRef.resolvedField = value
+                    writeExpression(printer, outerRef, ownerInternalName);
+                    printer.printText("." + sn(resolvedName, "fld") + " = ");
                     writeExpression(printer, smie.getArguments().get(1), ownerInternalName);
                 } else {
-                    // Multi-arg: fallback
-                    printer.printText("." + sn(smie.getMethodName(), "mtd"));
-                    List<Expression> remainingArgs = new ArrayList<Expression>();
-                    for (int rai = 1; rai < smie.getArguments().size(); rai++) {
-                        remainingArgs.add(smie.getArguments().get(rai));
+                    // Fallback: emit as static call (the access$ method will be written as a regular method)
+                    String owner = smie.getOwnerInternalName();
+                    if (owner != null && !owner.isEmpty() && !owner.equals(ownerInternalName)) {
+                        emitRef(printer, Printer.TYPE, owner, TypeNameUtil.simpleNameFromInternal(owner), "", ownerInternalName);
+                        printer.printText(".");
                     }
-                    writeArguments(printer, remainingArgs, ownerInternalName);
+                    emitRef(printer, Printer.METHOD, owner, smie.getMethodName(), smie.getDescriptor(), ownerInternalName);
+                    writeArguments(printer, smie.getArguments(), ownerInternalName);
                 }
-                // END_CHANGE: BUG-2026-0045-2
+                // END_CHANGE: BUG-2026-0046-1
             } else {
             // Simplify autoboxing: Integer.valueOf(1) -> 1, etc.
             if ("valueOf".equals(smie.getMethodName()) && smie.getArguments().size() == 1) {
