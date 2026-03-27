@@ -1886,8 +1886,13 @@ public class JavaSourceWriter implements Processor {
             String fieldName = fae.getName();
             // START_CHANGE: BUG-2026-0045-20260327-1 - Handle synthetic inner class fields
             if (fieldName != null && fieldName.startsWith("this$")) {
-                // this$0 is the outer class reference - just write the object (usually 'this')
-                // Skip entirely - the outer reference is implicit in inlined anonymous classes
+                // this$0 is the outer class reference → OuterClass.this
+                String outerType = fae.getDescriptor();
+                if (outerType != null && outerType.startsWith("L") && outerType.endsWith(";")) {
+                    String outerName = outerType.substring(1, outerType.length() - 1);
+                    emitRef(printer, Printer.TYPE, outerName, TypeNameUtil.simpleNameFromInternal(outerName), "", ownerInternalName);
+                    printer.printText(".");
+                }
                 printer.printKeyword("this");
             } else if (fieldName != null && fieldName.startsWith("val$")) {
                 // val$xxx is a captured variable from outer scope - write just the variable name
