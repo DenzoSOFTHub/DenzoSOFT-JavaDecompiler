@@ -140,7 +140,7 @@ Prints the decompiler version and the maximum supported Java version, then exits
 **Output:**
 
 ```
-DenzoSOFT Java Decompiler v1.6.0
+DenzoSOFT Java Decompiler v1.7.0
 Supports Java 1.0 through Java 25
 ```
 

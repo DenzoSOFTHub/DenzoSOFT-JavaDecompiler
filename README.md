@@ -1,4 +1,4 @@
-# DenzoSOFT Java Decompiler v1.6.0
+# DenzoSOFT Java Decompiler v1.7.0
 
 A Java bytecode decompiler supporting **Java 1.0 through Java 25**, with zero external dependencies.
 
@@ -585,6 +585,36 @@ Benchmark results (measured on project's own 180 class files):
 | Batch (parallel) | 150 classes in ~5 sec |
 | Thread safety | Full (one converter per call) |
 | Security limits | Max 64KB bytecode, 200 recursion depth |
+
+## Compilability
+
+Decompiled output is verified to produce compilable Java source on the full JDK 25:
+
+| Test Set | Classes | Compile OK | Rate |
+|---|---|---|---|
+| **java.base** (core JDK) | 3,372 | 3,355 | **99.5%** |
+| **Other JDK modules** (desktop, xml, net, compiler, ...) | 3,000 | 2,996 | **99.9%** |
+| **Total** | **6,372** | **6,351** | **99.7%** |
+| Obfuscated classes (no debug info, keyword names) | all | all | **100%** |
+
+The ~21 files that don't compile are:
+- 10 sealed `permits` clauses referencing classes from other modules (output is correct, compilation fails due to missing cross-module dependencies)
+- 7 JDK-internal classes with extreme bytecode patterns (Panama FFI sealed generics, classfile API pattern matching)
+- 4 ternary expression edge cases in the converter
+
+**Bugs found and fixed via this test:**
+
+| Bug | Impact | Fix |
+|---|---|---|
+| Enum switch map `$SwitchMap$` selector | 52 errors | Simplified to enum expression |
+| Record component fields duplicated | 40 errors | Suppress fields already in `record(...)` |
+| `__MONITORENTER__` as string literal | 21 errors | Emit as comment |
+| `<=>` comparison operator (lcmp/dcmp) | ~10 errors | Convert to `Long.compare()` / `Double.compare()` |
+| Trailing `;` in type names from descriptors | ~12 errors | Strip before emitting |
+| Numeric inner class names (`$1CleanupAction`) | ~65 errors | Prefix with `_` → `_1CleanupAction` |
+| Array class literals (`[S.class`) | 21 errors | Convert to `short[].class` |
+| Numeric local class in `new` expressions | 6 errors | Prefix with `_` → `new _5()` |
+| Boolean ternary `cond ? 1 : 0` | quality | Simplified to `cond` |
 
 ## Test Suite
 

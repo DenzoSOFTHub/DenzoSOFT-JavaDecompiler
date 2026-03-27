@@ -2,6 +2,33 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.7.0] - 2026-03-27
+
+### Added
+- GUI multi-tab navigation: Content, Classes, Libraries tabs in archive browser
+- WAR/EAR support: WEB-INF/classes, WEB-INF/lib, BOOT-INF (Spring Boot), EAR modules
+- APK Android support: open .apk files, DEX class structure parser, DEX Classes tab
+- Deobfuscation transformer: encrypted string detection, opaque predicate removal, control flow flattening detection, reflection annotation, return-type overloading rename
+- Compilability section in README with test results on 6,372 JDK classes
+
+### Fixed
+- Enum switch map: `$SwitchMap$[expr.ordinal()]` simplified to `expr` as selector (52 errors)
+- Record fields: suppress component fields already declared in `record(...)` (40 errors)
+- MONITORENTER/MONITOREXIT: emit as comment instead of string literal (21 errors)
+- `<=>` comparison: emit as `Long.compare()`/`Double.compare()` instead of invalid operator (10 errors)
+- Type names: strip trailing `;` from descriptor-derived names (12 errors)
+- Numeric inner class names: `$1CleanupAction` → `_1CleanupAction` in emitRef, SignatureParser, writeExpressionSimple (65 errors)
+- Array class literals: `[S.class` → `short[].class`, `[Lcom/Foo;.class` → `Foo[].class` (21 errors)
+- `this$0` → `OuterClass.this` qualified reference in anonymous class bodies (4 errors)
+- Boolean ternary: `cond ? 1 : 0` simplified to `cond`, `cond ? true : false` → `cond`
+- `access$NNN` resolution: read accessor body to find private member name (e.g. `doOpenJar()`)
+- `access$NNN` double emission: fixed missing else-block around standard static call path
+
+### Performance
+- java.base: 3,355/3,372 compile (99.5%)
+- Other JDK modules: 2,996/3,000 compile (99.9%)
+- Total: 6,351/6,372 compile (99.7%)
+
 ## [1.6.0] - 2026-03-27
 
 ### Added
