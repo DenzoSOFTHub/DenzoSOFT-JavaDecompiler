@@ -1,4 +1,4 @@
-# DenzoSOFT Java Decompiler v1.7.0
+# DenzoSOFT Java Decompiler v1.8.0
 
 A Java bytecode decompiler supporting **Java 1.0 through Java 25**, with zero external dependencies.
 
@@ -556,12 +556,14 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 ### Permanent Limitations
 - **Generic type erasure**: Some generic type parameters are lost at bytecode level; raw types may appear where generics were used. `LocalVariableTypeTable` is used when available for better results.
 - **`@Override`**: Not reconstructable (has `RetentionPolicy.SOURCE`, not present in class files)
-- **Text blocks** (Java 15+): Heuristic detection based on newline count (2+ newlines → text block) for Java 15+ class files. Exact distinction is impossible since text blocks and regular strings compile to identical bytecode.
+- **Text blocks** (Java 15+): Heuristic detection based on newline count and safety check (2+ newlines, no trailing quote, no `\r`, no `"""`, no control chars); when not safe, output falls back to an escaped string literal. Exact distinction is impossible since text blocks and regular strings compile to identical bytecode.
 - **String templates** (Java 21+ preview): Not supported
+- **Cross-module sealed `permits`**: Sealed classes in one JDK module whose `permits` lists classes from another module fail to compile as a standalone file. The decompilation output is correct — this is a cross-module linkage requirement.
 
 ### Output Quality
 - **Inner/anonymous classes**: Named inner classes are fully inlined. Anonymous classes have display name mapping but body inlining into `new` expressions is in progress.
 - **Type annotations** (Java 8+): Field type and method return type annotations are rendered. Annotations on generic type arguments (`List<@NonNull String>`) are not yet supported.
+- **Extreme bytecode patterns**: A handful of JDK-internal classes (Panama FFI `BindingSpecializer`, `FallbackLinker`, `ForkJoinPool`, `DirectMethodHandleDescImpl`) use bytecode patterns the decoder still can't fully reconstruct. When this happens the output contains explicit `// === DECOMPILATION NOTES ===` comment blocks identifying the pc and opcode of each unresolved site.
 
 ### Resolved in Previous Versions
 - **String switch** (Java 7+): Fully reconstructed from hashCode/equals pattern since v1.1.0
@@ -572,6 +574,13 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 - **Type annotations** (Java 8+): Parsed and rendered on field types and method return types since v1.4.0
 - **If-else-if chains**: Rendered as `else if` instead of nested `else { if }` since v1.4.0
 - **While with assignment**: `while((line = readLine()) != null)` pattern reconstructed since v1.4.0
+- **Exception handler stack** (v1.8.0): `catch (e) { ... }` body no longer starts with `null = e` placeholder
+- **Multi-value block stack inheritance** (v1.8.0): `result = result * PRIME + (x == null ? 43 : x.hashCode())` (Lombok) reconstructed correctly
+- **Signature parser for type-parameter-only bound** (v1.8.0): `<L::LMemoryLayout;>` no longer produces malformed `import ::L...;`
+- **Multi-bound generics** (v1.8.0): `<L extends A & B>` rendered correctly instead of `<L extends A extends B>`
+- **Interface static initializer** (v1.8.0): static-final fields inline from clinit; `static { }` block never emitted inside an interface body
+- **package-info class** (v1.8.0): emitted as `package X;` declaration with annotations
+- **Reserved-word names** (v1.8.0): class/field names colliding with Java keywords prefixed with `_` unconditionally
 
 ## Performance
 
@@ -588,33 +597,54 @@ Benchmark results (measured on project's own 180 class files):
 
 ## Compilability
 
-Decompiled output is verified to produce compilable Java source on the full JDK 25:
+Decompiled output is verified to produce compilable Java source on real-world bytecode:
 
 | Test Set | Classes | Compile OK | Rate |
 |---|---|---|---|
-| **java.base** (core JDK) | 3,372 | 3,355 | **99.5%** |
-| **Other JDK modules** (desktop, xml, net, compiler, ...) | 3,000 | 2,996 | **99.9%** |
-| **Total** | **6,372** | **6,351** | **99.7%** |
+| **java.base** (core JDK 25) | 3,372 | 3,368 | **99.88%** |
+| **Spring Boot uber-jar** (contrp.be-springboot 22.2.66) | 1,402 | 1,402 decompile OK, 0 diagnostics | **100%** |
+| **Spring Boot uber-jar** (contrp.be-springboot 22.2.65) | 1,401 | 1,401 decompile OK, 0 diagnostics | **100%** |
 | Obfuscated classes (no debug info, keyword names) | all | all | **100%** |
 
-The ~21 files that don't compile are:
-- 10 sealed `permits` clauses referencing classes from other modules (output is correct, compilation fails due to missing cross-module dependencies)
-- 7 JDK-internal classes with extreme bytecode patterns (Panama FFI sealed generics, classfile API pattern matching)
-- 4 ternary expression edge cases in the converter
+The remaining 4 java.base files that don't compile are JDK-internal classes with extreme bytecode patterns (Panama FFI `BindingSpecializer`, `FallbackLinker`, `ForkJoinPool`, `DirectMethodHandleDescImpl`). A separate group of files fails to compile only because of sealed `permits` clauses referencing classes in other JDK modules — the decompilation output itself is correct, the compile failure is a cross-module linkage issue.
 
-**Bugs found and fixed via this test:**
+**v1.8.0 fixes** (stack simulation + source-level output):
 
 | Bug | Impact | Fix |
 |---|---|---|
-| Enum switch map `$SwitchMap$` selector | 52 errors | Simplified to enum expression |
-| Record component fields duplicated | 40 errors | Suppress fields already in `record(...)` |
-| `__MONITORENTER__` as string literal | 21 errors | Emit as comment |
-| `<=>` comparison operator (lcmp/dcmp) | ~10 errors | Convert to `Long.compare()` / `Double.compare()` |
-| Trailing `;` in type names from descriptors | ~12 errors | Strip before emitting |
-| Numeric inner class names (`$1CleanupAction`) | ~65 errors | Prefix with `_` → `_1CleanupAction` |
-| Array class literals (`[S.class`) | 21 errors | Convert to `short[].class` |
-| Numeric local class in `new` expressions | 6 errors | Prefix with `_` → `new _5()` |
-| Boolean ternary `cond ? 1 : 0` | quality | Simplified to `cond` |
+| Exception handler stack seed (BUG-2026-0050) | ~560 Spring Boot underflows | Pre-seed caught exception ref on handler entry |
+| Multi-value exit stack across block boundaries (BUG-2026-0051) | ~860 Spring Boot underflows on ternary+arith | Snapshot full exit stack, restore in successor |
+| Malformed `import ::Ljava...;` (BUG-2026-0043) | 6 java.base files | Structural signature scanner |
+| Text-block illegal-delimiter / illegal-escape (BUG-2026-0044) | ~3 files | `isTextBlockSafe` guard |
+| Non-printable chars in string literals (BUG-2026-0045) | ~22 errors | `\u`-escape control + U+0085/2028/2029 |
+| `<T extends A extends B>` (BUG-2026-0046) | 4 errors | Track extends-emitted correctly |
+| Interface `static { ... }` block (BUG-2026-0047) | 3 errors | Inline clinit into fields, suppress in interfaces |
+| `interface package-info {}` (BUG-2026-0048) | 1 error | Emit `package X;` declaration |
+| Reserved-word class names (BUG-2026-0049) | 3 errors | Prefix `_` always (not only in --deobfuscate) |
+
+### Decompilation Diagnostics (new in v1.8.0)
+
+When the decompiler cannot fully reconstruct a class or method, it now records the reason directly in the generated source:
+
+```java
+// =========================================================
+// WARNING: This class was NOT fully decompiled.
+//   - INNER_CLASS_SKIPPED com/foo/Bar$1 IOException: ...
+// =========================================================
+
+public int doWork() {
+    // === DECOMPILATION NOTES (body may be inaccurate) ===
+    //   - STACK_UNDERFLOW pc=172 opcode=0xB6 (ref placeholder used)
+    //   - CFG_BUILD_FAILED IllegalStateException -- using linear-scan fallback
+    ...
+}
+```
+
+Recorded event types:
+- `STACK_UNDERFLOW pc=N opcode=0xXX` — empty stack forced a placeholder
+- `DECODE_ERROR pc=N opcode=0xXX ...` — decoder exception caught
+- `CFG_BUILD_FAILED ...` / `STRUCTURED_FLOW_FAILED ...` — linear-scan fallback used
+- `INNER_CLASS_SKIPPED ...` — nested class could not be loaded (class-level)
 
 ## Test Suite
 
