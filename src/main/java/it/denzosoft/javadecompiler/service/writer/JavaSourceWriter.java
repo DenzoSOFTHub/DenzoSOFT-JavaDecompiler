@@ -113,6 +113,14 @@ public class JavaSourceWriter implements Processor {
         if (deobfuscate && name != null) {
             return IdentifierSanitizer.sanitize(name, category);
         }
+        // START_CHANGE: BUG-2026-0049-20260420-1 - Always sanitize reserved-word collisions even
+        // without deobfuscate. A class/field named "default" or "true" is valid in the class
+        // file but produces illegal source otherwise. Leave non-keyword names untouched to
+        // preserve byte-for-byte fidelity when no deobfuscation is requested.
+        if (name != null && IdentifierSanitizer.isKeyword(name)) {
+            return "_" + name;
+        }
+        // END_CHANGE: BUG-2026-0049-1
         return name;
     }
 
@@ -233,6 +241,28 @@ public class JavaSourceWriter implements Processor {
         String simpleName = TypeNameUtil.simpleNameFromInternal(internalName);
         int lineNumber = 1;
 
+        // START_CHANGE: BUG-2026-0048-20260420-1 - Emit package-info as a real `package X;`
+        // declaration carrying any package annotations. The prior output
+        // (`interface package-info {}`) is illegal source because `-` is not allowed
+        // in a Java identifier.
+        if ("package-info".equals(simpleName)) {
+            if (result.getClassAnnotations() != null) {
+                for (AnnotationInfo ann : result.getClassAnnotations()) {
+                    printer.startLine(lineNumber++);
+                    writeAnnotation(printer, ann, internalName);
+                    printer.endLine();
+                }
+            }
+            printer.startLine(lineNumber);
+            printer.printKeyword("package");
+            printer.printText(" ");
+            printer.printText(packageName);
+            printer.printText(";");
+            printer.endLine();
+            return;
+        }
+        // END_CHANGE: BUG-2026-0048-1
+
         // START_CHANGE: BUG-2026-0029-20260325-2 - Build anonymous class display name map from inner class results
         anonymousClassDisplayNames.clear();
         buildAnonymousClassMap(result);
@@ -252,6 +282,31 @@ public class JavaSourceWriter implements Processor {
             printer.endLine();
             lineNumber++;
         }
+
+        // START_CHANGE: IMP-2026-0002-20260420-14 - Class-level decompilation banner.
+        // Gives the reader an immediate, top-of-file signal that this source is incomplete
+        // and lists every class-scoped issue (pipeline errors, skipped inner classes).
+        if (result.decompilationNotes != null && !result.decompilationNotes.isEmpty()) {
+            printer.startLine(lineNumber);
+            printer.printText("// =========================================================");
+            printer.endLine();
+            lineNumber++;
+            printer.startLine(lineNumber);
+            printer.printText("// WARNING: This class was NOT fully decompiled.");
+            printer.endLine();
+            lineNumber++;
+            for (String note : result.decompilationNotes) {
+                printer.startLine(lineNumber);
+                printer.printText("//   - " + note);
+                printer.endLine();
+                lineNumber++;
+            }
+            printer.startLine(lineNumber);
+            printer.printText("// =========================================================");
+            printer.endLine();
+            lineNumber++;
+        }
+        // END_CHANGE: IMP-2026-0002-14
 
         // Package declaration
         if (!packageName.isEmpty()) {
@@ -501,6 +556,10 @@ public class JavaSourceWriter implements Processor {
                 if (method.isConstructor() && method.parameterTypes.size() <= 2) continue;
             }
             // END_CHANGE: ISS-2026-0012-2
+            // START_CHANGE: BUG-2026-0047-20260420-3 - Always skip clinit on interfaces
+            // (Java forbids `static { ... }` inside an interface body).
+            if (result.isInterface() && "<clinit>".equals(method.name)) continue;
+            // END_CHANGE: BUG-2026-0047-3
             // Skip clinit if all its statements were inlined into field declarations
             if ("<clinit>".equals(method.name) && !inlinedFieldNames.isEmpty()) {
                 boolean allInlined = true;
@@ -777,7 +836,17 @@ public class JavaSourceWriter implements Processor {
                 }
             }
             printer.startLine(lineNumber++);
-            writeField(printer, field, innerInternalName);
+            // START_CHANGE: BUG-2026-0047-20260420-1 - Inline static-final field initializers
+            // from the inner class's own clinit. Previously this only happened for top-level
+            // classes, so interfaces nested inside another class rendered their clinit as a
+            // `static { ... }` block -- illegal in Java interfaces.
+            if (field.isStatic() && field.initialValue == null && innerStaticInits.containsKey(field.name)) {
+                writeFieldWithInit(printer, field, innerInternalName, innerStaticInits.get(field.name));
+                innerInlinedFieldNames.add(field.name);
+            } else {
+                writeField(printer, field, innerInternalName);
+            }
+            // END_CHANGE: BUG-2026-0047-1
             printer.endLine();
         }
 
@@ -793,6 +862,34 @@ public class JavaSourceWriter implements Processor {
                 if (method.isConstructor() && method.parameterTypes.size() <= 2) continue;
                 if ("<clinit>".equals(method.name)) continue;
             }
+            // START_CHANGE: BUG-2026-0047-20260420-2 - Suppress clinit in interfaces entirely
+            // (the Java grammar forbids `static { ... }` inside an interface body). Fields that
+            // required initialization were already inlined above; anything else in clinit
+            // (assertion bootstrap, etc.) is synthetic and safe to drop.
+            if (inner.isInterface() && "<clinit>".equals(method.name)) continue;
+            // Also skip if all remaining clinit statements correspond to already-inlined fields.
+            if ("<clinit>".equals(method.name) && !innerInlinedFieldNames.isEmpty()) {
+                boolean allInlined = true;
+                if (method.body != null) {
+                    for (Statement s : method.body) {
+                        if (s instanceof ReturnStatement && !((ReturnStatement) s).hasExpression()) continue;
+                        if (s instanceof ExpressionStatement) {
+                            Expression e = ((ExpressionStatement) s).getExpression();
+                            if (e instanceof AssignmentExpression) {
+                                Expression lhs = ((AssignmentExpression) e).getLeft();
+                                if (lhs instanceof FieldAccessExpression
+                                        && innerInlinedFieldNames.contains(((FieldAccessExpression) lhs).getName())) {
+                                    continue;
+                                }
+                            }
+                        }
+                        allInlined = false;
+                        break;
+                    }
+                }
+                if (allInlined) continue;
+            }
+            // END_CHANGE: BUG-2026-0047-2
             if (innerFirstMethod && !inner.getFields().isEmpty()) {
                 printer.startLine(lineNumber++);
                 printer.endLine();
@@ -1112,31 +1209,92 @@ public class JavaSourceWriter implements Processor {
     }
     // END_CHANGE: BUG-2026-0036-1
 
-    // START_CHANGE: BUG-2026-0040-20260327-2 - Extract class names from generic signatures for imports
+    // START_CHANGE: BUG-2026-0043-20260420-1 - Proper structural JVM signature parser.
+    // The prior naive scan treated every 'L' as start of a class descriptor, which was wrong
+    // inside a type-parameter declaration block: "<L::Ljava/lang/foreign/MemoryLayout;>..."
+    // would capture "::Ljava/lang/foreign/MemoryLayout" because the type-variable name "L"
+    // was itself mistaken for a class descriptor. Result: malformed "import ::Ljava..." lines.
     private void collectSignatureImports(Set<String> imports, String signature, String thisPackage) {
-        // Parse class names from JVM generic signature: Ljava/util/List<Ljava/lang/String;>;
+        if (signature == null || signature.isEmpty()) return;
         int i = 0;
-        while (i < signature.length()) {
-            if (signature.charAt(i) == 'L') {
-                int end = i + 1;
-                while (end < signature.length() && signature.charAt(end) != ';' && signature.charAt(end) != '<') {
-                    end++;
+        // Type-parameter declaration block: <Name:Bound[:Bound]*;...>
+        if (signature.charAt(i) == '<') {
+            i++;
+            while (i < signature.length() && signature.charAt(i) != '>') {
+                // Skip the type parameter identifier up to the first ':'
+                while (i < signature.length() && signature.charAt(i) != ':' && signature.charAt(i) != '>') i++;
+                // Bounds: one or more ':' separators, each followed by a type (class or type-var)
+                while (i < signature.length() && signature.charAt(i) == ':') {
+                    i++;
+                    // "::" = missing class bound, only interface bound follows
+                    if (i < signature.length() && signature.charAt(i) == ':') continue;
+                    // Empty bound (just before '>' or ':' again)
+                    if (i < signature.length() && (signature.charAt(i) == '>' || signature.charAt(i) == ':')) continue;
+                    i = scanSignatureType(imports, signature, i, thisPackage);
                 }
-                if (end > i + 1) {
-                    String internalName = signature.substring(i + 1, end);
-                    addImport(imports, internalName, thisPackage);
-                }
-                i = end;
-            } else {
-                i++;
             }
+            if (i < signature.length()) i++; // past '>'
+        }
+        // Remaining: method sig "(Params)Ret" or field sig "Type"
+        while (i < signature.length()) {
+            char c = signature.charAt(i);
+            if (c == '(' || c == ')' || c == '^') { i++; continue; }
+            i = scanSignatureType(imports, signature, i, thisPackage);
         }
     }
-    // END_CHANGE: BUG-2026-0040-2
+
+    private int scanSignatureType(Set<String> imports, String sig, int i, String thisPackage) {
+        while (i < sig.length() && sig.charAt(i) == '[') i++;
+        if (i >= sig.length()) return i;
+        char c = sig.charAt(i);
+        if (c == 'L') {
+            i++;
+            int start = i;
+            while (i < sig.length() && sig.charAt(i) != ';' && sig.charAt(i) != '<' && sig.charAt(i) != '.') i++;
+            String internalName = sig.substring(start, i);
+            addImport(imports, internalName, thisPackage);
+            // Type arguments
+            if (i < sig.length() && sig.charAt(i) == '<') {
+                i = scanSignatureTypeArgs(imports, sig, i + 1, thisPackage);
+            }
+            // Inner class chain: .Inner[<...>]
+            while (i < sig.length() && sig.charAt(i) == '.') {
+                i++;
+                while (i < sig.length() && sig.charAt(i) != ';' && sig.charAt(i) != '<' && sig.charAt(i) != '.') i++;
+                if (i < sig.length() && sig.charAt(i) == '<') {
+                    i = scanSignatureTypeArgs(imports, sig, i + 1, thisPackage);
+                }
+            }
+            if (i < sig.length() && sig.charAt(i) == ';') i++;
+        } else if (c == 'T') {
+            // Type variable reference Txxx;
+            while (i < sig.length() && sig.charAt(i) != ';') i++;
+            if (i < sig.length()) i++;
+        } else {
+            // primitive / V / unknown
+            i++;
+        }
+        return i;
+    }
+
+    private int scanSignatureTypeArgs(Set<String> imports, String sig, int i, String thisPackage) {
+        while (i < sig.length() && sig.charAt(i) != '>') {
+            char c = sig.charAt(i);
+            if (c == '*' || c == '+' || c == '-') { i++; continue; }
+            i = scanSignatureType(imports, sig, i, thisPackage);
+        }
+        if (i < sig.length()) i++; // past '>'
+        return i;
+    }
+    // END_CHANGE: BUG-2026-0043-1
 
     // START_CHANGE: BUG-2026-0039-20260327-1 - Fix inner class import: import outer class, use Outer.Inner in code
     private void addImport(Set<String> imports, String internalName, String thisPackage) {
         if (internalName == null) return;
+        // START_CHANGE: BUG-2026-0043-20260420-2 - Defensive: reject obviously malformed names
+        // so a single bad signature doesn't poison the imports block with e.g. "::Ljava.lang..."
+        if (!isValidInternalName(internalName)) return;
+        // END_CHANGE: BUG-2026-0043-2
         // For inner classes (Outer$Inner), import the outer class only
         int dollar = internalName.indexOf('$');
         String importName = dollar >= 0 ? internalName.substring(0, dollar) : internalName;
@@ -1145,6 +1303,22 @@ public class JavaSourceWriter implements Processor {
             imports.add(TypeNameUtil.internalToQualified(importName));
         }
     }
+
+    // START_CHANGE: BUG-2026-0043-20260420-3 - Validate internal class names before importing
+    private static boolean isValidInternalName(String name) {
+        if (name.isEmpty()) return false;
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c == '/' || c == '$' || c == '_' || (c >= '0' && c <= '9')
+                    || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) continue;
+            return false;
+        }
+        // Must start with letter, '_' or '$' -- not a digit or slash
+        char first = name.charAt(0);
+        if (first == '/' || (first >= '0' && first <= '9')) return false;
+        return true;
+    }
+    // END_CHANGE: BUG-2026-0043-3
     // END_CHANGE: BUG-2026-0039-1
 
     private void writeAccessFlags(Printer printer, int accessFlags, boolean isClass) {
@@ -1517,6 +1691,22 @@ public class JavaSourceWriter implements Processor {
             currentBytecodeInstructions = (showBytecode && method.bytecodeInstructions != null)
                 ? method.bytecodeInstructions : null;
             // END_CHANGE: IMP-LINES-10
+
+            // START_CHANGE: IMP-2026-0002-20260420-13 - Emit per-method decompilation notes
+            // so readers see where the body was reconstructed from placeholders or fallbacks.
+            if (method.decompilationNotes != null && !method.decompilationNotes.isEmpty()) {
+                printer.startLine(lineNumber);
+                printer.printText("// === DECOMPILATION NOTES (body may be inaccurate) ===");
+                printer.endLine();
+                lineNumber++;
+                for (String note : method.decompilationNotes) {
+                    printer.startLine(lineNumber);
+                    printer.printText("//   - " + note);
+                    printer.endLine();
+                    lineNumber++;
+                }
+            }
+            // END_CHANGE: IMP-2026-0002-13
 
             for (Statement stmt : method.body) {
                 // Skip trailing void return in constructors and void methods
@@ -1950,17 +2140,21 @@ public class JavaSourceWriter implements Processor {
             StringConstantExpression sce = (StringConstantExpression) expr;
             // START_CHANGE: LIM-0006-20260324-3 - Emit text block for Java 15+ strings with newlines
             // START_CHANGE: BUG-2026-0023-20260324-1 - Require at least 2 newlines for text block detection
-            if (currentMajorVersion >= 59 && sce.getValue().indexOf("\n") != sce.getValue().lastIndexOf("\n")) {
+            // START_CHANGE: BUG-2026-0044-20260420-1 - Only use text block when content is
+            // unambiguously safe. Previously any string with 2+ newlines became a text block,
+            // producing `illegal text block open delimiter` or `illegal escape` errors when
+            // the content had trailing `"`, lone `\r`, or non-printable chars that a text block
+            // would misinterpret. Fall back to a regular escaped literal in those cases.
+            String sVal = sce.getValue();
+            if (currentMajorVersion >= 59
+                    && sVal.indexOf("\n") != sVal.lastIndexOf("\n")
+                    && isTextBlockSafe(sVal)) {
             // END_CHANGE: BUG-2026-0023-1
-                String raw = sce.getValue();
-                // Ensure text block ends with newline for proper closing delimiter
-                if (!raw.endsWith("\n")) {
-                    raw = raw + "\\";
-                }
-                printer.printStringConstant("\"\"\"\n" + raw + "\"\"\"", ownerInternalName);
+                printer.printStringConstant("\"\"\"\n" + sVal + "\"\"\"", ownerInternalName);
             } else {
-                printer.printStringConstant("\"" + escapeString(sce.getValue()) + "\"", ownerInternalName);
+                printer.printStringConstant("\"" + escapeString(sVal) + "\"", ownerInternalName);
             }
+            // END_CHANGE: BUG-2026-0044-1
             // END_CHANGE: LIM-0006-3
         } else if (expr instanceof NullExpression) {
             printer.printKeyword("null");
@@ -2723,11 +2917,51 @@ public class JavaSourceWriter implements Processor {
                 case '\t': sb.append("\\t"); break;
                 case '\b': sb.append("\\b"); break;
                 case '\f': sb.append("\\f"); break;
-                default: sb.append(c); break;
+                // START_CHANGE: BUG-2026-0045-20260420-1 - Escape all non-printable / non-ASCII
+                // control chars so they don't leak into source as illegal characters
+                // (e.g. U+2028, U+0085, U+E800, bell, backspace ranges).
+                default:
+                    if (c < 0x20 || c == 0x7f || isProblematicLineTerminator(c)) {
+                        sb.append('\\');
+                        sb.append('u');
+                        sb.append(String.format("%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+                    break;
+                // END_CHANGE: BUG-2026-0045-1
             }
         }
         return sb.toString();
     }
+
+    // START_CHANGE: BUG-2026-0045-20260420-2 - Chars javac treats as line terminators in source
+    // even when they appear inside a literal. These must be backslash-u escaped or they
+    // break compilation.
+    private static boolean isProblematicLineTerminator(char c) {
+        return c == 0x85 || c == 0x2028 || c == 0x2029;
+    }
+    // END_CHANGE: BUG-2026-0045-2
+
+    // START_CHANGE: BUG-2026-0044-20260420-2 - A text block is only safe when content has no
+    // unescaped constructs that would trip the text-block lexer: trailing quotes, `"""`
+    // sequences, lone `\r` (text blocks normalize line endings), backslash escapes the user
+    // would need to re-escape, or source-level line terminators other than `\n`.
+    private static boolean isTextBlockSafe(String s) {
+        if (s.isEmpty()) return false;
+        // A trailing quote merges with the closing `"""` delimiter.
+        if (s.charAt(s.length() - 1) == '"') return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\') return false;             // would need re-escaping
+            if (c == '\r') return false;             // CR normalized to LF, changes value
+            if (c < 0x20 && c != '\n' && c != '\t') return false;
+            if (c == 0x7f || isProblematicLineTerminator(c)) return false;
+        }
+        // No `"""` substring (would prematurely close the block).
+        return s.indexOf("\"\"\"") < 0;
+    }
+    // END_CHANGE: BUG-2026-0044-2
 
     @SuppressWarnings("unchecked")
     private void writeAnnotation(Printer printer, AnnotationInfo annotation, String ownerInternalName) {

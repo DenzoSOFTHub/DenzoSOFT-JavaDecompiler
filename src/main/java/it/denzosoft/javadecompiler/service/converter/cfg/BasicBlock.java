@@ -71,6 +71,25 @@ public class BasicBlock {
     /** Stack expression remaining after block decode (for ternary detection) */
     public Expression stackTopExpression;
 
+    // START_CHANGE: BUG-2026-0051-20260420-1 - Full exit-stack snapshot for multi-value
+    // inheritance across block boundaries (fixes IADD / compound-arith underflow seen in
+    // ternary-in-expression patterns like Lombok hashCode: `result * PRIME + (ternary)`).
+    /** Complete operand stack contents when this block finishes decoding, in push-order
+     *  (bottom first). A following block whose predecessor exited in a non-branching way
+     *  reuses this to reconstruct its entry stack. Null = not yet decoded. */
+    public java.util.List<Expression> exitStack;
+    // END_CHANGE: BUG-2026-0051-1
+
+    // START_CHANGE: BUG-2026-0050-20260420-1 - Mark blocks reached via the exception handler
+    // mechanism. The JVM pushes the caught exception onto the operand stack before branching
+    // to a handler; without this flag the decoder sees an empty stack and emits a
+    // STACK_UNDERFLOW placeholder instead of the exception reference.
+    /** True if this block is the target of an exception handler entry. */
+    public boolean isExceptionHandler;
+    /** Internal name of the caught exception type (or "java/lang/Throwable" for catch-all). */
+    public String exceptionHandlerType;
+    // END_CHANGE: BUG-2026-0050-1
+
     public BasicBlock(int startPc) {
         this.startPc = startPc;
         this.endPc = startPc;

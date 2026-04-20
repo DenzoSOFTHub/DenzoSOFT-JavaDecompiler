@@ -43,6 +43,12 @@ public class JavaSyntaxResult {
     public void setEncryptedStringMethods(java.util.Set<String> s) { encryptedStringMethods = s; }
     // END_CHANGE: IMP-2026-0009-3
     private int innerClassAccessFlags;
+    // START_CHANGE: IMP-2026-0002-20260420-12 - Class-level decompilation diagnostics.
+    // Captures issues that don't belong to any single method: skipped inner classes,
+    // signature parse failures, pipeline stage fallbacks. Emitted as a banner at the top
+    // of the generated source file so the user sees "this class was not fully reconstructed".
+    public java.util.List<String> decompilationNotes;
+    // END_CHANGE: IMP-2026-0002-12
 
     // Module info fields
     private String moduleName;
@@ -177,6 +183,12 @@ public class JavaSyntaxResult {
         /** Map from source line number to list of disassembled bytecode instructions for that line. */
         public java.util.Map<Integer, java.util.List<String>> bytecodeInstructions;
         // END_CHANGE: IMP-LINES-5
+        // START_CHANGE: IMP-2026-0002-20260420-1 - Diagnostics: per-method notes about places
+        // where decompilation had to fall back to a placeholder or skip state. Emitted as a
+        // comment block immediately before the method body so the reader knows exactly
+        // which parts of the method were not reconstructed cleanly.
+        public java.util.List<String> decompilationNotes;
+        // END_CHANGE: IMP-2026-0002-1
 
         public MethodDeclaration(int accessFlags, String name, String descriptor,
                                    Type returnType, List<Type> parameterTypes,

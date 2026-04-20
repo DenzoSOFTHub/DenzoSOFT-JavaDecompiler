@@ -228,26 +228,32 @@ public final class SignatureParser {
             String paramName = sig.substring(pos[0], colonPos);
             sb.append(paramName);
             pos[0] = colonPos + 1;
+            // START_CHANGE: BUG-2026-0046-20260420-1 - Track bound emission properly.
+            // Previously when a non-Object class bound was present, the flag tracking "first
+            // bound already written with extends" was never set, so the first interface bound
+            // re-emitted "extends" producing "<L extends A extends B>" (illegal). Now we flip
+            // the flag as soon as any bound (class or interface) is emitted.
+            boolean extendsEmitted = false;
             // Parse class bound (may be empty)
             if (pos[0] < sig.length() && sig.charAt(pos[0]) != ':' && sig.charAt(pos[0]) != '>') {
                 String bound = parseTypeSignature(sig, pos);
                 if (!"Object".equals(bound) && !"java.lang.Object".equals(bound)) {
                     sb.append(" extends ").append(bound);
+                    extendsEmitted = true;
                 }
             }
-            // Parse interface bounds
-            boolean hasClassBound = false;
+            // Parse interface bounds (one or more, each introduced by ':')
             while (pos[0] < sig.length() && sig.charAt(pos[0]) == ':') {
                 pos[0]++;
                 String iBound = parseTypeSignature(sig, pos);
-                if (!hasClassBound) {
-                    // First interface bound after empty/Object class bound: use extends
+                if (!extendsEmitted) {
                     sb.append(" extends ").append(iBound);
-                    hasClassBound = true;
+                    extendsEmitted = true;
                 } else {
                     sb.append(" & ").append(iBound);
                 }
             }
+            // END_CHANGE: BUG-2026-0046-1
         }
         if (pos[0] < sig.length()) pos[0]++; // skip '>'
         sb.append('>');

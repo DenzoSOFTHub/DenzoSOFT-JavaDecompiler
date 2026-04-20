@@ -94,7 +94,15 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     outerResult.addInnerClassResult(innerResult);
                 }
             } catch (Exception e) {
-                // Skip inner class if it can't be loaded or decompiled
+                // START_CHANGE: IMP-2026-0002-20260420-11 - Surface inner-class skip to the outer
+                // class's diagnostics so the generated source flags the missing nested class.
+                if (outerResult.decompilationNotes == null) {
+                    outerResult.decompilationNotes = new ArrayList<String>();
+                }
+                outerResult.decompilationNotes.add("INNER_CLASS_SKIPPED " + ic.innerClassName
+                    + " " + e.getClass().getSimpleName()
+                    + (e.getMessage() != null ? ": " + e.getMessage() : ""));
+                // END_CHANGE: IMP-2026-0002-11
             }
         }
     }
@@ -337,6 +345,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             thrownExceptions.addAll(Arrays.asList(exc.getExceptions()));
         }
 
+        // START_CHANGE: IMP-2026-0002-20260420-9 - Reset per-method diagnostics before body conversion
+        currentMethodDiagnostics = new ArrayList<String>();
+        currentDecodePc = -1;
+        currentDecodeOpcode = -1;
+        // END_CHANGE: IMP-2026-0002-9
+
         // Decompile method body
         List<Statement> bodyStatements = new ArrayList<Statement>();
         if (code != null) {
@@ -441,6 +455,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             md.returnTypeAnnotations = returnTypeAnns;
         }
         // END_CHANGE: LIM-0004-9
+        // START_CHANGE: IMP-2026-0002-20260420-10 - Attach accumulated diagnostics to the method
+        if (!currentMethodDiagnostics.isEmpty()) {
+            md.decompilationNotes = new ArrayList<String>(currentMethodDiagnostics);
+        }
+        // END_CHANGE: IMP-2026-0002-10
         return md;
     }
 
@@ -618,6 +637,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         try {
             cfg.build();
         } catch (Exception e) {
+            // START_CHANGE: IMP-2026-0002-20260420-7 - Note the fallback so the reader knows
+            // the method body comes from a linear-scan recovery, not the structured path.
+            recordDiagnostic("CFG_BUILD_FAILED " + e.getClass().getSimpleName()
+                + (e.getMessage() != null ? ": " + e.getMessage() : "")
+                + " -- using linear-scan fallback (loops/conditionals may be degraded)");
+            // END_CHANGE: IMP-2026-0002-7
             // Fallback to linear scan if CFG build fails
             return decompileMethodBodyLinear(codeAttr, pool, method, pcToLine, localVarNames, localVarDescriptors);
         }
@@ -811,6 +836,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 return result;
             }
         } catch (Exception e) {
+            // START_CHANGE: IMP-2026-0002-20260420-8 - Structured-flow fallback diagnostic
+            recordDiagnostic("STRUCTURED_FLOW_FAILED " + e.getClass().getSimpleName()
+                + (e.getMessage() != null ? ": " + e.getMessage() : "")
+                + " -- using linear-scan fallback");
+            // END_CHANGE: IMP-2026-0002-8
             // Fallback to linear scan
         }
 
@@ -839,6 +869,45 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     private Map<String, List<String>> patternSwitchLabels;
     // END_CHANGE: LIM-0005-1
 
+    // START_CHANGE: IMP-2026-0002-20260420-2 - Per-method decompilation diagnostics.
+    // Every silent fallback (stack underflow -> placeholder, opcode decode exception,
+    // CFG build failure, inner-class skip) appends a note here; the note is then emitted
+    // as a comment before the method body so readers see exactly what went wrong and where.
+    private List<String> currentMethodDiagnostics = new ArrayList<String>();
+    private int currentDecodePc = -1;
+    private int currentDecodeOpcode = -1;
+
+    private void recordDiagnostic(String note) {
+        currentMethodDiagnostics.add(note);
+    }
+
+    private Expression popOrUnderflowInt(Deque<Expression> stack, int line) {
+        if (stack.isEmpty()) {
+            recordUnderflow("int");
+            return IntegerConstantExpression.valueOf(line, 0);
+        }
+        return stack.pop();
+    }
+
+    private Expression popOrUnderflowRef(Deque<Expression> stack) {
+        if (stack.isEmpty()) {
+            recordUnderflow("ref");
+            return NullExpression.INSTANCE;
+        }
+        return stack.pop();
+    }
+
+    private void recordUnderflow(String kind) {
+        StringBuilder sb = new StringBuilder("STACK_UNDERFLOW");
+        if (currentDecodePc >= 0) sb.append(" pc=").append(currentDecodePc);
+        if (currentDecodeOpcode >= 0) {
+            sb.append(" opcode=0x").append(Integer.toHexString(currentDecodeOpcode).toUpperCase());
+        }
+        sb.append(" (").append(kind).append(" placeholder used)");
+        recordDiagnostic(sb.toString());
+    }
+    // END_CHANGE: IMP-2026-0002-2
+
     /**
      * Decode instructions in a single basic block.
      * Populates block.statements and block.condition.
@@ -850,20 +919,50 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         if (currentBytecode == null || block.startPc >= currentBytecode.length) return;
 
         Deque<Expression> stack = new ArrayDeque<Expression>();
-        // Seed stack from predecessor blocks that left a value (e.g., split try blocks)
+        // START_CHANGE: BUG-2026-0050-20260420-3 - Pre-seed the operand stack of exception
+        // handler blocks with a reference to the caught exception. The JVM transfers control
+        // to a handler with exactly one value on the stack (the exception); the typical first
+        // instruction `astore_N` needs that value to produce `localN = <exception>`.
+        if (block.isExceptionHandler) {
+            String excType = block.exceptionHandlerType != null
+                ? block.exceptionHandlerType : "java/lang/Throwable";
+            stack.push(new LocalVariableExpression(block.lineNumber, new ObjectType(excType), "$exception", 0));
+        } else // END_CHANGE: BUG-2026-0050-3
+        // START_CHANGE: BUG-2026-0051-20260420-2 - Seed the entire stack from a predecessor's
+        // exit snapshot when available (handles compound arithmetic around ternaries and
+        // other expressions whose sub-values span block boundaries). Falls back to the prior
+        // single-slot `stackTopExpression` behaviour when no snapshot exists.
         if (block.predecessors != null) {
+            BasicBlock source = null;
             for (BasicBlock pred : block.predecessors) {
-                if (pred.stackTopExpression != null &&
-                    (pred.type == BasicBlock.FALL_THROUGH || pred.type == BasicBlock.NORMAL)) {
-                    stack.push(pred.stackTopExpression);
-                    // Inherit line number from predecessor if this block has none
-                    if (block.lineNumber == 0 && pred.lineNumber > 0) {
-                        block.lineNumber = pred.lineNumber;
-                    }
+                if (pred.exitStack != null && !pred.exitStack.isEmpty()
+                        && (pred.type == BasicBlock.FALL_THROUGH || pred.type == BasicBlock.NORMAL
+                            || pred.type == BasicBlock.GOTO || pred.type == BasicBlock.CONDITIONAL)) {
+                    source = pred;
                     break;
                 }
             }
+            if (source != null) {
+                for (int i = 0; i < source.exitStack.size(); i++) {
+                    stack.push(source.exitStack.get(i));
+                }
+                if (block.lineNumber == 0 && source.lineNumber > 0) {
+                    block.lineNumber = source.lineNumber;
+                }
+            } else {
+                for (BasicBlock pred : block.predecessors) {
+                    if (pred.stackTopExpression != null &&
+                        (pred.type == BasicBlock.FALL_THROUGH || pred.type == BasicBlock.NORMAL)) {
+                        stack.push(pred.stackTopExpression);
+                        if (block.lineNumber == 0 && pred.lineNumber > 0) {
+                            block.lineNumber = pred.lineNumber;
+                        }
+                        break;
+                    }
+                }
+            }
         }
+        // END_CHANGE: BUG-2026-0051-2
         List<Statement> stmts = new ArrayList<Statement>();
         ByteReader reader = new ByteReader(currentBytecode);
         reader.setOffset(block.startPc);
@@ -895,9 +994,19 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             }
 
             try {
+                // START_CHANGE: IMP-2026-0002-20260420-3 - Track pc/opcode for underflow diagnostics
+                currentDecodePc = pc;
+                currentDecodeOpcode = opcode;
+                // END_CHANGE: IMP-2026-0002-3
                 decodeOpcode(opcode, reader, stack, stmts, pool, localVarNames,
                              localVarDescriptors, currentLine, method, currentBytecode, pc);
             } catch (Exception e) {
+                // START_CHANGE: IMP-2026-0002-20260420-4 - Record decoder exceptions too
+                recordDiagnostic("DECODE_ERROR pc=" + pc
+                    + " opcode=0x" + Integer.toHexString(opcode).toUpperCase()
+                    + " " + e.getClass().getSimpleName()
+                    + (e.getMessage() != null ? ": " + e.getMessage() : ""));
+                // END_CHANGE: IMP-2026-0002-4
                 stmts.add(new ExpressionStatement(
                     new StringConstantExpression(currentLine,
                         "/* ERROR: opcode 0x" + Integer.toHexString(opcode) + " at pc=" + pc + " */")));
@@ -914,6 +1023,18 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         if (!stack.isEmpty()) {
             block.stackTopExpression = stack.peek();
         }
+        // START_CHANGE: BUG-2026-0051-20260420-3 - Snapshot full exit stack so successors
+        // can restore the complete operand state, not just the top value.
+        if (!stack.isEmpty()) {
+            List<Expression> snapshot = new ArrayList<Expression>(stack.size());
+            // Iterator over Deque yields top-first; reverse so list is bottom-first.
+            Iterator<Expression> it = stack.iterator();
+            List<Expression> topFirst = new ArrayList<Expression>();
+            while (it.hasNext()) topFirst.add(it.next());
+            for (int i = topFirst.size() - 1; i >= 0; i--) snapshot.add(topFirst.get(i));
+            block.exitStack = snapshot;
+        }
+        // END_CHANGE: BUG-2026-0051-3
     }
 
     /**
@@ -942,37 +1063,37 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         switch (opcode) {
             // Single-operand: compare with 0
             case 0x99: { // ifeq → branch if == 0 → Java condition: != 0
-                Expression val = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression val = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                     val, "!=", IntegerConstantExpression.valueOf(line, 0));
                 break;
             }
             case 0x9A: { // ifne → branch if != 0 → Java condition: == 0
-                Expression val = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression val = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                     val, "==", IntegerConstantExpression.valueOf(line, 0));
                 break;
             }
             case 0x9B: { // iflt → branch if < 0 → Java condition: >= 0
-                Expression val = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression val = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                     val, ">=", IntegerConstantExpression.valueOf(line, 0));
                 break;
             }
             case 0x9C: { // ifge → branch if >= 0 → Java condition: < 0
-                Expression val = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression val = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                     val, "<", IntegerConstantExpression.valueOf(line, 0));
                 break;
             }
             case 0x9D: { // ifgt → branch if > 0 → Java condition: <= 0
-                Expression val = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression val = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                     val, "<=", IntegerConstantExpression.valueOf(line, 0));
                 break;
             }
             case 0x9E: { // ifle → branch if <= 0 → Java condition: > 0
-                Expression val = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression val = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                     val, ">", IntegerConstantExpression.valueOf(line, 0));
                 break;
@@ -980,65 +1101,65 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
             // Two-operand: compare two values
             case 0x9F: { // if_icmpeq → branch if == → Java condition: !=
-                Expression b = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression a = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression b = popOrUnderflowInt(stack, line);
+                Expression a = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN, a, "!=", b);
                 break;
             }
             case 0xA0: { // if_icmpne → branch if != → Java condition: ==
-                Expression b = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression a = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression b = popOrUnderflowInt(stack, line);
+                Expression a = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN, a, "==", b);
                 break;
             }
             case 0xA1: { // if_icmplt → branch if < → Java condition: >=
-                Expression b = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression a = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression b = popOrUnderflowInt(stack, line);
+                Expression a = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN, a, ">=", b);
                 break;
             }
             case 0xA2: { // if_icmpge → branch if >= → Java condition: <
-                Expression b = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression a = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression b = popOrUnderflowInt(stack, line);
+                Expression a = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN, a, "<", b);
                 break;
             }
             case 0xA3: { // if_icmpgt → branch if > → Java condition: <=
-                Expression b = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression a = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression b = popOrUnderflowInt(stack, line);
+                Expression a = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN, a, "<=", b);
                 break;
             }
             case 0xA4: { // if_icmple → branch if <= → Java condition: >
-                Expression b = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression a = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression b = popOrUnderflowInt(stack, line);
+                Expression a = popOrUnderflowInt(stack, line);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN, a, ">", b);
                 break;
             }
 
             // Reference comparison
             case 0xA5: { // if_acmpeq
-                Expression b = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
-                Expression a = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression b = popOrUnderflowRef(stack);
+                Expression a = popOrUnderflowRef(stack);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN, a, "!=", b);
                 break;
             }
             case 0xA6: { // if_acmpne
-                Expression b = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
-                Expression a = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression b = popOrUnderflowRef(stack);
+                Expression a = popOrUnderflowRef(stack);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN, a, "==", b);
                 break;
             }
 
             // Null checks
             case 0xC6: { // ifnull → branch if null → Java condition: != null
-                Expression val = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression val = popOrUnderflowRef(stack);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                     val, "!=", NullExpression.INSTANCE);
                 break;
             }
             case 0xC7: { // ifnonnull → branch if not null → Java condition: == null
-                Expression val = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression val = popOrUnderflowRef(stack);
                 condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                     val, "==", NullExpression.INSTANCE);
                 break;
@@ -1087,12 +1208,19 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             int opcode = reader.readUnsignedByte();
 
             try {
+                // START_CHANGE: IMP-2026-0002-20260420-5 - Track pc/opcode for underflow diagnostics
+                currentDecodePc = pc;
+                currentDecodeOpcode = opcode;
+                // END_CHANGE: IMP-2026-0002-5
                 decodeOpcode(opcode, reader, stack, statements, pool, localVarNames,
                              localVarDescriptors, currentLine, method, bytecode, pc);
             } catch (Exception e) {
                 // Log the error as a comment and continue decompilation
                 String hexOpcode = "0x" + Integer.toHexString(opcode).toUpperCase();
                 String errorDetail = e.getClass().getSimpleName() + ": " + e.getMessage();
+                // START_CHANGE: IMP-2026-0002-20260420-6 - Record decoder exceptions
+                recordDiagnostic("DECODE_ERROR pc=" + pc + " opcode=" + hexOpcode + " " + errorDetail);
+                // END_CHANGE: IMP-2026-0002-6
                 statements.add(new ExpressionStatement(
                     new StringConstantExpression(currentLine,
                         "/* ERROR: Unable to decompile opcode " + hexOpcode +
@@ -1192,8 +1320,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
             // Array operations (loads)
             case 0x2E: case 0x2F: case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: { // iaload..saload
-                Expression idx = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression arr = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression idx = popOrUnderflowInt(stack, line);
+                Expression arr = popOrUnderflowRef(stack);
                 stack.push(new ArrayAccessExpression(line, PrimitiveType.INT, arr, idx));
                 break;
             }
@@ -1232,9 +1360,9 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
             // Array operations (stores)
             case 0x4F: case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: { // iastore..sastore
-                Expression val = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression idx = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression arr = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression val = popOrUnderflowInt(stack, line);
+                Expression idx = popOrUnderflowInt(stack, line);
+                Expression arr = popOrUnderflowRef(stack);
                 // START_CHANGE: ISS-2026-0002-20260323-3 - Detect array init pattern: newarray + dup + idx + val + iastore
                 if (arr instanceof NewArrayExpression) {
                     NewArrayExpression nae = (NewArrayExpression) arr;
@@ -1406,8 +1534,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
             // comparison ops
             case 0x94: case 0x95: case 0x96: case 0x97: case 0x98: { // lcmp, fcmp, dcmp
-                Expression b = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                Expression a = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression b = popOrUnderflowInt(stack, line);
+                Expression a = popOrUnderflowInt(stack, line);
                 stack.push(new BinaryOperatorExpression(line, PrimitiveType.INT, a, "<=>", b));
                 break;
             }
@@ -1417,7 +1545,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 int offset = reader.readShort();
                 int targetPc = pc + offset;
                 if (!suppressBranchComments) {
-                    Expression val = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                    Expression val = popOrUnderflowInt(stack, line);
                     String op;
                     switch (opcode) {
                         case 0x99: op = "=="; break;
@@ -1439,8 +1567,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 int offset = reader.readShort();
                 int targetPc = pc + offset;
                 if (!suppressBranchComments) {
-                    Expression val2 = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-                    Expression val1 = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                    Expression val2 = popOrUnderflowInt(stack, line);
+                    Expression val1 = popOrUnderflowInt(stack, line);
                     String op;
                     switch (opcode) {
                         case 0x9F: op = "=="; break;
@@ -1462,8 +1590,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 int offset = reader.readShort();
                 int targetPc = pc + offset;
                 if (!suppressBranchComments) {
-                    Expression val2 = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
-                    Expression val1 = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                    Expression val2 = popOrUnderflowRef(stack);
+                    Expression val1 = popOrUnderflowRef(stack);
                     String op = (opcode == 0xA5) ? "==" : "!=";
                     statements.add(new ExpressionStatement(
                         new StringConstantExpression(line,
@@ -1510,7 +1638,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
             // Returns
             case 0xAC: { // ireturn
-                Expression val = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression val = popOrUnderflowInt(stack, line);
                 statements.add(new ReturnStatement(line, val));
                 break;
             }
@@ -1530,7 +1658,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 break;
             }
             case 0xB0: { // areturn
-                Expression val = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression val = popOrUnderflowRef(stack);
                 statements.add(new ReturnStatement(line, val));
                 break;
             }
@@ -1555,7 +1683,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 String fieldName = pool.getMemberName(index);
                 String desc = pool.getMemberDescriptor(index);
                 Type fieldType = parseType(desc);
-                Expression value = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression value = popOrUnderflowRef(stack);
                 Expression field = new FieldAccessExpression(line, fieldType, null, className, fieldName, desc);
                 statements.add(new ExpressionStatement(
                     new AssignmentExpression(line, fieldType, field, "=", value)));
@@ -1577,7 +1705,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 String fieldName = pool.getMemberName(index);
                 String desc = pool.getMemberDescriptor(index);
                 Type fieldType = parseType(desc);
-                Expression value = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression value = popOrUnderflowRef(stack);
                 Expression obj = stack.isEmpty() ? new ThisExpression(line, ObjectType.OBJECT) : stack.pop();
                 Expression field = new FieldAccessExpression(line, fieldType, obj, className, fieldName, desc);
                 statements.add(new ExpressionStatement(
@@ -1601,7 +1729,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
                 List<Expression> args = new ArrayList<Expression>();
                 for (int i = paramDescs.length - 1; i >= 0; i--) {
-                    Expression arg = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                    Expression arg = popOrUnderflowRef(stack);
                     // START_CHANGE: BUG-2026-0043-20260327-2 - Convert int constants to correct types for typed params
                     if (arg instanceof IntegerConstantExpression) {
                         int v = ((IntegerConstantExpression) arg).getValue();
@@ -1664,7 +1792,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
                 List<Expression> args = new ArrayList<Expression>();
                 for (int i = paramDescs.length - 1; i >= 0; i--) {
-                    Expression arg = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                    Expression arg = popOrUnderflowRef(stack);
                     // START_CHANGE: BUG-2026-0043-20260327-3 - Convert int constants to correct types for typed params (static)
                     if (arg instanceof IntegerConstantExpression) {
                         int v = ((IntegerConstantExpression) arg).getValue();
@@ -1701,7 +1829,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
                 List<Expression> args = new ArrayList<Expression>();
                 for (int i = paramDescs.length - 1; i >= 0; i--) {
-                    args.add(0, stack.isEmpty() ? NullExpression.INSTANCE : stack.pop());
+                    args.add(0, popOrUnderflowRef(stack));
                 }
 
                 // Detect string concatenation pattern (Java 9+)
@@ -1936,7 +2064,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             // newarray
             case 0xBC: {
                 int atype = reader.readUnsignedByte();
-                Expression count = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression count = popOrUnderflowInt(stack, line);
                 stack.push(new NewArrayExpression(line, primitiveArrayType(atype), Collections.singletonList(count)));
                 break;
             }
@@ -1945,7 +2073,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             case 0xBD: {
                 int index = reader.readUnsignedShort();
                 String className = pool.getClassName(index);
-                Expression count = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+                Expression count = popOrUnderflowInt(stack, line);
                 Type elemType;
                 if (className != null && className.startsWith("[")) {
                     elemType = parseType(className);
@@ -1958,14 +2086,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
             // Misc
             case 0xBE: { // arraylength
-                Expression arr = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression arr = popOrUnderflowRef(stack);
                 stack.push(new FieldAccessExpression(line, PrimitiveType.INT, arr, "", "length", "I"));
                 break;
             }
 
             // Throw
             case 0xBF: { // athrow
-                Expression exception = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression exception = popOrUnderflowRef(stack);
                 statements.add(new ThrowStatement(line, exception));
                 break;
             }
@@ -1974,7 +2102,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             case 0xC0: { // checkcast
                 int index = reader.readUnsignedShort();
                 String className = pool.getClassName(index);
-                Expression expr = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression expr = popOrUnderflowRef(stack);
                 Type castType;
                 if (className != null && className.startsWith("[")) {
                     castType = parseType(className);
@@ -1987,7 +2115,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             case 0xC1: { // instanceof
                 int index = reader.readUnsignedShort();
                 String className = pool.getClassName(index);
-                Expression expr = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression expr = popOrUnderflowRef(stack);
                 Type instType;
                 if (className != null && className.startsWith("[")) {
                     instType = parseType(className);
@@ -2001,7 +2129,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             // START_CHANGE: ISS-2026-0008-20260324-1 - Emit sync markers for synchronized reconstruction
             // monitorenter
             case 0xC2: {
-                Expression monExpr = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                Expression monExpr = popOrUnderflowRef(stack);
                 statements.add(new ExpressionStatement(
                     new StringConstantExpression(line, "/* __MONITORENTER__ */")));
                 break;
@@ -2053,7 +2181,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 int offset = reader.readShort();
                 int targetPc = pc + offset;
                 if (!suppressBranchComments) {
-                    Expression val = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+                    Expression val = popOrUnderflowRef(stack);
                     String op = (opcode == 0xC6) ? "== null" : "!= null";
                     statements.add(new ExpressionStatement(
                         new StringConstantExpression(line,
@@ -2122,7 +2250,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             String desc = (String) descriptors.get(index);
             type = desc != null ? parseType(desc) : defaultType;
         }
-        Expression value = stack.isEmpty() ? NullExpression.INSTANCE : stack.pop();
+        Expression value = popOrUnderflowRef(stack);
 
         // START_CHANGE: LIM-0002-20260324-1 - Infer type from RHS when descriptor is unavailable (e.g., TWR temp vars)
         if (type == ObjectType.OBJECT && value != null && value.getType() != null
@@ -2238,18 +2366,18 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     }
 
     private void binaryOp(Deque<Expression> stack, String op, Type type, int line) {
-        Expression right = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
-        Expression left = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+        Expression right = popOrUnderflowInt(stack, line);
+        Expression left = popOrUnderflowInt(stack, line);
         stack.push(new BinaryOperatorExpression(line, type, left, op, right));
     }
 
     private void unaryOp(Deque<Expression> stack, String op, Type type, int line) {
-        Expression expr = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+        Expression expr = popOrUnderflowInt(stack, line);
         stack.push(new UnaryOperatorExpression(line, type, op, expr, true));
     }
 
     private void castTop(Deque<Expression> stack, Type targetType, int line) {
-        Expression expr = stack.isEmpty() ? IntegerConstantExpression.valueOf(line, 0) : stack.pop();
+        Expression expr = popOrUnderflowInt(stack, line);
         stack.push(new CastExpression(line, targetType, expr));
     }
 

@@ -2,6 +2,29 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.8.0] - 2026-04-20
+
+### Added
+- **Decompilation diagnostics in generated source** (IMP-2026-0002): every silent recovery path now records a machine-readable note visible to the reader.
+  - Class-level `// WARNING: This class was NOT fully decompiled.` banner listing class-scoped issues.
+  - Per-method `// === DECOMPILATION NOTES ===` block immediately before the method body.
+  - Event types: `STACK_UNDERFLOW`, `DECODE_ERROR`, `CFG_BUILD_FAILED`, `STRUCTURED_FLOW_FAILED`, `INNER_CLASS_SKIPPED`.
+
+### Fixed
+- **Exception handler operand-stack seed** (BUG-2026-0050): handler blocks pre-seeded with the caught exception reference so the opening `astore` captures it correctly (hundreds of spurious `catch (e) { null = e; ... }` patterns eliminated on Spring Boot bytecode).
+- **Multi-value exit-stack inheritance** (BUG-2026-0051): full operand-stack snapshot saved at block exit and restored at successor entry. Fixes compound arithmetic around ternaries, including Lombok `hashCode()` pattern `result = result * PRIME + (x == null ? 43 : x.hashCode())`.
+- **Malformed `import ::Ljava...;`** (BUG-2026-0043): signature scanner rewritten as a structural parser that handles interface-only bounds (`<L::L...>`) without mistaking the type-parameter name for a class descriptor.
+- **`<L extends A extends B>` generics** (BUG-2026-0046): class-bound-then-interface-bound now correctly renders as `<L extends A & B>`.
+- **Text-block emission safety** (BUG-2026-0044): `isTextBlockSafe` guard rejects content with trailing quote, `\r`, `"""`, backslash, or source-level line terminators other than `\n`. Falls back to escaped string literal.
+- **Control-char / line-terminator escape** (BUG-2026-0045): `escapeString` now `\u`-escapes every char < 0x20 (except `\n` / `\t`), 0x7f, and U+0085 / U+2028 / U+2029.
+- **Interface `static { }` initializer** (BUG-2026-0047): static-final assignments from `<clinit>` now inline into the field declaration for inner classes too; clinit is suppressed entirely in interface bodies.
+- **`package-info` class output** (BUG-2026-0048): rendered as `package X;` declaration with annotations instead of illegal `interface package-info {}`.
+- **Reserved-word class / field names** (BUG-2026-0049): names colliding with Java keywords (e.g., `SystemModules$default`) are now prefixed with `_` regardless of `--deobfuscate`.
+
+### Performance
+- java.base: 3,368/3,372 non-permits-clean (99.88%); remaining 4 files carry explicit decompilation notes.
+- Spring Boot uber-jars: 2,803/2,803 classes decompiled, **0 decompilation diagnostics**, **0 stack underflows**.
+
 ## [1.7.0] - 2026-03-27
 
 ### Added

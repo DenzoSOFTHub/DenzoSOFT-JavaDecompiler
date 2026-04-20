@@ -129,6 +129,23 @@ public class ControlFlowGraph {
         if (blocks.isEmpty()) return;
         entryBlock = blocks.get(0);
 
+        // START_CHANGE: BUG-2026-0050-20260420-2 - Tag handler-entry blocks so the decoder
+        // can pre-seed the operand stack with the caught exception. Without this the
+        // `astore` at handler start underflows and the exception ref is replaced with null.
+        if (exceptionTable != null) {
+            for (CodeAttribute.ExceptionEntry entry : exceptionTable) {
+                BasicBlock handler = blockMap.get(entry.handlerPc);
+                if (handler != null) {
+                    handler.isExceptionHandler = true;
+                    // Prefer a concrete type; `catchType == 0` means catch-all (finally).
+                    if (handler.exceptionHandlerType == null) {
+                        handler.exceptionHandlerType = "java/lang/Throwable";
+                    }
+                }
+            }
+        }
+        // END_CHANGE: BUG-2026-0050-2
+
         // Step 3: Determine block types and successors
         for (BasicBlock block : blocks) {
             classifyBlock(block);

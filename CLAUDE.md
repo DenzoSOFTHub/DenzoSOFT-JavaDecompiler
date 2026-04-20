@@ -11,22 +11,22 @@ Package: `it.denzosoft.javadecompiler`. Build: `mvn clean package`.
 
 ```bash
 mvn clean compile          # Compile
-mvn clean package          # Build JAR (target/java-decompiler-1.7.0.jar)
+mvn clean package          # Build JAR (target/java-decompiler-1.8.0.jar)
 mvn test                   # Run tests (if surefire configured)
 ```
 
 **Running the decompiler:**
 ```bash
-java -jar target/java-decompiler-1.7.0.jar                                   # GUI (default)
-java -jar target/java-decompiler-1.7.0.jar <file.class>                      # CLI, line-aligned
-java -jar target/java-decompiler-1.7.0.jar --compact <file.class>            # Compact output
-java -jar target/java-decompiler-1.7.0.jar --show-bytecode <file.class>      # Inline bytecode instructions
-java -jar target/java-decompiler-1.7.0.jar --show-native-info <file.class>   # JNI info on native methods
-java -jar target/java-decompiler-1.7.0.jar --deobfuscate <file.class>        # Sanitize obfuscated names
-java -jar target/java-decompiler-1.7.0.jar <file.jar> <ClassName>            # From JAR
-java -jar target/java-decompiler-1.7.0.jar --batch <file.jar> <output-dir>   # Batch
-java -jar target/java-decompiler-1.7.0.jar --gui [file.jar ...]              # GUI explicit
-java -jar target/java-decompiler-1.7.0.jar --trace <dir> <file>              # Tracing
+java -jar target/java-decompiler-1.8.0.jar                                   # GUI (default)
+java -jar target/java-decompiler-1.8.0.jar <file.class>                      # CLI, line-aligned
+java -jar target/java-decompiler-1.8.0.jar --compact <file.class>            # Compact output
+java -jar target/java-decompiler-1.8.0.jar --show-bytecode <file.class>      # Inline bytecode instructions
+java -jar target/java-decompiler-1.8.0.jar --show-native-info <file.class>   # JNI info on native methods
+java -jar target/java-decompiler-1.8.0.jar --deobfuscate <file.class>        # Sanitize obfuscated names
+java -jar target/java-decompiler-1.8.0.jar <file.jar> <ClassName>            # From JAR
+java -jar target/java-decompiler-1.8.0.jar --batch <file.jar> <output-dir>   # Batch
+java -jar target/java-decompiler-1.8.0.jar --gui [file.jar ...]              # GUI explicit
+java -jar target/java-decompiler-1.8.0.jar --trace <dir> <file>              # Tracing
 ```
 
 **Running the test suite** (custom test runner, not JUnit — requires JDK 25 javac):
