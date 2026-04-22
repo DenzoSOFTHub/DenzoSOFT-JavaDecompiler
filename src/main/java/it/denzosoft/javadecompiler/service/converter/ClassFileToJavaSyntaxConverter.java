@@ -484,6 +484,73 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         return md;
     }
 
+    // START_CHANGE: IMP-2026-0062-20260422-19 - JD-Core pipeline entry points.
+    // Opt-in behind a system property / env var so existing callers are unaffected.
+    // Once the new emitter reaches feature parity with the legacy flow builder this
+    // will become the default (and the legacy StructuredFlowBuilder will go away).
+    private static boolean useJdPipeline() {
+        String sys = System.getProperty("denzo.jd.pipeline");
+        if (sys != null && ("true".equalsIgnoreCase(sys) || "1".equals(sys))) return true;
+        String env = System.getenv("DENZO_JD_PIPELINE");
+        return env != null && ("1".equals(env) || "true".equalsIgnoreCase(env));
+    }
+
+    private List<Statement> runJdPipeline(
+            final MethodInfo method, final ConstantPool pool, final CodeAttribute codeAttr,
+            final Map<Integer, String> localVarNames,
+            final Map<Integer, String> localVarDescriptors) {
+        // Bridge: decode each jd.BasicBlock's bytecode range into Statements
+        // using our existing decodeOpcode / stack-simulation pipeline.
+        final byte[] code = codeAttr.getCode();
+        it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder.BlockDecoder decoder
+            = new it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder.BlockDecoder() {
+                public void decode(it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock bb) {
+                    List<Statement> stmts = decodeBytecodeRange(bb.getFromOffset(), bb.getToOffset(),
+                        pool, method, localVarNames, localVarDescriptors, bb.getFirstLineNumber());
+                    bb.statements = stmts;
+                }
+            };
+        it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder jdBuilder =
+            new it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder(method, pool, decoder);
+        return jdBuilder.build();
+    }
+
+    /** Decode a bytecode range [startPc, endPc) to a Statement list using our converter's decoder. */
+    private List<Statement> decodeBytecodeRange(int startPc, int endPc,
+            ConstantPool pool, MethodInfo method,
+            Map<Integer, String> localVarNames, Map<Integer, String> localVarDescriptors,
+            int startLine) {
+        // Reuse the legacy decodeBasicBlock by constructing a transient legacy block
+        // over [startPc, endPc). The legacy decoder mutates block.statements which we
+        // return as the jd block's statement list.
+        BasicBlock transient_ = new BasicBlock(startPc);
+        transient_.endPc = endPc;
+        transient_.type = BasicBlock.NORMAL;
+        transient_.lineNumber = startLine;
+        Map<Integer, Integer> pcToLine = buildPcToLineMap(codeAttribute(method));
+        decodeBasicBlock(transient_, pool, method, localVarNames, localVarDescriptors, pcToLine);
+        return transient_.statements != null ? transient_.statements : new ArrayList<Statement>();
+    }
+
+    private static CodeAttribute codeAttribute(MethodInfo method) {
+        return method.findAttribute("Code");
+    }
+
+    private Map<Integer, Integer> buildPcToLineMap(CodeAttribute codeAttr) {
+        Map<Integer, Integer> pcToLine = new HashMap<Integer, Integer>();
+        if (codeAttr == null) return pcToLine;
+        for (Attribute a : codeAttr.getAttributes()) {
+            if (a instanceof LineNumberTableAttribute) {
+                LineNumberTableAttribute lnt = (LineNumberTableAttribute) a;
+                for (LineNumberTableAttribute.LineNumber e : lnt.getLineNumbers()) {
+                    pcToLine.put(Integer.valueOf(e.startPc), Integer.valueOf(e.lineNumber));
+                }
+            }
+        }
+        return pcToLine;
+    }
+    // END_CHANGE: IMP-2026-0062-19
+
     private List<AnnotationInfo> extractAnnotations(List<Attribute> attributes) {
         List<AnnotationInfo> result = new ArrayList<AnnotationInfo>();
         for (Attribute attr : attributes) {
@@ -778,6 +845,35 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 decodeBasicBlock(block, fPool, fMethod, localVarNames, localVarDescriptors, fPcToLine);
             }
         };
+
+        // START_CHANGE: IMP-2026-0062-20260422-18 - JD-Core pipeline opt-in.
+        // When `-Ddenzo.jd.pipeline=true` or env `DENZO_JD_PIPELINE=1` is set, run the
+        // ported ControlFlowGraphMaker + Reducer + GotoReducer + JdFlowBuilder emitter
+        // instead of the legacy pattern-matcher. The new pipeline physically reduces
+        // the CFG graph (no "visited as claim-tracker" truncation). If it succeeds we
+        // return its output; if it throws we fall through to the legacy path so a
+        // single failure cannot regress the whole build.
+        if (useJdPipeline()) {
+            try {
+                List<Statement> jdResult = runJdPipeline(method, pool, codeAttr,
+                    localVarNames, localVarDescriptors);
+                if (jdResult != null) {
+                    if (!preDeclarations.isEmpty()) {
+                        List<Statement> withDecls = new ArrayList<Statement>();
+                        withDecls.addAll(preDeclarations);
+                        withDecls.addAll(jdResult);
+                        jdResult = withDecls;
+                    }
+                    mergeDeclarationsWithAssignments(jdResult);
+                    return jdResult;
+                }
+            } catch (Exception e) {
+                recordDiagnostic("JD_PIPELINE_FAILED " + e.getClass().getSimpleName()
+                    + (e.getMessage() != null ? ": " + e.getMessage() : "")
+                    + " -- falling back to legacy StructuredFlowBuilder");
+            }
+        }
+        // END_CHANGE: IMP-2026-0062-18
 
         // Build structured statements from CFG
         StructuredFlowBuilder builder = new StructuredFlowBuilder(cfg, decoder);
