@@ -10,9 +10,118 @@
 package it.denzosoft.javadecompiler.service.converter.cfg.jd;
 
 import it.denzosoft.javadecompiler.model.classfile.ConstantPool;
+import it.denzosoft.javadecompiler.model.classfile.attribute.CodeAttribute;
 
 public final class ByteCodeParser {
     private ByteCodeParser() {}
+
+    /** 1-arg helper used by the reducer: reads code/constants from the block's CFG. */
+    public static int evalStackDepth(BasicBlock bb) {
+        ControlFlowGraph cfg = bb.getControlFlowGraph();
+        if (cfg == null) return 0;
+        CodeAttribute code = cfg.getMethod().findAttribute("Code");
+        if (code == null) return 0;
+        return evalStackDepth(cfg.getConstants(), code.getCode(), bb);
+    }
+
+    /** Last opcode in bb (or 0 if empty). Ignores operands. */
+    public static int getLastOpcode(BasicBlock bb) {
+        ControlFlowGraph cfg = bb.getControlFlowGraph();
+        if (cfg == null) return 0;
+        CodeAttribute codeAttr = cfg.getMethod().findAttribute("Code");
+        if (codeAttr == null) return 0;
+        byte[] code = codeAttr.getCode();
+        int offset = bb.getFromOffset();
+        int toOffset = bb.getToOffset();
+        if (offset >= toOffset) return 0;
+        int lastOffset = offset;
+        while (offset < toOffset) {
+            int opcode = code[offset] & 0xFF;
+            lastOffset = offset++;
+            offset += opcodeOperandBytes(code, lastOffset, opcode);
+        }
+        return code[lastOffset] & 0xFF;
+    }
+
+    /**
+     * Return the first opcode at or after bb.fromOffset whose PC is &le; maxOffset.
+     * Used by the reducer to special-case synthetic blocks by their leading opcode.
+     */
+    public static int searchNextOpcode(BasicBlock bb, int maxOffset) {
+        ControlFlowGraph cfg = bb.getControlFlowGraph();
+        if (cfg == null) return 0;
+        CodeAttribute codeAttr = cfg.getMethod().findAttribute("Code");
+        if (codeAttr == null) return 0;
+        byte[] code = codeAttr.getCode();
+        int offset = bb.getFromOffset();
+        int toOffset = bb.getToOffset();
+        if (toOffset > maxOffset) toOffset = maxOffset;
+        while (offset < toOffset) {
+            int opcode = code[offset] & 0xFF;
+            offset += 1 + opcodeOperandBytes(code, offset, opcode);
+        }
+        if (offset <= maxOffset) return code[offset] & 0xFF;
+        return 0;
+    }
+
+    /**
+     * Size in bytes of an opcode's operand (does NOT include the opcode byte).
+     * For variable-length opcodes (tableswitch / lookupswitch / wide) we compute
+     * the actual extent.
+     */
+    private static int opcodeOperandBytes(byte[] code, int offset, int opcode) {
+        switch (opcode) {
+            // 1-byte operand
+            case 16: case 18: case 21: case 22: case 23: case 24: case 25:
+            case 54: case 55: case 56: case 57: case 58:
+            case 169: case 188:
+                return 1;
+            // 2-byte operand
+            case 17: case 19: case 20: case 132: case 153: case 154: case 155:
+            case 156: case 157: case 158: case 159: case 160: case 161: case 162:
+            case 163: case 164: case 165: case 166: case 167: case 168: case 178:
+            case 179: case 180: case 181: case 182: case 183: case 184: case 187:
+            case 189: case 192: case 193: case 198: case 199:
+                return 2;
+            // 3-byte operand
+            case 197:
+                return 3;
+            // 4-byte operand
+            case 185: case 186: case 200: case 201:
+                return 4;
+            // TABLESWITCH
+            case 170: {
+                int base = offset + 1;
+                int pad = (4 - (base % 4)) % 4;
+                int idx = base + pad;
+                idx += 4; // default
+                int low = ((code[idx++] & 0xFF) << 24) | ((code[idx++] & 0xFF) << 16)
+                        | ((code[idx++] & 0xFF) << 8)  | (code[idx++] & 0xFF);
+                int high = ((code[idx++] & 0xFF) << 24) | ((code[idx++] & 0xFF) << 16)
+                         | ((code[idx++] & 0xFF) << 8)  | (code[idx++] & 0xFF);
+                idx += 4 * (high - low + 1);
+                return idx - offset - 1;
+            }
+            // LOOKUPSWITCH
+            case 171: {
+                int base = offset + 1;
+                int pad = (4 - (base % 4)) % 4;
+                int idx = base + pad;
+                idx += 4; // default
+                int npairs = ((code[idx++] & 0xFF) << 24) | ((code[idx++] & 0xFF) << 16)
+                           | ((code[idx++] & 0xFF) << 8)  | (code[idx++] & 0xFF);
+                idx += 8 * npairs;
+                return idx - offset - 1;
+            }
+            // WIDE: 3 bytes (wide + opcode + index, unless wide iinc = 5 bytes)
+            case 196: {
+                int op2 = code[offset + 1] & 0xFF;
+                return op2 == 132 ? 5 : 3;
+            }
+            default:
+                return 0;
+        }
+    }
 
     public static int evalStackDepth(ConstantPool constants, byte[] code, BasicBlock bb) {
         int depth = 0;
