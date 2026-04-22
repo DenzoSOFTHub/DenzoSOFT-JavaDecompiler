@@ -101,6 +101,19 @@ public class BasicBlock {
     protected List<ExceptionHandler> exceptionHandlers = EMPTY_EXCEPTION_HANDLERS;
     protected List<SwitchCase> switchCases = EMPTY_SWITCH_CASES;
     protected HashSet<BasicBlock> predecessors;
+    // START_CHANGE: IMP-2026-0062-20260422-14 - Java-syntax statements + exit stack
+    // produced by decoding this block's bytecode range. Populated by the bridge that
+    // hooks our existing decodeOpcode pipeline into the JD-Core flow graph: for every
+    // STATEMENTS / CONDITIONAL_BRANCH block, the bytes [fromOffset, toOffset) are
+    // interpreted and the resulting List<Statement> stored here. The emitter walks the
+    // reduced CFG and splices these per-block lists together according to the block's
+    // structured type.
+    public java.util.List<it.denzosoft.javadecompiler.model.javasyntax.statement.Statement> statements;
+    public it.denzosoft.javadecompiler.model.javasyntax.expression.Expression stackTopExpression;
+    public java.util.List<it.denzosoft.javadecompiler.model.javasyntax.expression.Expression> exitStack;
+    public it.denzosoft.javadecompiler.model.javasyntax.expression.Expression conditionExpression;
+    // END_CHANGE: IMP-2026-0062-14
+
 
     public BasicBlock(ControlFlowGraph controlFlowGraph, int index, BasicBlock original) {
         this(controlFlowGraph, index, original, new HashSet<BasicBlock>());
