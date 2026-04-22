@@ -297,7 +297,7 @@ public class ControlFlowGraphMaker {
             }
         }
 
-        ControlFlowGraph cfg = new ControlFlowGraph(method);
+        ControlFlowGraph cfg = new ControlFlowGraph(method, constants);
 
         // ----- Pass 2: build offset->line map; line transitions can split blocks -----
         LineNumberTableAttribute lnt = null;

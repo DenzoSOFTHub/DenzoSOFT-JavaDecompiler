@@ -21,12 +21,25 @@ public class ControlFlowGraph {
     protected List<BasicBlock> list = new ArrayList<BasicBlock>();
     /** offsetToLineNumbers[pc] -> source line; 0 if unknown. */
     protected int[] offsetToLineNumbers = null;
+    // START_CHANGE: IMP-2026-0062-20260422-9 - Stash constant pool on the CFG.
+    // JD-Core's Method.getConstants() is what ByteCodeParser reaches for from a
+    // BasicBlock; our MethodInfo doesn't track the containing class so we keep
+    // the ConstantPool here.
+    protected it.denzosoft.javadecompiler.model.classfile.ConstantPool constants;
+    // END_CHANGE: IMP-2026-0062-9
 
     public ControlFlowGraph(MethodInfo method) {
         this.method = method;
     }
 
+    public ControlFlowGraph(MethodInfo method,
+                            it.denzosoft.javadecompiler.model.classfile.ConstantPool constants) {
+        this.method = method;
+        this.constants = constants;
+    }
+
     public MethodInfo getMethod() { return method; }
+    public it.denzosoft.javadecompiler.model.classfile.ConstantPool getConstants() { return constants; }
     public List<BasicBlock> getBasicBlocks() { return list; }
     public BasicBlock getStart() { return list.get(0); }
 
