@@ -24,13 +24,18 @@ import it.denzosoft.javadecompiler.model.classfile.ConstantPool;
 import it.denzosoft.javadecompiler.model.classfile.MethodInfo;
 import it.denzosoft.javadecompiler.model.javasyntax.expression.BooleanExpression;
 import it.denzosoft.javadecompiler.model.javasyntax.expression.Expression;
+import it.denzosoft.javadecompiler.model.javasyntax.expression.IntegerConstantExpression;
 import it.denzosoft.javadecompiler.model.javasyntax.expression.StringConstantExpression;
 import it.denzosoft.javadecompiler.model.javasyntax.statement.BlockStatement;
 import it.denzosoft.javadecompiler.model.javasyntax.statement.ExpressionStatement;
 import it.denzosoft.javadecompiler.model.javasyntax.statement.IfElseStatement;
 import it.denzosoft.javadecompiler.model.javasyntax.statement.IfStatement;
 import it.denzosoft.javadecompiler.model.javasyntax.statement.Statement;
+import it.denzosoft.javadecompiler.model.javasyntax.statement.SwitchStatement;
+import it.denzosoft.javadecompiler.model.javasyntax.statement.TryCatchStatement;
 import it.denzosoft.javadecompiler.model.javasyntax.statement.WhileStatement;
+import it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType;
+import it.denzosoft.javadecompiler.model.javasyntax.type.Type;
 
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -156,7 +161,7 @@ public class JdFlowBuilder {
                 case BasicBlock.TYPE_LOOP: {
                     // Minimal loop emission: treat as while(true) over sub1.
                     // Full loop reconstruction (condition on header vs trailer, do-while,
-                    // for-init/update) happens in LoopReducer output — extend in future.
+                    // for-init/update) happens in LoopReducer output -- extend in future.
                     Expression loopCond = new BooleanExpression(line, true);
                     List<Statement> body = new ArrayList<Statement>();
                     emit(bb.getSub1(), body, visited);
@@ -165,6 +170,66 @@ public class JdFlowBuilder {
                     bb = bb.getNext();
                     continue;
                 }
+                // START_CHANGE: IMP-2026-0062-20260422-16 - TRY emission.
+                // The reducer produces a TRY block with sub1 = try body, exceptionHandlers
+                // = per-type catch entries. Each handler's basicBlock is the start of its
+                // catch body. A null throwable name on a handler indicates `finally`.
+                case BasicBlock.TYPE_TRY:
+                case BasicBlock.TYPE_TRY_ECLIPSE:
+                case BasicBlock.TYPE_TRY_JSR: {
+                    List<Statement> tryBody = new ArrayList<Statement>();
+                    emit(bb.getSub1(), tryBody, visited);
+                    List<TryCatchStatement.CatchClause> catches = new ArrayList<TryCatchStatement.CatchClause>();
+                    Statement finallyBody = null;
+                    for (ExceptionHandler eh : bb.getExceptionHandlers()) {
+                        List<Statement> handlerBody = new ArrayList<Statement>();
+                        emit(eh.getBasicBlock(), handlerBody, visited);
+                        BlockStatement hBlock = new BlockStatement(line, handlerBody);
+                        if (eh.getInternalThrowableName() == null) {
+                            finallyBody = hBlock;
+                        } else {
+                            List<Type> types = new ArrayList<Type>();
+                            types.add(new ObjectType(eh.getInternalThrowableName()));
+                            if (eh.getOtherInternalThrowableNames() != null) {
+                                for (String n : eh.getOtherInternalThrowableNames()) {
+                                    types.add(new ObjectType(n));
+                                }
+                            }
+                            catches.add(new TryCatchStatement.CatchClause(types, "e", hBlock));
+                        }
+                    }
+                    out.add(new TryCatchStatement(line,
+                        new BlockStatement(line, tryBody),
+                        catches, finallyBody, null));
+                    bb = bb.getNext();
+                    continue;
+                }
+                // END_CHANGE: IMP-2026-0062-16
+                // START_CHANGE: IMP-2026-0062-20260422-17 - SWITCH emission.
+                // After reduction TYPE_SWITCH carries switchCases in source order
+                // (including the default); sub1/sub2 are not used. Each SwitchCase's
+                // basicBlock is the case body -- emit recursively, bounded by
+                // TYPE_SWITCH_BREAK which the reducer injects at the join point.
+                case BasicBlock.TYPE_SWITCH: {
+                    Expression selector = bb.statements != null && !bb.statements.isEmpty()
+                            && bb.statements.get(0) instanceof ExpressionStatement
+                        ? ((ExpressionStatement) bb.statements.get(0)).getExpression()
+                        : new StringConstantExpression(line, "/* switch selector */");
+                    List<SwitchStatement.SwitchCase> cases = new ArrayList<SwitchStatement.SwitchCase>();
+                    for (SwitchCase sc : bb.getSwitchCases()) {
+                        List<Expression> labels = new ArrayList<Expression>();
+                        if (!sc.isDefaultCase()) {
+                            labels.add(IntegerConstantExpression.valueOf(line, sc.getValue()));
+                        }
+                        List<Statement> caseStmts = new ArrayList<Statement>();
+                        emit(sc.getBasicBlock(), caseStmts, visited);
+                        cases.add(new SwitchStatement.SwitchCase(labels, caseStmts));
+                    }
+                    out.add(new SwitchStatement(line, selector, cases, false));
+                    bb = bb.getNext();
+                    continue;
+                }
+                // END_CHANGE: IMP-2026-0062-17
                 default:
                     // Unknown/unreduced type: do NOT drop -- emit statements if present
                     // and continue. Aligns with the "no truncation" policy.
