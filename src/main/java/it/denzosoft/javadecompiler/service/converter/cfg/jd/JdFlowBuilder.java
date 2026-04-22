@@ -54,15 +54,23 @@ public class JdFlowBuilder {
     private final MethodInfo method;
     private final ConstantPool constants;
     private final BlockDecoder decoder;
+    private final ControlFlowGraph cfgOverride;
 
     public JdFlowBuilder(MethodInfo method, ConstantPool constants, BlockDecoder decoder) {
+        this(method, constants, decoder, null);
+    }
+
+    public JdFlowBuilder(MethodInfo method, ConstantPool constants, BlockDecoder decoder,
+                         ControlFlowGraph cfg) {
         this.method = method;
         this.constants = constants;
         this.decoder = decoder;
+        this.cfgOverride = cfg;
     }
 
     public List<Statement> build() {
-        ControlFlowGraph cfg = ControlFlowGraphMaker.make(method, constants);
+        ControlFlowGraph cfg = cfgOverride != null ? cfgOverride
+            : ControlFlowGraphMaker.make(method, constants);
         if (cfg == null) return new ArrayList<Statement>();
 
         // ---- Phase 2: decode every block with real bytecode into Statement list ----
