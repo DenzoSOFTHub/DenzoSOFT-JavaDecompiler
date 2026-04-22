@@ -484,6 +484,70 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         return md;
     }
 
+    // START_CHANGE: IMP-2026-0062-20260422-25 - Quality heuristic for JD output.
+    // Walks the statement tree looking for placeholder string constants the emitter
+    // inserts when a block type wasn't fully reduced / condition wasn't decoded.
+    // If any are found, the JD result is structurally degraded and we fall back to
+    // the legacy path rather than ship broken code.
+    private static boolean containsPlaceholders(List<Statement> stmts) {
+        if (stmts == null) return false;
+        for (Statement s : stmts) {
+            if (statementHasPlaceholder(s)) return true;
+        }
+        return false;
+    }
+
+    private static boolean statementHasPlaceholder(Statement s) {
+        if (s == null) return false;
+        if (s instanceof ExpressionStatement) {
+            return exprHasPlaceholder(((ExpressionStatement) s).getExpression());
+        }
+        if (s instanceof IfStatement) {
+            IfStatement is = (IfStatement) s;
+            return exprHasPlaceholder(is.getCondition()) || statementHasPlaceholder(is.getThenBody());
+        }
+        if (s instanceof IfElseStatement) {
+            IfElseStatement ies = (IfElseStatement) s;
+            return exprHasPlaceholder(ies.getCondition())
+                || statementHasPlaceholder(ies.getThenBody())
+                || statementHasPlaceholder(ies.getElseBody());
+        }
+        if (s instanceof WhileStatement) {
+            WhileStatement ws = (WhileStatement) s;
+            return exprHasPlaceholder(ws.getCondition()) || statementHasPlaceholder(ws.getBody());
+        }
+        if (s instanceof BlockStatement) {
+            return containsPlaceholders(((BlockStatement) s).getStatements());
+        }
+        if (s instanceof TryCatchStatement) {
+            TryCatchStatement tcs = (TryCatchStatement) s;
+            if (statementHasPlaceholder(tcs.getTryBody())) return true;
+            for (TryCatchStatement.CatchClause cc : tcs.getCatchClauses()) {
+                if (statementHasPlaceholder(cc.body)) return true;
+            }
+            return tcs.hasFinally() && statementHasPlaceholder(tcs.getFinallyBody());
+        }
+        if (s instanceof SwitchStatement) {
+            SwitchStatement ss = (SwitchStatement) s;
+            for (SwitchStatement.SwitchCase sc : ss.getCases()) {
+                for (Statement inner : sc.getStatements()) {
+                    if (statementHasPlaceholder(inner)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean exprHasPlaceholder(Expression e) {
+        if (e instanceof StringConstantExpression) {
+            String v = ((StringConstantExpression) e).getValue();
+            return v != null && (v.startsWith("/* condition") || v.startsWith("/* expr")
+                || v.startsWith("/* switch selector"));
+        }
+        return false;
+    }
+    // END_CHANGE: IMP-2026-0062-25
+
     // START_CHANGE: IMP-2026-0062-20260422-19 - JD-Core pipeline entry points.
     // Opt-in behind a system property / env var so existing callers are unaffected.
     // Once the new emitter reaches feature parity with the legacy flow builder this
@@ -903,10 +967,24 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         // return its output; if it throws we fall through to the legacy path so a
         // single failure cannot regress the whole build.
         if (useJdPipeline()) {
+            // START_CHANGE: IMP-2026-0062-20260422-24 - Per-method quality check.
+            // Run the JD pipeline into a sandbox (diagnostics snapshot + captured
+            // result). If the JD pass recorded any STACK_UNDERFLOW / DECODE_ERROR
+            // markers or produced a result that is less complete than what the
+            // legacy builder will produce, discard it and fall through to legacy.
+            // This guarantees the new pipeline never regresses a method.
+            int diagSnapshot = currentMethodDiagnostics.size();
             try {
                 List<Statement> jdResult = runJdPipeline(method, pool, codeAttr,
                     localVarNames, localVarDescriptors);
-                if (jdResult != null) {
+                boolean jdIntroducedDiagnostics =
+                    currentMethodDiagnostics.size() > diagSnapshot;
+                // START_CHANGE: IMP-2026-0062-20260422-25 - Quality heuristic:
+                // if the JD emitter produced placeholder comments (e.g. `/* condition */`)
+                // the body is structurally degraded; prefer legacy.
+                boolean jdHasPlaceholders = jdResult != null && containsPlaceholders(jdResult);
+                if (jdResult != null && !jdIntroducedDiagnostics && !jdHasPlaceholders) {
+                // END_CHANGE: IMP-2026-0062-25
                     if (!preDeclarations.isEmpty()) {
                         List<Statement> withDecls = new ArrayList<Statement>();
                         withDecls.addAll(preDeclarations);
@@ -916,11 +994,21 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     mergeDeclarationsWithAssignments(jdResult);
                     return jdResult;
                 }
+                // JD produced a degraded result; roll back diagnostics so the
+                // legacy run can decide for itself without false-positive noise.
+                while (currentMethodDiagnostics.size() > diagSnapshot) {
+                    currentMethodDiagnostics.remove(currentMethodDiagnostics.size() - 1);
+                }
             } catch (Exception e) {
+                // Roll back any partial diagnostics for same reason.
+                while (currentMethodDiagnostics.size() > diagSnapshot) {
+                    currentMethodDiagnostics.remove(currentMethodDiagnostics.size() - 1);
+                }
                 recordDiagnostic("JD_PIPELINE_FAILED " + e.getClass().getSimpleName()
                     + (e.getMessage() != null ? ": " + e.getMessage() : "")
                     + " -- falling back to legacy StructuredFlowBuilder");
             }
+            // END_CHANGE: IMP-2026-0062-24
         }
         // END_CHANGE: IMP-2026-0062-18
 
