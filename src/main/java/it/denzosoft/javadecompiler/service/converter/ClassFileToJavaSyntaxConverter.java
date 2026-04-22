@@ -499,37 +499,86 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             final MethodInfo method, final ConstantPool pool, final CodeAttribute codeAttr,
             final Map<Integer, String> localVarNames,
             final Map<Integer, String> localVarDescriptors) {
-        // Bridge: decode each jd.BasicBlock's bytecode range into Statements
-        // using our existing decodeOpcode / stack-simulation pipeline.
-        final byte[] code = codeAttr.getCode();
+        // Build the CFG up-front so we can index handler-entry blocks. The bridge
+        // passes that info through so the legacy decoder can seed the operand stack
+        // with the caught exception (parity with BUG-2026-0050 / 0051 fixes).
+        final it.denzosoft.javadecompiler.service.converter.cfg.jd.ControlFlowGraph jdCfg =
+            it.denzosoft.javadecompiler.service.converter.cfg.jd.ControlFlowGraphMaker.make(method, pool);
+        if (jdCfg == null) return null;
+
+        // Map from handler-entry block.index -> throwable internal name.
+        // null name => catch-all / finally handler.
+        final java.util.Map<Integer, String> handlerTypes = new java.util.HashMap<Integer, String>();
+        for (it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock b : jdCfg.getBasicBlocks()) {
+            for (it.denzosoft.javadecompiler.service.converter.cfg.jd.ExceptionHandler h : b.getExceptionHandlers()) {
+                handlerTypes.put(Integer.valueOf(h.getBasicBlock().getIndex()),
+                                 h.getInternalThrowableName());
+            }
+        }
+
         it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder.BlockDecoder decoder
             = new it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder.BlockDecoder() {
                 public void decode(it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock bb) {
-                    List<Statement> stmts = decodeBytecodeRange(bb.getFromOffset(), bb.getToOffset(),
-                        pool, method, localVarNames, localVarDescriptors, bb.getFirstLineNumber());
-                    bb.statements = stmts;
+                    boolean isHandler = handlerTypes.containsKey(Integer.valueOf(bb.getIndex()));
+                    String handlerType = handlerTypes.get(Integer.valueOf(bb.getIndex()));
+                    // Map jd type -> legacy type so extractBranchCondition fires for
+                    // actual CONDITIONAL_BRANCH blocks only.
+                    int legacyType = BasicBlock.NORMAL;
+                    int jdType = bb.getType();
+                    if (jdType == it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock.TYPE_CONDITIONAL_BRANCH) {
+                        legacyType = BasicBlock.CONDITIONAL;
+                    } else if (jdType == it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock.TYPE_GOTO
+                            || jdType == it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock.TYPE_GOTO_IN_TERNARY_OPERATOR) {
+                        legacyType = BasicBlock.GOTO;
+                    } else if (jdType == it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock.TYPE_RETURN
+                            || jdType == it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock.TYPE_RETURN_VALUE) {
+                        legacyType = BasicBlock.RETURN;
+                    } else if (jdType == it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock.TYPE_THROW) {
+                        legacyType = BasicBlock.THROW;
+                    } else if (jdType == it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock.TYPE_SWITCH_DECLARATION) {
+                        legacyType = BasicBlock.SWITCH;
+                    }
+                    BasicBlock transient_ = decodeBytecodeRangeFull(bb.getFromOffset(), bb.getToOffset(),
+                        pool, method, localVarNames, localVarDescriptors, bb.getFirstLineNumber(),
+                        isHandler, handlerType, legacyType);
+                    bb.statements = transient_.statements != null ? transient_.statements
+                        : new ArrayList<Statement>();
+                    // START_CHANGE: IMP-2026-0062-20260422-22 - Propagate the branch condition
+                    // so the emitter can render `if (condExpr)` instead of `/* condition */`
+                    // placeholder strings (which caused 1703 String-vs-boolean errors).
+                    bb.conditionExpression = transient_.condition;
+                    // stackTopExpression for ternary detection in aggregateConditionalBranches
+                    bb.stackTopExpression = transient_.stackTopExpression;
+                    // END_CHANGE: IMP-2026-0062-22
                 }
             };
+        // Use the cfg-aware overload so Maker isn't called twice.
         it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder jdBuilder =
-            new it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder(method, pool, decoder);
+            new it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder(method, pool, decoder, jdCfg);
         return jdBuilder.build();
     }
 
-    /** Decode a bytecode range [startPc, endPc) to a Statement list using our converter's decoder. */
-    private List<Statement> decodeBytecodeRange(int startPc, int endPc,
+    /** Decode a bytecode range, returning the transient block so callers can see
+     *  statements + condition + stackTopExpression. */
+    private BasicBlock decodeBytecodeRangeFull(int startPc, int endPc,
             ConstantPool pool, MethodInfo method,
             Map<Integer, String> localVarNames, Map<Integer, String> localVarDescriptors,
-            int startLine) {
-        // Reuse the legacy decodeBasicBlock by constructing a transient legacy block
-        // over [startPc, endPc). The legacy decoder mutates block.statements which we
-        // return as the jd block's statement list.
+            int startLine, boolean isExceptionHandler, String exceptionHandlerType,
+            int legacyType) {
         BasicBlock transient_ = new BasicBlock(startPc);
         transient_.endPc = endPc;
-        transient_.type = BasicBlock.NORMAL;
+        transient_.type = legacyType;
         transient_.lineNumber = startLine;
+        // START_CHANGE: IMP-2026-0062-20260422-21 - Propagate exception-handler context so
+        // the decoder pre-seeds the operand stack with the caught exception (parity with
+        // BUG-2026-0050). Previously the handler's opening astore emitted a garbage
+        // `Exception e = null` because the transient block lacked this flag.
+        transient_.isExceptionHandler = isExceptionHandler;
+        transient_.exceptionHandlerType = exceptionHandlerType;
+        // END_CHANGE: IMP-2026-0062-21
         Map<Integer, Integer> pcToLine = buildPcToLineMap(codeAttribute(method));
         decodeBasicBlock(transient_, pool, method, localVarNames, localVarDescriptors, pcToLine);
-        return transient_.statements != null ? transient_.statements : new ArrayList<Statement>();
+        return transient_;
     }
 
     private static CodeAttribute codeAttribute(MethodInfo method) {

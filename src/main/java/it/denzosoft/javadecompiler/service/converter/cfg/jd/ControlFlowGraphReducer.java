@@ -212,7 +212,29 @@ public class ControlFlowGraphReducer {
         basicBlock.setNext(next);
     }
 
+    // START_CHANGE: IMP-2026-0062-20260422-20 - Recursion guard for aggregateConditionalBranches.
+    // JD-Core expects LoopReducer to run BEFORE the Reducer, stripping back-edges. We skip
+    // LoopReducer for now (complex), so loops can cause this method to recurse infinitely
+    // into next/branch chains. Guard via a thread-local BitSet of block indices seen in the
+    // current call stack. This is a *safety net* -- when LoopReducer is wired in, remove it.
+    private static final ThreadLocal<java.util.BitSet> AGGREGATE_VISITED =
+        new ThreadLocal<java.util.BitSet>() {
+            protected java.util.BitSet initialValue() { return new java.util.BitSet(); }
+        };
+
     protected static boolean aggregateConditionalBranches(BasicBlock basicBlock) {
+        java.util.BitSet visited = AGGREGATE_VISITED.get();
+        int idx = basicBlock.getIndex();
+        if (idx >= 0 && visited.get(idx)) return false;
+        if (idx >= 0) visited.set(idx);
+        try {
+            return aggregateConditionalBranchesImpl(basicBlock);
+        } finally {
+            if (idx >= 0) visited.clear(idx);
+        }
+    }
+
+    protected static boolean aggregateConditionalBranchesImpl(BasicBlock basicBlock) {
         int lineNumber2;
         BasicBlock nextNext;
         boolean change = false;

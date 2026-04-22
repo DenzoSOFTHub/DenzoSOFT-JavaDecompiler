@@ -134,6 +134,16 @@ public class BasicBlock {
         this.exceptionHandlers = original.exceptionHandlers;
         this.switchCases = original.switchCases;
         this.predecessors = predecessors;
+        // START_CHANGE: IMP-2026-0062-20260422-23 - Propagate decoder-bridge state to clones.
+        // Reducer.createIf does `newBasicBlock(basicBlock)` to snapshot the conditional's
+        // state then uses the snapshot as the `condition` block of the IF. The emitter
+        // reads conditionExpression off that snapshot; without copying these fields the
+        // condition was always null and we printed a `/* condition */` placeholder string.
+        this.statements = original.statements;
+        this.stackTopExpression = original.stackTopExpression;
+        this.exitStack = original.exitStack;
+        this.conditionExpression = original.conditionExpression;
+        // END_CHANGE: IMP-2026-0062-23
     }
 
     public BasicBlock(ControlFlowGraph controlFlowGraph, int index, int type,
