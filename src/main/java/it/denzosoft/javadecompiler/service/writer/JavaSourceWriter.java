@@ -1723,6 +1723,13 @@ public class JavaSourceWriter implements Processor {
                     continue;
                 }
                 // END_CHANGE: ISS-2026-0012-4
+                // START_CHANGE: BUG-2026-0066-20260421-1 - Suppress the synthetic `this.this$N = arg`
+                // assignment that javac emits at the start of an inner class constructor to store
+                // the outer-class reference. Rendering it as `Outer.this = arg` is illegal Java.
+                if (method.isConstructor() && isSyntheticOuterAssign(stmt)) {
+                    continue;
+                }
+                // END_CHANGE: BUG-2026-0066-1
                 lineNumber = writeStatement(printer, stmt, ownerInternalName, lineNumber);
             }
 
@@ -1848,6 +1855,15 @@ public class JavaSourceWriter implements Processor {
                 printer.printText("Object _ternary" + line + " = ");
             }
             // END_CHANGE: BUG-2026-0035-1
+            // START_CHANGE: BUG-2026-0058-20260421-1 - Bare binary-op expressions like
+            // `a.isX() || b.isY();` are also invalid as statements. Wrap them the same way
+            // but ONLY when they look like a comparison / logical op (and not an assignment
+            // or compound-assignment, which are already valid statements).
+            else if (esExpr instanceof BinaryOperatorExpression
+                    && isComparisonOrLogicalOp(((BinaryOperatorExpression) esExpr).getOperator())) {
+                printer.printText("Object _orphan" + line + " = ");
+            }
+            // END_CHANGE: BUG-2026-0058-1
             writeExpression(printer, esExpr, ownerInternalName);
             printer.printText(";");
         } else if (stmt instanceof ThrowStatement) {
@@ -1864,6 +1880,18 @@ public class JavaSourceWriter implements Processor {
             }
             if (vds.isVar()) {
                 printer.printKeyword("var");
+            // START_CHANGE: BUG-2026-0065-20260421-4 - Prefer the LVTT generic signature when
+            // present so declarations render with their real generic parameters
+            // (`List<ClassInfo> results` rather than the raw `List results`). Required for
+            // downstream lambda inference to compile.
+            } else if (vds.getGenericSignature() != null) {
+                String rendered = SignatureParser.parseFieldSignature(vds.getGenericSignature());
+                if (rendered != null && !rendered.isEmpty()) {
+                    printer.printText(rendered);
+                } else {
+                    writeType(printer, vds.getType(), ownerInternalName);
+                }
+            // END_CHANGE: BUG-2026-0065-4
             } else {
                 writeType(printer, vds.getType(), ownerInternalName);
             }
@@ -1999,7 +2027,32 @@ public class JavaSourceWriter implements Processor {
                     }
                 }
             }
+            // START_CHANGE: BUG-2026-0063-20260421-1 - Enum-typed switch selector: the JVM
+            // tableswitch targets enum ordinals (0, 1, 2...) which aren't valid `case` labels
+            // against the enum value itself in source Java. When the selector has an object
+            // type and every case label is an integer constant, wrap the selector with
+            // `.ordinal()` so the result is a valid int switch. Without this, the emitted
+            // source fails with `incompatible types: int cannot be converted to <EnumType>`.
+            boolean selectorNeedsOrdinal = false;
+            if (switchSel.getType() instanceof ObjectType) {
+                boolean allIntLabels = !ss.getCases().isEmpty();
+                for (SwitchStatement.SwitchCase sc : ss.getCases()) {
+                    if (sc.isDefault()) continue;
+                    for (Expression lab : sc.getLabels()) {
+                        if (!(lab instanceof IntegerConstantExpression)) {
+                            allIntLabels = false;
+                            break;
+                        }
+                    }
+                    if (!allIntLabels) break;
+                }
+                selectorNeedsOrdinal = allIntLabels;
+            }
             writeExpression(printer, switchSel, ownerInternalName);
+            if (selectorNeedsOrdinal) {
+                printer.printText(".ordinal()");
+            }
+            // END_CHANGE: BUG-2026-0063-1
             // END_CHANGE: BUG-2026-0048-1
             printer.printText(") {");
             printer.endLine();
@@ -2038,7 +2091,13 @@ public class JavaSourceWriter implements Processor {
                 printer.printText(" (");
                 for (int ri = 0; ri < tcs.getResources().size(); ri++) {
                     if (ri > 0) printer.printText("; ");
-                    writeInlineStatement(printer, tcs.getResources().get(ri), ownerInternalName);
+                    // START_CHANGE: BUG-2026-0054-20260421-1 - Try-with-resources requires a
+                    // variable declaration or an effectively-final bare identifier (Java 9+).
+                    // A bare `name = expr` is illegal. When the resource is an assignment to
+                    // a previously-declared local, prepend the local's type to turn it into
+                    // a proper declaration inside the try header.
+                    emitTryResource(printer, tcs.getResources().get(ri), ownerInternalName);
+                    // END_CHANGE: BUG-2026-0054-1
                 }
                 printer.printText(")");
             }
@@ -2186,7 +2245,18 @@ public class JavaSourceWriter implements Processor {
             } else {
             // END_CHANGE: BUG-2026-0045-1
                 if (fae.getObject() != null) {
-                    writeExpression(printer, fae.getObject(), ownerInternalName);
+                    // START_CHANGE: BUG-2026-0052-20260421-1 - Parenthesize cast expressions
+                    // used as field-access receivers. Without the parens, `(T) obj.field`
+                    // binds the cast to the full member-access chain rather than to `obj`,
+                    // producing illegal-as-statement code downstream.
+                    if (fae.getObject() instanceof CastExpression) {
+                        printer.printText("(");
+                        writeExpression(printer, fae.getObject(), ownerInternalName);
+                        printer.printText(")");
+                    } else {
+                        writeExpression(printer, fae.getObject(), ownerInternalName);
+                    }
+                    // END_CHANGE: BUG-2026-0052-1
                     printer.printText(".");
                 } else {
                     // Static field access
@@ -2373,11 +2443,28 @@ public class JavaSourceWriter implements Processor {
                 }
                 printer.printText("{");
                 List<Expression> initVals = nae.getInitValues();
+                // START_CHANGE: BUG-2026-0061-20260421-1 - For a boolean[] initializer the
+                // element values are loaded with iconst_0/1 and arrive as IntegerConstant 0/1
+                // in the AST. javac doesn't auto-convert those to `false`/`true` inside an
+                // array initializer, so emit boolean literals when the array component type
+                // is boolean.
+                boolean isBooleanArray = false;
+                Type elemType = nae.getType();
+                while (elemType instanceof ArrayType) elemType = ((ArrayType) elemType).getElementType();
+                if (elemType == PrimitiveType.BOOLEAN) isBooleanArray = true;
+                // END_CHANGE: BUG-2026-0061-1
                 for (int iv = 0; iv < initVals.size(); iv++) {
                     if (iv > 0) printer.printText(", ");
                     // START_CHANGE: BUG-2026-0032-20260325-6 - Handle all value types iteratively
                     Expression val = initVals.get(iv);
-                    writeExpressionSimple(printer, val, ownerInternalName);
+                    // START_CHANGE: BUG-2026-0061-20260421-2 - Boolean-array element conversion
+                    if (isBooleanArray && val instanceof IntegerConstantExpression) {
+                        int v = ((IntegerConstantExpression) val).getValue();
+                        printer.printKeyword(v != 0 ? "true" : "false");
+                    } else {
+                        writeExpressionSimple(printer, val, ownerInternalName);
+                    }
+                    // END_CHANGE: BUG-2026-0061-2
                 }
                 printer.printText("}");
             } else {
@@ -2635,6 +2722,35 @@ public class JavaSourceWriter implements Processor {
         }
     }
 
+    // START_CHANGE: BUG-2026-0054-20260421-2 - Render a try-with-resources resource correctly.
+    // If the resource is a VariableDeclarationStatement, emit `Type name = init`.
+    // If it is an ExpressionStatement whose expression is an AssignmentExpression
+    // (`localVar = expr`), prepend the local's type (from the LocalVariableExpression)
+    // so the result is a proper declaration. Fall back to the previous inline-statement
+    // emission otherwise.
+    private void emitTryResource(Printer printer, Statement res, String ownerInternalName) {
+        if (res instanceof ExpressionStatement) {
+            Expression e = ((ExpressionStatement) res).getExpression();
+            if (e instanceof AssignmentExpression) {
+                AssignmentExpression ae = (AssignmentExpression) e;
+                Expression lhs = ae.getLeft();
+                if (lhs instanceof LocalVariableExpression) {
+                    LocalVariableExpression lve = (LocalVariableExpression) lhs;
+                    if (lve.getType() != null) {
+                        writeType(printer, lve.getType(), ownerInternalName);
+                        printer.printText(" ");
+                    }
+                    printer.printText(sn(lve.getName(), "var"));
+                    printer.printText(" = ");
+                    writeExpression(printer, ae.getRight(), ownerInternalName);
+                    return;
+                }
+            }
+        }
+        writeInlineStatement(printer, res, ownerInternalName);
+    }
+    // END_CHANGE: BUG-2026-0054-2
+
     private void writeInlineStatement(Printer printer, Statement stmt, String ownerInternalName) {
         if (stmt instanceof ExpressionStatement) {
             writeExpression(printer, ((ExpressionStatement) stmt).getExpression(), ownerInternalName);
@@ -2699,7 +2815,16 @@ public class JavaSourceWriter implements Processor {
     // START_CHANGE: BUG-2026-0019-20260324-1 - Handle complex statements in lambda body
     private void writeInlineLambdaStatement(Printer printer, Statement stmt, String ownerInternalName) {
         if (stmt instanceof ExpressionStatement) {
-            writeExpression(printer, ((ExpressionStatement) stmt).getExpression(), ownerInternalName);
+            // START_CHANGE: BUG-2026-0053-20260421-1 - Ternary and boolean-op expressions are not
+            // valid as bare statements. The outer `writeStatement` path already wraps these for
+            // top-level method bodies, but lambda bodies go through this inline path instead.
+            // Wrap the same way so code inside lambdas compiles.
+            Expression esExpr = ((ExpressionStatement) stmt).getExpression();
+            if (esExpr instanceof TernaryExpression || esExpr instanceof BinaryOperatorExpression) {
+                printer.printText("Object _orphan = ");
+            }
+            writeExpression(printer, esExpr, ownerInternalName);
+            // END_CHANGE: BUG-2026-0053-1
             printer.printText(";");
         } else if (stmt instanceof ReturnStatement) {
             ReturnStatement rs = (ReturnStatement) stmt;
@@ -2785,7 +2910,15 @@ public class JavaSourceWriter implements Processor {
         } else if (val instanceof FieldAccessExpression) {
             FieldAccessExpression fae = (FieldAccessExpression) val;
             if (fae.getObject() != null) {
-                writeExpressionSimple(printer, fae.getObject(), ownerInternalName);
+                // START_CHANGE: BUG-2026-0052-20260421-2 - Mirror cast-parens handling in simple path
+                if (fae.getObject() instanceof CastExpression) {
+                    printer.printText("(");
+                    writeExpressionSimple(printer, fae.getObject(), ownerInternalName);
+                    printer.printText(")");
+                } else {
+                    writeExpressionSimple(printer, fae.getObject(), ownerInternalName);
+                }
+                // END_CHANGE: BUG-2026-0052-2
                 printer.printText(".");
             } else if (fae.getOwnerInternalName() != null && !fae.getOwnerInternalName().isEmpty()
                        && !fae.getOwnerInternalName().equals(ownerInternalName)) {
@@ -2798,7 +2931,15 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("this");
         } else if (val instanceof MethodInvocationExpression) {
             MethodInvocationExpression mie = (MethodInvocationExpression) val;
-            writeExpressionSimple(printer, mie.getObject(), ownerInternalName);
+            // START_CHANGE: BUG-2026-0052-20260421-3 - Parens cast receivers in simple path too
+            if (mie.getObject() instanceof CastExpression) {
+                printer.printText("(");
+                writeExpressionSimple(printer, mie.getObject(), ownerInternalName);
+                printer.printText(")");
+            } else {
+                writeExpressionSimple(printer, mie.getObject(), ownerInternalName);
+            }
+            // END_CHANGE: BUG-2026-0052-3
             printer.printText(".");
             printer.printText(mie.getMethodName());
             printer.printText("(/* ... */)");
@@ -2903,6 +3044,13 @@ public class JavaSourceWriter implements Processor {
         }
         return "jobject";
     }
+
+    // START_CHANGE: BUG-2026-0058-20260421-2 - Operators that cannot be a statement on their own
+    private static boolean isComparisonOrLogicalOp(String op) {
+        return "==".equals(op) || "!=".equals(op) || "<".equals(op) || "<=".equals(op)
+            || ">".equals(op) || ">=".equals(op) || "&&".equals(op) || "||".equals(op);
+    }
+    // END_CHANGE: BUG-2026-0058-2
 
     private String escapeString(String s) {
         if (s == null) return "";
@@ -3095,6 +3243,19 @@ public class JavaSourceWriter implements Processor {
     // END_CHANGE: ISS-2026-0011-6
 
     // START_CHANGE: IMP-2026-0003-20260326-3 - Detect implicit super() to java.lang.Object
+    // START_CHANGE: BUG-2026-0066-20260421-2 - Detect the synthetic outer-class reference
+    // store pattern emitted for inner class constructors: `this.this$N = arg_0`.
+    private boolean isSyntheticOuterAssign(Statement stmt) {
+        if (!(stmt instanceof ExpressionStatement)) return false;
+        Expression e = ((ExpressionStatement) stmt).getExpression();
+        if (!(e instanceof AssignmentExpression)) return false;
+        AssignmentExpression ae = (AssignmentExpression) e;
+        if (!(ae.getLeft() instanceof FieldAccessExpression)) return false;
+        String name = ((FieldAccessExpression) ae.getLeft()).getName();
+        return name != null && name.startsWith("this$");
+    }
+    // END_CHANGE: BUG-2026-0066-2
+
     private boolean isImplicitSuperCall(Statement stmt, JavaSyntaxResult result) {
         if (!(stmt instanceof ExpressionStatement)) return false;
         Expression expr = ((ExpressionStatement) stmt).getExpression();

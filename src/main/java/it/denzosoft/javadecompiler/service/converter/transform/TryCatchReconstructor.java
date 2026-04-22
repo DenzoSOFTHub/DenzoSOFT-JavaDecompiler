@@ -110,12 +110,27 @@ public class TryCatchReconstructor {
             List<Statement> afterTry = new ArrayList<Statement>();
 
             int firstHandlerPc = Integer.MAX_VALUE;
+            int lastHandlerPc = -1;
             for (CodeAttribute.ExceptionEntry entry : groupEntries) {
                 if (entry.handlerPc < firstHandlerPc) {
                     firstHandlerPc = entry.handlerPc;
                 }
+                if (entry.handlerPc > lastHandlerPc) {
+                    lastHandlerPc = entry.handlerPc;
+                }
             }
             int firstHandlerLine = findLineForPc(firstHandlerPc, sortedPcs);
+
+            // START_CHANGE: BUG-2026-0056-20260421-1 - Compute the line at which the try-catch-finally
+            // region ENDS (i.e. the "merge point" after all handlers). Statements whose line falls
+            // inside the handler region are part of a handler body (decoded separately) and must
+            // be dropped; statements with a line strictly past the merge point are plain
+            // after-try code and must be preserved. Previously any statement at/after
+            // firstHandlerLine was dropped, which lost the trailing `log.info(...); return resp;`
+            // that appears AFTER the catch/finally in non-void methods.
+            int afterTryStartLine = computeAfterTryStartLine(
+                firstHandlerPc, lastHandlerPc, tryEndPc, sortedPcs);
+            // END_CHANGE: BUG-2026-0056-1
 
             boolean inTryRegion = false;
             for (Statement s : statements) {
@@ -126,10 +141,18 @@ public class TryCatchReconstructor {
                 } else if (!inTryRegion) {
                     beforeTry.add(s);
                 } else {
+                    // START_CHANGE: BUG-2026-0056-20260421-2 - Restore after-try statements.
+                    // Drop statements that fall inside any handler body's line range, but keep
+                    // statements past the merge point (they are plain after-try code).
+                    if (afterTryStartLine > 0 && sLine >= afterTryStartLine) {
+                        afterTry.add(s);
+                        continue;
+                    }
                     if (firstHandlerLine > 0 && sLine >= firstHandlerLine) {
                         continue;
                     }
                     afterTry.add(s);
+                    // END_CHANGE: BUG-2026-0056-2
                 }
             }
 
@@ -460,11 +483,52 @@ public class TryCatchReconstructor {
                 }
             } else if (block.type == BasicBlock.FALL_THROUGH || block.type == BasicBlock.NORMAL) {
                 block = block.trueSuccessor;
+            // START_CHANGE: BUG-2026-0056-20260421-4 - Walk through conditional blocks in the
+            // handler body. The catch body may itself contain an if/else whose branches later
+            // merge before the throw/return terminator. Previously we stopped at the first
+            // conditional and produced a truncated catch (only the first assignment visible).
+            // Follow the fall-through edge by default; if that ends up at a stop PC we try
+            // the branch target instead.
+            } else if (block.type == BasicBlock.CONDITIONAL) {
+                BasicBlock fall = block.falseSuccessor;
+                BasicBlock br = block.trueSuccessor;
+                if (fall != null && !stopPcs.contains(fall.startPc) && !visited.contains(fall.startPc)) {
+                    block = fall;
+                } else if (br != null && !stopPcs.contains(br.startPc) && !visited.contains(br.startPc)) {
+                    block = br;
+                } else {
+                    return;
+                }
+            // END_CHANGE: BUG-2026-0056-4
             } else {
                 return;
             }
         }
     }
+
+    // START_CHANGE: BUG-2026-0056-20260421-3 - Find the earliest line number AFTER every handler
+    // block of the current try-region. Uses the handler exit / merge PC from the CFG when
+    // available, falling back to the line of the PC that follows the last handler block.
+    // Returns -1 if no "after-try" region can be identified (callers should then preserve the
+    // legacy behaviour of dropping anything past firstHandlerLine).
+    private int computeAfterTryStartLine(int firstHandlerPc, int lastHandlerPc,
+                                          int tryEndPc, List<Integer> sortedPcs) {
+        int mergePc = findTryCatchMergePc(tryEndPc);
+        if (mergePc >= 0) {
+            int mergeLine = findLineForPc(mergePc, sortedPcs);
+            if (mergeLine > 0) return mergeLine;
+        }
+        // Fall back: take the end PC of the block that contains the last handler.
+        if (lastHandlerPc >= 0 && cfg != null) {
+            BasicBlock last = cfg.getBlockAtPc(lastHandlerPc);
+            if (last != null && last.endPc > lastHandlerPc) {
+                int afterLine = findLineForPc(last.endPc, sortedPcs);
+                if (afterLine > 0) return afterLine;
+            }
+        }
+        return -1;
+    }
+    // END_CHANGE: BUG-2026-0056-3
 
     public int findLineForPc(int pc, List<Integer> sortedPcs) {
         Integer line = pcToLine.get(pc);

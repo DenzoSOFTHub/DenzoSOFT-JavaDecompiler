@@ -829,6 +829,27 @@ public class StructuredFlowBuilder {
      * The merge point is where control flow continues after the structured region.
      * Uses pre-computed cache when available.
      */
+    // START_CHANGE: BUG-2026-0062-20260421-2 - Return the lowest-pc block that comes strictly
+    // after the given conditional block in bytecode order and whose PC is the endPc of a
+    // successor, unvisited. Used as a fallback when findMergePoint gives up: a method shaped
+    // as `if (a) { ... } if (b) { ... } return X;` has two sibling if-statements with no merge
+    // point between them; we still need to continue to the second if.
+    private BasicBlock findNextSequentialBlock(BasicBlock condBlock) {
+        int best = Integer.MAX_VALUE;
+        BasicBlock bestBlock = null;
+        int baseline = condBlock.endPc;
+        for (BasicBlock b : cfg.getBlocks()) {
+            if (b.startPc >= baseline && b.startPc < best) {
+                // Only accept blocks that look like normal sequential code (not exception
+                // handlers, not inside an already-visited region)
+                best = b.startPc;
+                bestBlock = b;
+            }
+        }
+        return bestBlock;
+    }
+    // END_CHANGE: BUG-2026-0062-2
+
     private int findMergePoint(BasicBlock condBlock) {
         Integer cached = precomputedMergePoints.get(condBlock.startPc);
         if (cached != null) {

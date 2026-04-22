@@ -197,6 +197,17 @@ public final class BooleanSimplifier {
         if (stmt instanceof ExpressionStatement) {
             ExpressionStatement es = (ExpressionStatement) stmt;
             Expression expr = es.getExpression();
+            // START_CHANGE: BUG-2026-0057-20260421-1 - Simplify the condition of an orphan
+            // ternary-as-statement. The writer later wraps such a statement in
+            // `Object _orphan = ...`; if we leave the condition as `x != 0` it renders as an
+            // illegal boolean-vs-int comparison in cases where x is already boolean.
+            if (expr instanceof TernaryExpression) {
+                Expression simplifiedExpr = simplifyBooleanExpr(expr);
+                if (simplifiedExpr != expr) {
+                    return new ExpressionStatement(simplifiedExpr);
+                }
+            }
+            // END_CHANGE: BUG-2026-0057-1
             if (expr instanceof AssignmentExpression) {
                 AssignmentExpression ae = (AssignmentExpression) expr;
                 if (ae.getRight() instanceof TernaryExpression) {
@@ -282,6 +293,20 @@ public final class BooleanSimplifier {
             return expr;
         }
         // END_CHANGE: BUG-2026-0047-1
+        // START_CHANGE: BUG-2026-0060-20260421-1 - Recurse into unary negation so that
+        // `!(a == 0 && b == 0 && ...)` simplifies its operand too; without this, compound
+        // boolean expressions like the Spring `isRestTemplateMethod` pattern keep the raw
+        // `x.equals(y) == 0` comparisons and fail to compile against boolean method returns.
+        if (expr instanceof UnaryOperatorExpression) {
+            UnaryOperatorExpression uoe = (UnaryOperatorExpression) expr;
+            Expression simplified = simplifyBooleanExpr(uoe.getExpression());
+            if (simplified != uoe.getExpression()) {
+                return new UnaryOperatorExpression(uoe.getLineNumber(), uoe.getType(),
+                    uoe.getOperator(), simplified, uoe.isPrefix());
+            }
+            return expr;
+        }
+        // END_CHANGE: BUG-2026-0060-1
         if (!(expr instanceof BinaryOperatorExpression)) return expr;
         BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
         Expression left = boe.getLeft();
@@ -361,6 +386,14 @@ public final class BooleanSimplifier {
             Type t = ((LocalVariableExpression) expr).getType();
             if (t == PrimitiveType.BOOLEAN) return true;
         }
+        // START_CHANGE: BUG-2026-0067-20260421-1 - ArrayAccessExpression on a boolean[] array
+        // is boolean-typed. Previously `reported[0] != 0` (where `reported` is boolean[])
+        // wasn't simplified, producing `incomparable types: boolean and int`.
+        if (expr instanceof ArrayAccessExpression) {
+            Type t = expr.getType();
+            if (t == PrimitiveType.BOOLEAN) return true;
+        }
+        // END_CHANGE: BUG-2026-0067-1
         if (expr instanceof UnaryOperatorExpression) {
             String op = ((UnaryOperatorExpression) expr).getOperator();
             return "!".equals(op);

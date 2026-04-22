@@ -91,6 +91,26 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     JavaSyntaxResult innerResult = innerConverter.convert(innerCf);
                     innerResult.setInnerClass(true);
                     innerResult.setInnerClassAccessFlags(ic.accessFlags);
+
+                    // START_CHANGE: BUG-2026-0059-20260421-1 - Recurse into the inner class's own
+                    // InnerClasses attribute. Previously `convert()` only converted the top-level
+                    // body, so doubly-nested classes (e.g. `Outer$Row$Kind`) were never emitted,
+                    // producing 'cannot find symbol Kind' compile errors in the generated source.
+                    InnerClassesAttribute nested = innerCf.findAttribute("InnerClasses");
+                    if (nested != null) {
+                        String innerThisName = innerCf.getThisClassName();
+                        for (InnerClassesAttribute.InnerClass sub : nested.getClasses()) {
+                            if (sub.outerClassName != null && sub.outerClassName.equals(innerThisName)
+                                    && sub.innerClassName != null && !sub.innerClassName.equals(innerThisName)) {
+                                innerConverter.loadAndAddInnerClass(loader, sub, innerResult);
+                            } else if (sub.outerClassName == null && sub.innerName == null
+                                    && sub.innerClassName != null && sub.innerClassName.startsWith(innerThisName + "$")) {
+                                innerConverter.loadAndAddInnerClass(loader, sub, innerResult);
+                            }
+                        }
+                    }
+                    // END_CHANGE: BUG-2026-0059-1
+
                     outerResult.addInnerClassResult(innerResult);
                 }
             } catch (Exception e) {
@@ -110,6 +130,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     public JavaSyntaxResult convert(ClassFile classFile) {
         // START_CHANGE: ISS-2026-0010-20260323-2 - Store current class name for this() vs super()
         currentClassInternalName = classFile.getThisClassName();
+        currentSuperClassInternalName = classFile.getSuperClassName();
         // END_CHANGE: ISS-2026-0010-2
         JavaSyntaxResult result = new JavaSyntaxResult();
         result.setMajorVersion(classFile.getMajorVersion());
@@ -850,6 +871,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     // START_CHANGE: ISS-2026-0010-20260323-1 - Track current class internal name for this() vs super() detection
     private String currentClassInternalName;
     // END_CHANGE: ISS-2026-0010-1
+    // START_CHANGE: BUG-2026-0055-20260421-4 - Track super class internal name so INVOKESPECIAL
+    // can distinguish a legitimate super(args) call from an embedded `new X(args)` when both
+    // appear in the same constructor body.
+    private String currentSuperClassInternalName;
+    // END_CHANGE: BUG-2026-0055-4
     // Shared bytecode reference for block-level decoding
     private byte[] currentBytecode;
     // When true, suppress branch/goto comment output (CFG handles control flow)
@@ -896,6 +922,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         }
         return stack.pop();
     }
+
+    // START_CHANGE: BUG-2026-0055-20260421-3 - Cheap "is this the ctor?" check used by INVOKESPECIAL
+    private static boolean isInConstructor(MethodInfo method) {
+        return method != null && StringConstants.CONSTRUCTOR_NAME.equals(method.getName());
+    }
+    // END_CHANGE: BUG-2026-0055-3
 
     private void recordUnderflow(String kind) {
         StringBuilder sb = new StringBuilder("STACK_UNDERFLOW");
@@ -1749,7 +1781,20 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     // Bytecode: new X → dup → [args...] → invokespecial X.<init>
                     // After dup, stack has [..., NewExpr, NewExpr_copy]
                     // invokespecial pops the copy (obj) + args, we replace the original
-                    if (obj instanceof NewExpression) {
+                    // START_CHANGE: BUG-2026-0055-20260421-1 - Unwrap cast-wrapped NewExpression
+                    // receivers that appear after multi-value stack inheritance across blocks,
+                    // and recognise the special case where the receiver is below-top on the
+                    // stack (checkcast can leave a CastExpression on top while the original
+                    // NewExpression is below). Mid-method ctor invocations targeting a class
+                    // other than `this` / `super` must render as `new X(args)` -- never `super(args)`,
+                    // which would be illegal outside a constructor's first position.
+                    Expression newExprTarget = obj;
+                    if (newExprTarget instanceof CastExpression) {
+                        newExprTarget = ((CastExpression) newExprTarget).getExpression();
+                    }
+                    boolean isLocalCtor = newExprTarget instanceof NewExpression;
+                    // END_CHANGE: BUG-2026-0055-1
+                    if (isLocalCtor) {
                         Expression newExpr = new NewExpression(line, new ObjectType(className), className, desc, args);
                         // Remove the original NewExpression that dup placed (it's still on stack)
                         // The dup pushed a copy - invokespecial consumed it (obj).
@@ -1758,6 +1803,19 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                             stack.pop(); // remove the original placeholder from dup
                         }
                         stack.push(newExpr);
+                    // START_CHANGE: BUG-2026-0055-20260421-2 - Cross-class invokespecial whose
+                    // target is neither the current class (this() call) nor the declared super
+                    // class (super() call) is a `new X(args)` -- never super(). This fires both
+                    // inside and outside constructors: inside a ctor it handles embedded
+                    // `new JComboBox<>(...)` where the NewExpression receiver was lost due to
+                    // block-boundary stack inheritance; outside a ctor super() is plainly illegal.
+                    } else if (currentClassInternalName != null
+                            && !className.equals(currentClassInternalName)
+                            && (currentSuperClassInternalName == null
+                                || !className.equals(currentSuperClassInternalName))) {
+                        Expression newExpr = new NewExpression(line, new ObjectType(className), className, desc, args);
+                        stack.push(newExpr);
+                    // END_CHANGE: BUG-2026-0055-2
                     } else {
                         // super() or this() call in constructor
                         // START_CHANGE: ISS-2026-0010-20260323-3 - Distinguish this() from super() by comparing target class
@@ -1977,8 +2035,19 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                                             ? syntheticParamNames.get(implMethodName) : null;
                                         if (implDesc != null) {
                                             String[] implParamDescs = TypeNameUtil.parseMethodParameterDescriptors(implDesc);
-                                            // Skip captured args (the invokedynamic args are captures)
-                                            int capturedCount = args.size();
+                                            // START_CHANGE: BUG-2026-0064-20260421-1 - For REF_invokeVirtual (5)
+                                            // and REF_invokeInterface (9) handle kinds the first captured arg is
+                                            // the implicit `this` receiver and is NOT reflected in the impl method
+                                            // descriptor. Counting it as a captured param makes the lambda lose its
+                                            // own arg list (e.g. `() -> this.repaint()` instead of `e -> this.repaint()`).
+                                            int refKind = handleEntry[0];
+                                            // REF_invokeVirtual (5), REF_invokeSpecial (7) and
+                                            // REF_invokeInterface (9) are instance invocations:
+                                            // the first captured arg is the implicit `this` and
+                                            // does NOT appear in the impl method descriptor.
+                                            int thisCapture = (refKind == 5 || refKind == 7 || refKind == 9) ? 1 : 0;
+                                            int capturedCount = Math.max(0, args.size() - thisCapture);
+                                            // END_CHANGE: BUG-2026-0064-1
                                             for (int pi = capturedCount; pi < implParamDescs.length; pi++) {
                                                 String pName = (lvtNames != null && pi < lvtNames.size())
                                                     ? lvtNames.get(pi) : "arg" + (pi - capturedCount);
@@ -2262,7 +2331,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         if (declaredVars != null && !declaredVars.contains(index)) {
             // First assignment - emit as variable declaration
             declaredVars.add(index);
-            statements.add(new VariableDeclarationStatement(line, type, name, value, false, false));
+            VariableDeclarationStatement vdsNew = new VariableDeclarationStatement(line, type, name, value, false, false);
+            // START_CHANGE: BUG-2026-0065-20260421-3 - Propagate LVTT signature to declaration
+            if (currentLocalVarSignatures != null) {
+                String sig = currentLocalVarSignatures.get(index);
+                if (sig != null) vdsNew.setGenericSignature(sig);
+            }
+            // END_CHANGE: BUG-2026-0065-3
+            statements.add(vdsNew);
         } else {
             Expression var = new LocalVariableExpression(line, type, name, index);
             statements.add(new ExpressionStatement(
