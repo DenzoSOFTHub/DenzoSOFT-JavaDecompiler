@@ -112,6 +112,9 @@ public class BasicBlock {
     public it.denzosoft.javadecompiler.model.javasyntax.expression.Expression stackTopExpression;
     public java.util.List<it.denzosoft.javadecompiler.model.javasyntax.expression.Expression> exitStack;
     public it.denzosoft.javadecompiler.model.javasyntax.expression.Expression conditionExpression;
+    /** Selector expression for TYPE_SWITCH blocks; populated by the decoder bridge from
+     *  the legacy BasicBlock.selectorExpression set on {table,lookup}switch. */
+    public it.denzosoft.javadecompiler.model.javasyntax.expression.Expression selectorExpression;
     // END_CHANGE: IMP-2026-0062-14
 
 
@@ -143,6 +146,7 @@ public class BasicBlock {
         this.stackTopExpression = original.stackTopExpression;
         this.exitStack = original.exitStack;
         this.conditionExpression = original.conditionExpression;
+        this.selectorExpression = original.selectorExpression;
         // END_CHANGE: IMP-2026-0062-23
     }
 
