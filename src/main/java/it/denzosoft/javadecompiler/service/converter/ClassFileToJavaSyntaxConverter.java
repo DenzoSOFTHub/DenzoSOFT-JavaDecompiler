@@ -580,6 +580,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             }
         }
 
+        // Map from jd.BasicBlock.index -> the transient legacy BasicBlock we decoded
+        // from it. Used to pass predecessors' exitStacks into successor blocks so the
+        // legacy decoder's multi-value inheritance (BUG-2026-0051) kicks in.
+        final java.util.Map<Integer, BasicBlock> jdToLegacy = new java.util.HashMap<Integer, BasicBlock>();
+
         it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder.BlockDecoder decoder
             = new it.denzosoft.javadecompiler.service.converter.cfg.jd.JdFlowBuilder.BlockDecoder() {
                 public void decode(it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock bb) {
@@ -602,18 +607,30 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     } else if (jdType == it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock.TYPE_SWITCH_DECLARATION) {
                         legacyType = BasicBlock.SWITCH;
                     }
+                    // START_CHANGE: IMP-2026-0062-20260422-26 - Build predecessor list for
+                    // exit-stack propagation. The legacy decoder uses `block.predecessors`
+                    // with each predecessor's `exitStack` to seed the operand stack of a
+                    // successor when the preceding block left values on the stack (multi-
+                    // value cross-block inheritance, BUG-2026-0051). Without this, compound
+                    // ternary-around-arithmetic patterns lose the pre-ternary stack values.
+                    java.util.List<BasicBlock> preds = new java.util.ArrayList<BasicBlock>();
+                    for (it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock jpred : bb.getPredecessors()) {
+                        BasicBlock legacyPred = jdToLegacy.get(Integer.valueOf(jpred.getIndex()));
+                        if (legacyPred != null) preds.add(legacyPred);
+                    }
+                    // END_CHANGE: IMP-2026-0062-26
                     BasicBlock transient_ = decodeBytecodeRangeFull(bb.getFromOffset(), bb.getToOffset(),
                         pool, method, localVarNames, localVarDescriptors, bb.getFirstLineNumber(),
-                        isHandler, handlerType, legacyType);
+                        isHandler, handlerType, legacyType, preds);
                     bb.statements = transient_.statements != null ? transient_.statements
                         : new ArrayList<Statement>();
-                    // START_CHANGE: IMP-2026-0062-20260422-22 - Propagate the branch condition
-                    // so the emitter can render `if (condExpr)` instead of `/* condition */`
-                    // placeholder strings (which caused 1703 String-vs-boolean errors).
+                    // Propagate branch condition + stack top for emitter / reducer use
                     bb.conditionExpression = transient_.condition;
-                    // stackTopExpression for ternary detection in aggregateConditionalBranches
                     bb.stackTopExpression = transient_.stackTopExpression;
-                    // END_CHANGE: IMP-2026-0062-22
+                    bb.selectorExpression = transient_.selectorExpression;
+                    bb.exitStack = transient_.exitStack;
+                    // Remember the legacy block so successor decodes can see its exitStack
+                    jdToLegacy.put(Integer.valueOf(bb.getIndex()), transient_);
                 }
             };
         // Use the cfg-aware overload so Maker isn't called twice.
@@ -628,7 +645,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             ConstantPool pool, MethodInfo method,
             Map<Integer, String> localVarNames, Map<Integer, String> localVarDescriptors,
             int startLine, boolean isExceptionHandler, String exceptionHandlerType,
-            int legacyType) {
+            int legacyType, List<BasicBlock> predecessors) {
         BasicBlock transient_ = new BasicBlock(startPc);
         transient_.endPc = endPc;
         transient_.type = legacyType;
@@ -640,6 +657,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         transient_.isExceptionHandler = isExceptionHandler;
         transient_.exceptionHandlerType = exceptionHandlerType;
         // END_CHANGE: IMP-2026-0062-21
+        // START_CHANGE: IMP-2026-0062-20260422-27 - Wire in predecessors so the legacy
+        // decoder's exitStack inheritance (BUG-2026-0051) activates across jd-blocks.
+        if (predecessors != null && !predecessors.isEmpty()) {
+            transient_.predecessors = new ArrayList<BasicBlock>(predecessors);
+        }
+        // END_CHANGE: IMP-2026-0062-27
         Map<Integer, Integer> pcToLine = buildPcToLineMap(codeAttribute(method));
         decodeBasicBlock(transient_, pool, method, localVarNames, localVarDescriptors, pcToLine);
         return transient_;
@@ -985,6 +1008,24 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 boolean jdHasPlaceholders = jdResult != null && containsPlaceholders(jdResult);
                 if (jdResult != null && !jdIntroducedDiagnostics && !jdHasPlaceholders) {
                 // END_CHANGE: IMP-2026-0062-25
+                    // START_CHANGE: IMP-2026-0062-20260424-28 - Run the same post-processing
+                    // pipeline on JD output as on the legacy structured-flow output. Without
+                    // this the JD emitter produces `x != 0` style comparisons instead of plain
+                    // boolean expressions, compound assignments never collapse, etc. (caused
+                    // 1600+ compile errors on sba-classes vs 635 for the legacy path).
+                    jdResult = ForEachDetector.convert(jdResult);
+                    String retDesc = TypeNameUtil.parseMethodReturnDescriptor(method.getDescriptor());
+                    boolean returnIsBoolean = "Z".equals(retDesc);
+                    jdResult = BooleanSimplifier.simplify(jdResult, returnIsBoolean);
+                    jdResult = reconstructAsserts(jdResult);
+                    jdResult = reconstructSynchronized(jdResult);
+                    jdResult = CompoundAssignmentSimplifier.simplify(jdResult);
+                    jdResult = ForLoopDetector.convert(jdResult);
+                    jdResult = StringSwitchReconstructor.reconstruct(jdResult);
+                    if (patternSwitchLabels != null && !patternSwitchLabels.isEmpty()) {
+                        jdResult = PatternSwitchReconstructor.reconstruct(jdResult, patternSwitchLabels);
+                    }
+                    // END_CHANGE: IMP-2026-0062-28
                     if (!preDeclarations.isEmpty()) {
                         List<Statement> withDecls = new ArrayList<Statement>();
                         withDecls.addAll(preDeclarations);

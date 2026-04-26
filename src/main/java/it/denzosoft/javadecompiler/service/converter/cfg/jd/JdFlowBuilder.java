@@ -189,6 +189,7 @@ public class JdFlowBuilder {
                     emit(bb.getSub1(), tryBody, visited);
                     List<TryCatchStatement.CatchClause> catches = new ArrayList<TryCatchStatement.CatchClause>();
                     Statement finallyBody = null;
+                    boolean hasNonMonitorHandler = false;
                     for (ExceptionHandler eh : bb.getExceptionHandlers()) {
                         List<Statement> handlerBody = new ArrayList<Statement>();
                         emit(eh.getBasicBlock(), handlerBody, visited);
@@ -203,9 +204,26 @@ public class JdFlowBuilder {
                                     types.add(new ObjectType(n));
                                 }
                             }
-                            catches.add(new TryCatchStatement.CatchClause(types, "e", hBlock));
+                            String catchVarName = inferCatchVarName(handlerBody);
+                            catches.add(new TryCatchStatement.CatchClause(types, catchVarName, hBlock));
+                            hasNonMonitorHandler = true;
                         }
                     }
+                    // START_CHANGE: IMP-2026-0062-20260425-29 - Collapse synthetic monitor
+                    // try-finally so reconstructSynchronized can recognize the legacy
+                    // __MONITORENTER__/__MONITOREXIT__ pattern. Without this, every
+                    // synchronized block emits as `try { ... __MONITOREXIT__ } finally
+                    // { __MONITOREXIT__; throw $exception; }` which the user sees as
+                    // "too many trys" and which never compiles ($exception is not a
+                    // real symbol). Heuristic: no real catches, body contains
+                    // __MONITORENTER__, finally body is the unwind preamble.
+                    if (!hasNonMonitorHandler && finallyBody != null
+                            && isMonitorUnwindFinally(tryBody, finallyBody)) {
+                        for (Statement s : tryBody) out.add(s);
+                        bb = bb.getNext();
+                        continue;
+                    }
+                    // END_CHANGE: IMP-2026-0062-29
                     out.add(new TryCatchStatement(line,
                         new BlockStatement(line, tryBody),
                         catches, finallyBody, null));
@@ -219,10 +237,12 @@ public class JdFlowBuilder {
                 // basicBlock is the case body -- emit recursively, bounded by
                 // TYPE_SWITCH_BREAK which the reducer injects at the join point.
                 case BasicBlock.TYPE_SWITCH: {
-                    Expression selector = bb.statements != null && !bb.statements.isEmpty()
-                            && bb.statements.get(0) instanceof ExpressionStatement
-                        ? ((ExpressionStatement) bb.statements.get(0)).getExpression()
-                        : new StringConstantExpression(line, "/* switch selector */");
+                    Expression selector = bb.selectorExpression != null
+                        ? bb.selectorExpression
+                        : (bb.statements != null && !bb.statements.isEmpty()
+                                && bb.statements.get(0) instanceof ExpressionStatement
+                            ? ((ExpressionStatement) bb.statements.get(0)).getExpression()
+                            : new StringConstantExpression(line, "/* switch selector */"));
                     List<SwitchStatement.SwitchCase> cases = new ArrayList<SwitchStatement.SwitchCase>();
                     for (SwitchCase sc : bb.getSwitchCases()) {
                         List<Expression> labels = new ArrayList<Expression>();
@@ -249,6 +269,84 @@ public class JdFlowBuilder {
                     return;
             }
         }
+    }
+
+    /** Look at the catch body's first statement (typically `astore` decoded as
+     *  `Type var = e;`) to recover the user's source-level catch variable name.
+     *  Falls back to "e" if no explicit assignment is found. */
+    private static String inferCatchVarName(List<Statement> handlerBody) {
+        if (handlerBody == null || handlerBody.isEmpty()) return "e";
+        Statement first = handlerBody.get(0);
+        if (first instanceof it.denzosoft.javadecompiler.model.javasyntax.statement.VariableDeclarationStatement) {
+            it.denzosoft.javadecompiler.model.javasyntax.statement.VariableDeclarationStatement vd =
+                (it.denzosoft.javadecompiler.model.javasyntax.statement.VariableDeclarationStatement) first;
+            String n = vd.getName();
+            if (n != null && !n.isEmpty()) {
+                handlerBody.remove(0);
+                return n;
+            }
+        }
+        if (first instanceof ExpressionStatement) {
+            Expression expr = ((ExpressionStatement) first).getExpression();
+            Expression lhs = null;
+            Expression rhs = null;
+            String op = null;
+            if (expr instanceof it.denzosoft.javadecompiler.model.javasyntax.expression.AssignmentExpression) {
+                it.denzosoft.javadecompiler.model.javasyntax.expression.AssignmentExpression a =
+                    (it.denzosoft.javadecompiler.model.javasyntax.expression.AssignmentExpression) expr;
+                lhs = a.getLeft(); rhs = a.getRight(); op = a.getOperator();
+            } else if (expr instanceof it.denzosoft.javadecompiler.model.javasyntax.expression.BinaryOperatorExpression) {
+                it.denzosoft.javadecompiler.model.javasyntax.expression.BinaryOperatorExpression b =
+                    (it.denzosoft.javadecompiler.model.javasyntax.expression.BinaryOperatorExpression) expr;
+                lhs = b.getLeft(); rhs = b.getRight(); op = b.getOperator();
+            }
+            if ("=".equals(op)
+                    && lhs instanceof it.denzosoft.javadecompiler.model.javasyntax.expression.LocalVariableExpression) {
+                String n = ((it.denzosoft.javadecompiler.model.javasyntax.expression.LocalVariableExpression) lhs).getName();
+                // Prefer this name only when RHS is the synthetic $exception seed:
+                // that confirms the assignment is the catch-variable bind, not a
+                // legitimate first statement of the handler body.
+                if (n != null && !n.isEmpty() && rhs instanceof it.denzosoft.javadecompiler.model.javasyntax.expression.LocalVariableExpression
+                        && "$exception".equals(((it.denzosoft.javadecompiler.model.javasyntax.expression.LocalVariableExpression) rhs).getName())) {
+                    handlerBody.remove(0);
+                    return n;
+                }
+            }
+        }
+        return "e";
+    }
+
+    /** Detect the JVM monitor-unwind synthetic finally: body holds
+     *  __MONITORENTER__ + body + __MONITOREXIT__, finally body is just the
+     *  rethrow preamble (__MONITOREXIT__; throw e;). When this matches we strip
+     *  the synthetic try-finally so the post-pass synchronized reconstructor
+     *  can collapse the markers into `synchronized(...) { ... }`. */
+    private static boolean isMonitorUnwindFinally(List<Statement> tryBody, Statement finallyBody) {
+        if (!(finallyBody instanceof BlockStatement)) return false;
+        boolean tryHasMonitor = containsMonitorMarker(tryBody);
+        if (!tryHasMonitor) return false;
+        List<Statement> stmts = ((BlockStatement) finallyBody).getStatements();
+        if (stmts == null || stmts.isEmpty()) return false;
+        for (Statement s : stmts) {
+            if (containsMonitorMarker(java.util.Collections.singletonList(s))) return true;
+        }
+        return false;
+    }
+
+    private static boolean containsMonitorMarker(List<Statement> stmts) {
+        if (stmts == null) return false;
+        for (Statement s : stmts) {
+            if (s instanceof ExpressionStatement) {
+                Expression expr = ((ExpressionStatement) s).getExpression();
+                if (expr instanceof StringConstantExpression) {
+                    String v = ((StringConstantExpression) expr).getValue();
+                    if (v != null && (v.contains("__MONITORENTER__") || v.contains("__MONITOREXIT__"))) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     private static Expression conditionExpr(BasicBlock cond, int line) {
