@@ -51,6 +51,28 @@ construct-level gaps that real-world sampling averages out.
   C_InterfaceMethods(1).
 - **Text blocks**: C_TextBlocks(1).
 
+### Debug-info sensitivity (critical nuance)
+The matrix was first compiled WITHOUT full debug info (javac default = `-g:source,lines`, no
+LocalVariableTable / LocalVariableTypeTable). Re-compiling the same corpus WITH `-g` (full debug, as most
+production builds and JD-Core's own test fixtures use) changes the result:
+
+| Compile mode | Matrix recompile |
+|---|---|
+| default (no LVT/LVTT) | 32/55 (post batch-1) |
+| `-g` (full debug) | 33/55 |
+
+Crucially the **failure set shifts**: with `-g` the lambda / functional-interface / generic-local classes
+(`C_FunctionalInterfaces`, `C_VarLambdaParams`, `C_Optional`, `C_StreamsAdvanced`) become **clean** — the
+decompiler reads the `LocalVariableTypeTable` and recovers `Function<Integer,Integer>` etc. Without `-g`,
+generic type arguments on locals are **erased from the class file and unrecoverable by any decompiler**,
+JD-Core included — this is a bytecode limitation, not a decompiler gap. (`-g` also surfaces a few separate
+LVTT-handling bugs, e.g. `C_ControlFlow`, tracked separately.)
+
+So the construct-level gaps split into two kinds:
+1. **Erasure-bound** (generics on locals without `-g`) — parity with JD-Core; not fixable from the class file.
+2. **Real construct bugs** (records, try-with-resources, synchronized-return, inner classes, guarded pattern
+   switch, unnamed `_`) — fixable, the actual improvement surface.
+
 ## Interpretation
 - Real-world **parity is strong** (0 crashes / 93% clean on JDK code) — the decompiler robustly handles the
   shapes that dominate production bytecode.
