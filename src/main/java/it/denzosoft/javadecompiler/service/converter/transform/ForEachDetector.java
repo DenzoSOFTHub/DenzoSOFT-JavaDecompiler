@@ -256,6 +256,12 @@ public final class ForEachDetector {
 
         if (elementVarName == null || elementType == null) return null;
 
+        // BUG-2026-0080 (RC-6): the element type of an array foreach is the array's component type, not the
+        // (sometimes mis-decoded) type of the synthetic element-copy local.
+        if (arrayExpr != null && arrayExpr.getType() instanceof it.denzosoft.javadecompiler.model.javasyntax.type.ArrayType) {
+            elementType = ((it.denzosoft.javadecompiler.model.javasyntax.type.ArrayType) arrayExpr.getType()).getElementType();
+        }
+
         Statement lastBodyStmt = bodyStmts.get(bodyStmts.size() - 1);
         if (!isCounterIncrement(lastBodyStmt, counterVar)) return null;
 
