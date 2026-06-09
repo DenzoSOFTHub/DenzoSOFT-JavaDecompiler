@@ -38,6 +38,8 @@ public class StructuredFlowBuilder {
     private int recursionDepth = 0;
     // START_CHANGE: ISS-2026-0007-20260324-1 - Track outer loop merge points for labeled break detection
     private List<Integer> outerLoopMergePoints = new ArrayList<Integer>();
+    // BUG-2026-0078: exit PCs of enclosing `while(true)` loops; a goto to one of these is a plain `break`.
+    private List<Integer> whileTrueExitStack = new ArrayList<Integer>();
     private Map<Integer, String> labeledBreakLabels = new HashMap<Integer, String>();
     private int labelCounter = 0;
     // END_CHANGE: ISS-2026-0007-1
@@ -237,12 +239,24 @@ public class StructuredFlowBuilder {
                 // The stopPc for the body is: the block AFTER the goto block
                 // We use the goto block's endPc as a reasonable boundary
                 int bodyStopPc = gotoBlock != null ? gotoBlock.endPc : -1;
+                // BUG-2026-0078: mark the loop exit so an inner `goto exit` becomes a plain `break`.
+                boolean pushedExit078 = false;
+                if (exitPc >= 0) { whileTrueExitStack.add(Integer.valueOf(exitPc)); pushedExit078 = true; }
                 buildFromBlock(block, bodyStmts, visited, bodyStopPc);
+                if (pushedExit078) whileTrueExitStack.remove(whileTrueExitStack.size() - 1);
 
                 int bodyLine = block.lineNumber > 0 ? block.lineNumber : 0;
-                output.add(new WhileStatement(bodyLine,
-                    new BooleanExpression(bodyLine, true),
-                    new BlockStatement(bodyLine, bodyStmts)));
+                // BUG-2026-0067: a `while (true)` whose body unconditionally returns/throws on the first
+                // iteration (e.g. a reconstructed guarded pattern switch `return switch(...) {...}`) is
+                // equivalent to its body — drop the loop wrapper.
+                if (bodyStmts.size() == 1
+                        && (bodyStmts.get(0) instanceof ReturnStatement || bodyStmts.get(0) instanceof ThrowStatement)) {
+                    output.add(bodyStmts.get(0));
+                } else {
+                    output.add(new WhileStatement(bodyLine,
+                        new BooleanExpression(bodyLine, true),
+                        new BlockStatement(bodyLine, bodyStmts)));
+                }
 
                 // Continue from exit block if any
                 if (exitPc >= 0) {
@@ -298,6 +312,20 @@ public class StructuredFlowBuilder {
             if (block.type == BasicBlock.SWITCH) {
                 // Compute merge point for the switch: the PC where all cases converge
                 int switchMergePc = findSwitchMergePoint(block);
+
+                // START_CHANGE: BUG-2026-0066-20260608-1 - Try to reconstruct a switch EXPRESSION
+                // first (every arm yields a value into a common `return` merge). Falls through to the
+                // statement-switch builder if the shape does not match.
+                Statement switchExpr = tryBuildSwitchExpression(block, switchMergePc, visited);
+                if (switchExpr != null) {
+                    if (switchExpr instanceof BlockStatement) {
+                        output.addAll(((BlockStatement) switchExpr).getStatements());
+                    } else {
+                        output.add(switchExpr);
+                    }
+                    return; // return-merge: flow ends here
+                }
+                // END_CHANGE: BUG-2026-0066-1
 
                 // Effective stopPc for case bodies: use the switch merge point
                 // so that case bodies don't bleed into subsequent code
@@ -408,6 +436,12 @@ public class StructuredFlowBuilder {
                 if (target != null && target.startPc <= block.startPc) {
                     // Backward goto = loop back-edge (while loop detected)
                     // The loop was already handled in matchConditionalPattern
+                    return;
+                }
+                // BUG-2026-0078: a forward goto to an enclosing while(true)'s exit PC is a plain `break`.
+                // (Checked before the labeled-break logic so the innermost loop stays unlabeled.)
+                if (target != null && whileTrueExitStack.contains(Integer.valueOf(target.startPc))) {
+                    output.add(new BreakStatement(block.lineNumber));
                     return;
                 }
                 // START_CHANGE: ISS-2026-0007-20260324-5 - Detect labeled break (goto targets beyond current stopPc)
@@ -1072,6 +1106,280 @@ public class StructuredFlowBuilder {
      * converge. This is the target of goto instructions at the end of case bodies,
      * or the default target if all non-default cases goto there.
      */
+    // START_CHANGE: BUG-2026-0066-20260608-3 - Switch-expression reconstruction.
+    private Statement tryBuildSwitchExpression(BasicBlock block, int mergePc, Set<Integer> visited) {
+        if (mergePc < 0 || block.switchKeys == null || block.switchDefaultTarget < 0) return null;
+        BasicBlock mergeBlock = cfg.getBlockAtPc(mergePc);
+        if (mergeBlock == null) return null;
+        // Only the `return switch(...)` shape for now: the merge is a `*return` (its own returned
+        // value is one arm's value leaked across the stack-merge; we replace it with the switch expr).
+        if (!mergeBlock.isReturn()) {
+            return null;
+        }
+        int line = block.lineNumber > 0 ? block.lineNumber : 0;
+
+        // Selector.
+        Expression selector = null;
+        boolean selFromStmt = false;
+        if (block.statements != null && !block.statements.isEmpty()) {
+            Statement last = block.statements.get(block.statements.size() - 1);
+            if (last instanceof ExpressionStatement) {
+                Expression e = ((ExpressionStatement) last).getExpression();
+                selector = (e instanceof AssignmentExpression) ? ((AssignmentExpression) e).getLeft() : e;
+                selFromStmt = true;
+            }
+        }
+        if (selector == null && block.selectorExpression != null) selector = block.selectorExpression;
+        if (selector == null) return null;
+
+        // BUG-2026-0067: pattern switch — `switch (SwitchBootstraps.typeSwitch(sel, idx))`. The real
+        // selector is the first bootstrap argument; arms are `Type b = (Type) sel; <value>`.
+        boolean patternSwitch = false;
+        Expression realSelector = selector;
+        if (selector instanceof StaticMethodInvocationExpression) {
+            StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) selector;
+            if (("typeSwitch".equals(smie.getMethodName()) || "enumSwitch".equals(smie.getMethodName()))
+                    && smie.getArguments() != null && !smie.getArguments().isEmpty()) {
+                patternSwitch = true;
+                realSelector = smie.getArguments().get(0);
+            }
+        }
+
+        // Group keys that share a target into a single case.
+        List<List<Integer>> keyGroups = new ArrayList<List<Integer>>();
+        List<Integer> targetPcs = new ArrayList<Integer>();
+        for (int i = 0; i < block.switchKeys.length; i++) {
+            int targetPc = (block.switchTargets != null && i < block.switchTargets.length) ? block.switchTargets[i] : -1;
+            int gi = targetPcs.indexOf(Integer.valueOf(targetPc));
+            if (gi >= 0) {
+                keyGroups.get(gi).add(Integer.valueOf(block.switchKeys[i]));
+            } else {
+                List<Integer> g = new ArrayList<Integer>();
+                g.add(Integer.valueOf(block.switchKeys[i]));
+                keyGroups.add(g);
+                targetPcs.add(Integer.valueOf(targetPc));
+            }
+        }
+
+        // For a guarded pattern switch the arms restart the typeSwitch loop; the restart index is the
+        // second bootstrap argument and the loop header is this switch block.
+        Expression restartVar = null;
+        if (patternSwitch && selector instanceof StaticMethodInvocationExpression) {
+            List<Expression> sargs = ((StaticMethodInvocationExpression) selector).getArguments();
+            if (sargs != null && sargs.size() > 1) restartVar = sargs.get(1);
+        }
+        int switchStartPc = block.startPc;
+
+        List<SwitchExpression.SwitchCase> exprCases = new ArrayList<SwitchExpression.SwitchCase>();
+        Type valType = null;
+        Set<Integer> armPcs = new HashSet<Integer>();
+        for (int g = 0; g < keyGroups.size(); g++) {
+            BasicBlock tb = cfg.getBlockAtPc(targetPcs.get(g).intValue());
+            SwitchExpression.SwitchCase sc;
+            if (patternSwitch) {
+                // `case null` arm: the typeSwitch returns -1 for null; the arm is a plain value.
+                if (keyGroups.get(g).size() == 1 && keyGroups.get(g).get(0).intValue() == -1) {
+                    Expression nv = switchArmValue(tb, mergePc);
+                    if (nv == null) return null;
+                    List<Expression> nl = new ArrayList<Expression>();
+                    nl.add(NullExpression.INSTANCE);
+                    sc = new SwitchExpression.SwitchCase(nl, nv);
+                } else {
+                    sc = patternArm(tb, mergePc);
+                    if (sc == null) sc = guardedPatternArm(tb, mergePc, switchStartPc, restartVar, armPcs);
+                    if (sc == null) return null;
+                }
+            } else {
+                Expression val = switchArmValue(tb, mergePc);
+                if (val == null) return null;
+                List<Expression> labels = new ArrayList<Expression>();
+                for (int k = 0; k < keyGroups.get(g).size(); k++) {
+                    labels.add(IntegerConstantExpression.valueOf(line, keyGroups.get(g).get(k).intValue()));
+                }
+                sc = new SwitchExpression.SwitchCase(labels, val);
+            }
+            if (valType == null && sc.getValue() != null && sc.getValue().getType() != null) valType = sc.getValue().getType();
+            exprCases.add(sc);
+            armPcs.add(Integer.valueOf(tb.startPc));
+        }
+        BasicBlock db = cfg.getBlockAtPc(block.switchDefaultTarget);
+        if (patternSwitch && isMatchExceptionDefault(db)) {
+            // Exhaustive pattern switch: the synthetic `default -> throw MatchException` is implicit.
+            armPcs.add(Integer.valueOf(db.startPc));
+        } else {
+            Expression defVal = switchArmValue(db, mergePc);
+            if (defVal == null) return null; // need a value default (no block arms yet)
+            exprCases.add(new SwitchExpression.SwitchCase(null, defVal));
+            armPcs.add(Integer.valueOf(db.startPc));
+        }
+        selector = realSelector;
+
+        // The merge return must be reached ONLY from the switch arms. If any other block flows into
+        // it (e.g. a nested switch-expr whose merge is shared with an outer fall-through), consuming
+        // the merge would drop the outer path's return. Bail in that case.
+        for (BasicBlock b : cfg.getBlocks()) {
+            if (b == block || armPcs.contains(Integer.valueOf(b.startPc)) || b.startPc == mergePc) continue;
+            boolean reachesMerge = (b.branchTargetPc == mergePc) || (b.endPc == mergePc);
+            if (reachesMerge) return null;
+        }
+
+        // Commit.
+        SwitchExpression se = new SwitchExpression(line,
+            valType != null ? valType : PrimitiveType.INT, selector, exprCases);
+        for (Integer pc : armPcs) visited.add(pc);
+        visited.add(Integer.valueOf(mergeBlock.startPc));
+
+        List<Statement> out = new ArrayList<Statement>(block.statements);
+        if (selFromStmt && !out.isEmpty()) out.remove(out.size() - 1);
+        out.add(new ReturnStatement(line, se));
+        return new BlockStatement(line, out);
+    }
+
+    private Expression switchArmValue(BasicBlock tb, int mergePc) {
+        if (tb == null || tb.stackTopExpression == null) return null;
+        if (tb.statements != null && !tb.statements.isEmpty()) return null;
+        boolean gotoMerge = tb.isGoto() && tb.branchTargetPc == mergePc;
+        boolean fallMerge = tb.endPc == mergePc;
+        return (gotoMerge || fallMerge) ? tb.stackTopExpression : null;
+    }
+    // END_CHANGE: BUG-2026-0066-3
+
+    // START_CHANGE: BUG-2026-0067-20260608-1 - A type-pattern switch arm: exactly a binding cast
+    // (`Type b = (Type) sel;`) plus a value on the stack, flowing to the switch merge.
+    private SwitchExpression.SwitchCase patternArm(BasicBlock tb, int mergePc) {
+        if (tb == null || tb.stackTopExpression == null) return null;
+        if (tb.statements == null || tb.statements.size() != 1) return null;
+        Statement s0 = tb.statements.get(0);
+        Type ptype = null; String pbind = null;
+        if (s0 instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) s0;
+            if (vds.hasInitializer() && vds.getInitializer() instanceof CastExpression) {
+                ptype = vds.getType(); pbind = vds.getName();
+            }
+        } else if (s0 instanceof ExpressionStatement) {
+            Expression e = ((ExpressionStatement) s0).getExpression();
+            if (e instanceof AssignmentExpression) {
+                AssignmentExpression ae = (AssignmentExpression) e;
+                if (ae.getLeft() instanceof LocalVariableExpression && ae.getRight() instanceof CastExpression) {
+                    pbind = ((LocalVariableExpression) ae.getLeft()).getName();
+                    ptype = ((CastExpression) ae.getRight()).getType();
+                }
+            }
+        }
+        if (ptype == null || pbind == null) return null;
+        boolean gotoMerge = tb.isGoto() && tb.branchTargetPc == mergePc;
+        boolean fallMerge = tb.endPc == mergePc;
+        if (!(gotoMerge || fallMerge)) return null;
+        SwitchExpression.SwitchCase sc = new SwitchExpression.SwitchCase(null, tb.stackTopExpression);
+        sc.setPatternType(ptype);
+        sc.setPatternBinding(pbind);
+        return sc;
+    }
+
+    // A guarded pattern arm: `Type b = (Type) sel;` then a conditional whose two successors are a
+    // value (-> merge) and a restart (set the typeSwitch index + goto the loop header). Reconstructs
+    // `case Type b when <guard> -> <value>`.
+    private SwitchExpression.SwitchCase guardedPatternArm(BasicBlock tb, int mergePc,
+                                                          int switchStartPc, Expression restartVar,
+                                                          Set<Integer> consumed) {
+        if (tb == null || !tb.isConditional() || tb.condition == null) return null;
+        if (tb.statements == null || tb.statements.size() != 1) return null;
+        Type ptype = null; String pbind = null;
+        Statement s0 = tb.statements.get(0);
+        if (s0 instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) s0;
+            if (vds.hasInitializer() && vds.getInitializer() instanceof CastExpression) {
+                ptype = vds.getType(); pbind = vds.getName();
+            }
+        }
+        if (ptype == null || pbind == null) return null;
+        BasicBlock ts = tb.trueSuccessor, fs = tb.falseSuccessor;
+        if (ts == null || fs == null) return null;
+
+        BasicBlock valueB = null;
+        boolean valueIsFallThrough = false;
+        if (switchArmValue(ts, mergePc) != null && isRestart(fs, switchStartPc, restartVar)) {
+            valueB = ts; valueIsFallThrough = false; // value is the branch target
+        } else if (switchArmValue(fs, mergePc) != null && isRestart(ts, switchStartPc, restartVar)) {
+            valueB = fs; valueIsFallThrough = true;  // value is the fall-through
+        } else {
+            return null;
+        }
+        // The displayed condition is true for the fall-through successor; orient the guard so it is
+        // true on the value path.
+        Expression guard = valueIsFallThrough ? tb.condition : negateCondition(tb.condition, tb.lineNumber);
+        guard = simplifyGuard(guard);
+        SwitchExpression.SwitchCase sc = new SwitchExpression.SwitchCase(null, valueB.stackTopExpression);
+        sc.setPatternType(ptype);
+        sc.setPatternBinding(pbind);
+        sc.setGuard(guard);
+        consumed.add(Integer.valueOf(ts.startPc));
+        consumed.add(Integer.valueOf(fs.startPc));
+        return sc;
+    }
+
+    // `boolExpr != 0` -> `boolExpr`; `boolExpr == 0` -> `!boolExpr` (the guard came from an `ifeq`/`ifne`
+    // over a boolean-valued expression, which would otherwise render as an illegal `boolean != int`).
+    private Expression simplifyGuard(Expression g) {
+        if (g instanceof BinaryOperatorExpression) {
+            BinaryOperatorExpression b = (BinaryOperatorExpression) g;
+            if (isZeroConst(b.getRight()) && isBooleanValued(b.getLeft())) {
+                if ("!=".equals(b.getOperator())) return b.getLeft();
+                if ("==".equals(b.getOperator())) {
+                    return new UnaryOperatorExpression(b.getLineNumber(), PrimitiveType.BOOLEAN, "!", b.getLeft(), true);
+                }
+            }
+        }
+        return g;
+    }
+
+    private boolean isZeroConst(Expression e) {
+        return e instanceof IntegerConstantExpression && ((IntegerConstantExpression) e).getValue() == 0;
+    }
+
+    private boolean isBooleanValued(Expression e) {
+        if (e instanceof MethodInvocationExpression) {
+            String d = ((MethodInvocationExpression) e).getDescriptor();
+            return d != null && d.endsWith(")Z");
+        }
+        if (e instanceof StaticMethodInvocationExpression) {
+            String d = ((StaticMethodInvocationExpression) e).getDescriptor();
+            return d != null && d.endsWith(")Z");
+        }
+        return e != null && e.getType() == PrimitiveType.BOOLEAN;
+    }
+
+    private boolean isRestart(BasicBlock b, int switchStartPc, Expression restartVar) {
+        if (b == null || !b.isGoto() || b.branchTargetPc != switchStartPc) return false;
+        if (!(restartVar instanceof LocalVariableExpression) || b.statements == null) return false;
+        String rname = ((LocalVariableExpression) restartVar).getName();
+        for (Statement s : b.statements) {
+            if (s instanceof ExpressionStatement) {
+                Expression e = ((ExpressionStatement) s).getExpression();
+                if (e instanceof AssignmentExpression
+                        && ((AssignmentExpression) e).getLeft() instanceof LocalVariableExpression
+                        && rname.equals(((LocalVariableExpression) ((AssignmentExpression) e).getLeft()).getName())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean isMatchExceptionDefault(BasicBlock db) {
+        if (db == null || db.statements == null) return false;
+        for (Statement s : db.statements) {
+            Expression e = null;
+            if (s instanceof ThrowStatement) e = ((ThrowStatement) s).getExpression();
+            if (e instanceof NewExpression) {
+                String tn = ((NewExpression) e).getInternalTypeName();
+                if (tn != null && tn.endsWith("MatchException")) return true;
+            }
+        }
+        return false;
+    }
+    // END_CHANGE: BUG-2026-0067-1
+
     private int findSwitchMergePoint(BasicBlock switchBlock) {
         // Collect all switch target PCs (case targets only, not default)
         Set<Integer> casePcs = new HashSet<Integer>();
@@ -1204,10 +1512,21 @@ public class StructuredFlowBuilder {
      * Both of its branches must produce values (or be nested ternaries themselves).
      */
     // START_CHANGE: BUG-2026-0032-20260325-3 - Fix infinite recursion in ternary detection
+    // START_CHANGE: BUG-2026-0057-20260608-1 - canFormTernary is a PROBE: it must not mutate the
+    // caller's emission `visited` set. Previously it added every block it inspected to `visited`,
+    // so probing a sequential `if (a) return X; if (b) return Y; ...` cascade (which is NOT a
+    // ternary) permanently marked the 2nd/3rd condition blocks as "emitted"; the real continuation
+    // then saw them visited and bailed, dropping every branch after the first (silent truncation +
+    // "missing return"). The probe now uses its OWN cycle-guard set and only READS `visited`.
     private boolean canFormTernary(BasicBlock condBlock, Set<Integer> visited) {
-        // Guard: if we've already visited this block, it's a cycle (loop), not a ternary
+        return canFormTernary(condBlock, visited, new HashSet<Integer>());
+    }
+
+    private boolean canFormTernary(BasicBlock condBlock, Set<Integer> visited, Set<Integer> probing) {
+        // Already emitted elsewhere -> not a fresh ternary branch.
         if (visited.contains(condBlock.startPc)) return false;
-        visited.add(condBlock.startPc);
+        // Cycle within the probe (loop, not a ternary).
+        if (!probing.add(condBlock.startPc)) return false;
 
         BasicBlock tTrue = condBlock.falseSuccessor;  // fall-through = true
         BasicBlock tFalse = condBlock.trueSuccessor;   // branch = false
@@ -1224,17 +1543,18 @@ public class StructuredFlowBuilder {
         // Only recurse on FORWARD conditionals (target PC > current PC) to prevent loops
         if (!trueOk && tTrue.isConditional()
             && tTrue.startPc > condBlock.startPc
-            && !visited.contains(tTrue.startPc)) {
-            trueOk = canFormTernary(tTrue, visited);
+            && !visited.contains(tTrue.startPc) && !probing.contains(tTrue.startPc)) {
+            trueOk = canFormTernary(tTrue, visited, probing);
         }
         if (!falseOk && tFalse.isConditional()
             && tFalse.startPc > condBlock.startPc
-            && !visited.contains(tFalse.startPc)) {
-            falseOk = canFormTernary(tFalse, visited);
+            && !visited.contains(tFalse.startPc) && !probing.contains(tFalse.startPc)) {
+            falseOk = canFormTernary(tFalse, visited, probing);
         }
 
         return trueOk && falseOk;
     }
+    // END_CHANGE: BUG-2026-0057-1
     // END_CHANGE: BUG-2026-0032-3
 
     /**

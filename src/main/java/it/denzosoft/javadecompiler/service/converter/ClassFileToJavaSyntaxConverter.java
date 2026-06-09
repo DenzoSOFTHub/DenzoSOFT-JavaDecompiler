@@ -186,9 +186,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         // Load BootstrapMethods attribute
         bootstrapMethodsAttr = classFile.findAttribute("BootstrapMethods");
 
-        // Build synthetic method map for lambda body reconstruction
+        // Build synthetic method map for lambda body reconstruction.
+        // START_CHANGE: BUG-2026-0073-20260608-1 - Decode synthetic bodies in TWO passes. A lambda
+        // body can reference a *later* lambda$ method (a nested lambda); on the first pass that nested
+        // body is not yet registered, so it leaks as `Class::lambda$x$n`. The second pass re-decodes
+        // every body with the full map available, so nested lambdas inline correctly.
         syntheticBodies = new HashMap<String, List<Statement>>();
         syntheticParamNames = new HashMap<String, List<String>>();
+        for (int synthPass = 0; synthPass < 2; synthPass++) {
         for (MethodInfo method : classFile.getMethods()) {
             if (method.isSynthetic() && method.getName().startsWith("lambda$")) {
                 CodeAttribute code = method.findAttribute("Code");
@@ -208,15 +213,25 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                             }
                         }
                     }
+                    // START_CHANGE: BUG-2026-0065-20260608-2 - Only record param names when the LVT
+                    // actually names every parameter. When it does not (default javac without -g), leave
+                    // the entry absent so the call site knows the body uses `argN` defaults and must
+                    // rename/substitute them to avoid shadowing the enclosing method's `argN`.
+                    boolean allNamed = paramDescs.length > 0;
                     for (int pi = 0; pi < paramDescs.length; pi++) {
                         String name = lvtNames.get(slot);
+                        if (name == null) allNamed = false;
                         paramNames.add(name != null ? name : "arg" + pi);
                         slot += ("D".equals(paramDescs[pi]) || "J".equals(paramDescs[pi])) ? 2 : 1;
                     }
-                    syntheticParamNames.put(method.getName(), paramNames);
+                    if (allNamed) {
+                        syntheticParamNames.put(method.getName(), paramNames);
+                    }
+                    // END_CHANGE: BUG-2026-0065-2
                 }
             }
         }
+        } // END_CHANGE: BUG-2026-0073-1 (synthPass)
 
         // Module info
         if (classFile.isModule()) {
@@ -1017,6 +1032,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     String retDesc = TypeNameUtil.parseMethodReturnDescriptor(method.getDescriptor());
                     boolean returnIsBoolean = "Z".equals(retDesc);
                     jdResult = BooleanSimplifier.simplify(jdResult, returnIsBoolean);
+                    jdResult = it.denzosoft.javadecompiler.service.converter.transform.InstanceOfPatternReconstructor.reconstruct(jdResult);
                     jdResult = reconstructAsserts(jdResult);
                     jdResult = reconstructSynchronized(jdResult);
                     jdResult = CompoundAssignmentSimplifier.simplify(jdResult);
@@ -1096,12 +1112,37 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 TryCatchReconstructor tryCatchReconstructor = new TryCatchReconstructor(
                     cfg, pcToLine, localVarNames, currentBytecode, pool, handlerVarNames);
                 result = tryCatchReconstructor.reconstruct(result, codeAttr.getExceptionTable());
+                // BUG-2026-0068: collapse the Java 9+ try-with-resources desugar into `try (res) {...}`.
+                result = it.denzosoft.javadecompiler.service.converter.transform.ModernTwrReconstructor.reconstruct(result);
                 // Post-process: detect for-each patterns
                 result = ForEachDetector.convert(result);
+                // START_CHANGE: BUG-2026-0077-20260609-1 - Promote the first bare assignment of an
+                // otherwise-undeclared local to a declaration. ForEachDetector removes the iterator
+                // declaration that "owned" a reused slot, leaving its later reuse declaration-less
+                // (`var6 = new HashMap();` -> "cannot find symbol").
+                java.util.Set<String> paramNames077 = new java.util.HashSet<String>();
+                {
+                    String[] pds077 = TypeNameUtil.parseMethodParameterDescriptors(method.getDescriptor());
+                    int pslot077 = method.isStatic() ? 0 : 1;
+                    for (int pi077 = 0; pi077 < pds077.length; pi077++) {
+                        String pn077 = localVarNames.get(Integer.valueOf(pslot077));
+                        if (pn077 != null) paramNames077.add(pn077);
+                        pslot077 += ("D".equals(pds077[pi077]) || "J".equals(pds077[pi077])) ? 2 : 1;
+                    }
+                }
+                promoteUndeclaredAssignments(result, paramNames077);
+                // END_CHANGE: BUG-2026-0077-1
                 // Post-process: simplify boolean comparisons (x != 0 → x, x == 0 → !x)
                 String retDesc = TypeNameUtil.parseMethodReturnDescriptor(method.getDescriptor());
                 boolean returnIsBoolean = "Z".equals(retDesc);
                 result = BooleanSimplifier.simplify(result, returnIsBoolean);
+                // START_CHANGE: BUG-2026-0064-20260608-1 - Reconstruct instanceof pattern bindings
+                // BUG-2026-0069: strip record-pattern MatchException try/catch scaffolding + always-true ifs.
+                result = it.denzosoft.javadecompiler.service.converter.transform.RecordPatternReconstructor.reconstruct(result);
+                result = it.denzosoft.javadecompiler.service.converter.transform.InstanceOfPatternReconstructor.reconstruct(result);
+                // BUG-2026-0067: fold record-deconstruction component extraction into `instanceof Type(comp, ...)`.
+                result = it.denzosoft.javadecompiler.service.converter.transform.RecordDeconstructionFolder.reconstruct(result);
+                // END_CHANGE: BUG-2026-0064-1
                 // START_CHANGE: ISS-2026-0011-20260323-1 - Reconstruct assert statements from $assertionsDisabled pattern
                 result = reconstructAsserts(result);
                 // END_CHANGE: ISS-2026-0011-1
@@ -1162,6 +1203,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     private Map<String, List<Statement>> syntheticBodies;
     // Map of synthetic lambda method names to their parameter names from LVT
     private Map<String, List<String>> syntheticParamNames;
+    // BUG-2026-0065: counter for fresh, non-shadowing lambda parameter names (`pN`)
+    private int lambdaVarCounter;
     // Bootstrap methods attribute for the current class
     private BootstrapMethodsAttribute bootstrapMethodsAttr;
     // START_CHANGE: LIM-0005-20260326-1 - Pattern switch case labels from typeSwitch bootstrap
@@ -1673,8 +1716,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 if (arr instanceof NewArrayExpression) {
                     NewArrayExpression nae = (NewArrayExpression) arr;
                     nae.addInitValue(val);
-                    // Push the array back on the stack (the dup before each store keeps a copy)
-                    stack.push(nae);
+                    // START_CHANGE: BUG-2026-0062-20260608-1 - The `dup` before each store already left
+                    // a copy of the array on the stack; only re-push if it was actually consumed,
+                    // otherwise the array ends up duplicated and a following `invokevirtual` reads it as
+                    // BOTH the receiver and the argument (e.g. `new Object[]{a}.formatted(...)`).
+                    if (stack.isEmpty() || stack.peek() != nae) {
+                        stack.push(nae);
+                    }
+                    // END_CHANGE: BUG-2026-0062-1
                     break;
                 }
                 // END_CHANGE: ISS-2026-0002-3
@@ -2164,8 +2213,48 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     args.add(0, popOrUnderflowRef(stack));
                 }
 
+                // START_CHANGE: BUG-2026-0058-20260608-1 - Dispatch invokedynamic on the
+                // bootstrap FACTORY class, not just the dynamic call-site name. Previously only
+                // `makeConcatWithConstants`/`typeSwitch` were recognised and every other bootstrap
+                // (most importantly java.lang.runtime.ObjectMethods, used for record
+                // toString/hashCode/equals) fell into the null-body lambda fallback and rendered
+                // as `arg0 -> { }`. Resolve the factory owner up front.
+                String bsmOwner = null;
+                if (bootstrapMethodsAttr != null) {
+                    BootstrapMethodsAttribute.BootstrapMethod[] bsmAll = bootstrapMethodsAttr.getBootstrapMethods();
+                    int bsmIdx0 = indyEntry[0];
+                    if (bsmIdx0 >= 0 && bsmIdx0 < bsmAll.length) {
+                        int mhIndex = bsmAll[bsmIdx0].bootstrapMethodRef;
+                        if (pool.getTag(mhIndex) == ConstantPool.CONSTANT_MethodHandle) {
+                            int[] mh0 = pool.getValue(mhIndex);
+                            bsmOwner = pool.getMemberClassName(mh0[1]);
+                        }
+                    }
+                }
+
+                // Record component bootstrap: toString/hashCode/equals synthesised by the compiler
+                // via java.lang.runtime.ObjectMethods. Emit a recognisable sentinel invocation so
+                // the writer can suppress the implicit record member (BUG-2026-0059); if for some
+                // reason the member is NOT suppressed, a `super.<method>()`-shaped call still
+                // compiles, unlike the previous `arg0 -> { }` garbage.
+                if ("java/lang/runtime/ObjectMethods".equals(bsmOwner)) {
+                    Expression objMethods = new StaticMethodInvocationExpression(
+                        line, retType, "java/lang/runtime/ObjectMethods", methodName, desc, args);
+                    if ("V".equals(retDesc)) {
+                        statements.add(new ExpressionStatement(objMethods));
+                    } else {
+                        stack.push(objMethods);
+                    }
+                    break;
+                }
+                // END_CHANGE: BUG-2026-0058-1
+
                 // Detect string concatenation pattern (Java 9+)
-                if ("makeConcatWithConstants".equals(methodName) && args.size() > 0) {
+                // BUG-2026-0058: also accept the constant-free `makeConcat` recipe (gated on the
+                // StringConcatFactory owner so a user method named `makeConcat` is not hijacked).
+                if (("makeConcatWithConstants".equals(methodName)
+                        || ("makeConcat".equals(methodName) && "java/lang/invoke/StringConcatFactory".equals(bsmOwner)))
+                        && args.size() > 0) {
                     // Try to get the template from bootstrap method arguments
                     String template = null;
                     if (bootstrapMethodsAttr != null) {
@@ -2304,35 +2393,61 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                                         String implDesc = pool.getMemberDescriptor(handleEntry[1]);
                                         List<String> lambdaParamNames = new ArrayList<String>();
                                         List<Type> lambdaParamTypes = new ArrayList<Type>();
-                                        // Get LVT-based names if available
+                                        // LVT-based names, ONLY present when the LVT named every param.
                                         List<String> lvtNames = syntheticParamNames != null
                                             ? syntheticParamNames.get(implMethodName) : null;
+                                        List<Statement> lambdaBodyFinal = lambdaBody;
                                         if (implDesc != null) {
                                             String[] implParamDescs = TypeNameUtil.parseMethodParameterDescriptors(implDesc);
-                                            // START_CHANGE: BUG-2026-0064-20260421-1 - For REF_invokeVirtual (5)
-                                            // and REF_invokeInterface (9) handle kinds the first captured arg is
-                                            // the implicit `this` receiver and is NOT reflected in the impl method
-                                            // descriptor. Counting it as a captured param makes the lambda lose its
-                                            // own arg list (e.g. `() -> this.repaint()` instead of `e -> this.repaint()`).
+                                            // REF_invokeVirtual (5), REF_invokeSpecial (7), REF_invokeInterface (9)
+                                            // are instance invocations: the first captured arg is the implicit
+                                            // `this` and does NOT appear in the impl method descriptor.
                                             int refKind = handleEntry[0];
-                                            // REF_invokeVirtual (5), REF_invokeSpecial (7) and
-                                            // REF_invokeInterface (9) are instance invocations:
-                                            // the first captured arg is the implicit `this` and
-                                            // does NOT appear in the impl method descriptor.
                                             int thisCapture = (refKind == 5 || refKind == 7 || refKind == 9) ? 1 : 0;
                                             int capturedCount = Math.max(0, args.size() - thisCapture);
-                                            // END_CHANGE: BUG-2026-0064-1
-                                            for (int pi = capturedCount; pi < implParamDescs.length; pi++) {
-                                                String pName = (lvtNames != null && pi < lvtNames.size())
-                                                    ? lvtNames.get(pi) : "arg" + (pi - capturedCount);
-                                                lambdaParamNames.add(pName);
-                                                lambdaParamTypes.add(parseType(implParamDescs[pi]));
+                                            if (lvtNames != null) {
+                                                // LVT named every param; the synthetic body already uses those
+                                                // names. Keep the existing behavior.
+                                                for (int pi = capturedCount; pi < implParamDescs.length && pi < lvtNames.size(); pi++) {
+                                                    lambdaParamNames.add(lvtNames.get(pi));
+                                                    lambdaParamTypes.add(parseType(implParamDescs[pi]));
+                                                }
+                                            } else {
+                                                // START_CHANGE: BUG-2026-0065-20260608-3 - No LVT: the body uses
+                                                // `argN`. Substitute captured arguments into the body and rename
+                                                // the lambda's OWN parameters to fresh `pN` so they cannot shadow
+                                                // the enclosing method's `argN`. (`argN` rename without capture
+                                                // substitution would break captured-variable references.)
+                                                final Map<String, Expression> subst = new HashMap<String, Expression>();
+                                                for (int i = 0; i < capturedCount; i++) {
+                                                    int ai = i + thisCapture;
+                                                    if (ai >= 0 && ai < args.size()) {
+                                                        subst.put("arg" + i, args.get(ai));
+                                                    }
+                                                }
+                                                for (int pi = capturedCount; pi < implParamDescs.length; pi++) {
+                                                    String fresh = "p" + (lambdaVarCounter++);
+                                                    Type pt = parseType(implParamDescs[pi]);
+                                                    subst.put("arg" + pi, new LocalVariableExpression(line, pt, fresh, -1));
+                                                    lambdaParamNames.add(fresh);
+                                                    lambdaParamTypes.add(pt);
+                                                }
+                                                if (!subst.isEmpty() && lambdaBody != null) {
+                                                    it.denzosoft.javadecompiler.service.converter.transform.AstLocalRewriter rw =
+                                                        new it.denzosoft.javadecompiler.service.converter.transform.AstLocalRewriter() {
+                                                            protected Expression onLocal(LocalVariableExpression lv) {
+                                                                Expression r = subst.get(lv.getName());
+                                                                return r != null ? r : lv;
+                                                            }
+                                                        };
+                                                    List<Statement> rewritten = new ArrayList<Statement>(lambdaBody.size());
+                                                    for (Statement st : lambdaBody) rewritten.add(rw.rewrite(st));
+                                                    lambdaBodyFinal = rewritten;
+                                                }
+                                                // END_CHANGE: BUG-2026-0065-3
                                             }
                                         }
-                                        if (lambdaParamNames.isEmpty()) {
-                                            // Zero-arg lambda (e.g., Runnable)
-                                        }
-                                        Statement body = new BlockStatement(line, lambdaBody);
+                                        Statement body = new BlockStatement(line, lambdaBodyFinal);
                                         Expression lambda = new LambdaExpression(line, retType, lambdaParamNames, lambdaParamTypes, body);
                                         stack.push(lambda);
                                         break;
@@ -2351,8 +2466,18 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                                         if (refKind == 8) {
                                             refMethodName = "new";
                                         }
+                                        // START_CHANGE: BUG-2026-0074-20260608-1 - Bound instance method
+                                        // reference: for REF_invokeVirtual/Special/Interface with a
+                                        // captured receiver, emit `receiver::method` (the captured value
+                                        // is args[0]) instead of dropping it to an unbound `Type::method`.
+                                        Expression boundReceiver = null;
+                                        if ((refKind == 5 || refKind == 7 || refKind == 9) && args.size() > 0) {
+                                            boundReceiver = args.get(0);
+                                        }
                                         Expression methodRef = new MethodReferenceExpression(
-                                            line, retType, null, ownerName, refMethodName, implDesc);
+                                            line, retType, boundReceiver,
+                                            boundReceiver != null ? "" : ownerName, refMethodName, implDesc);
+                                        // END_CHANGE: BUG-2026-0074-1
                                         stack.push(methodRef);
                                         break;
                                     }
@@ -2417,14 +2542,28 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 int index = reader.readUnsignedShort();
                 String className = pool.getClassName(index);
                 Expression count = popOrUnderflowInt(stack, line);
-                Type elemType;
+                // START_CHANGE: BUG-2026-0066-20260608-1 - `anewarray X` creates an array whose
+                // ELEMENT type is X, so the constructed array is X with ONE extra dimension. When X is
+                // itself an array descriptor ("[I"), the result is `int[][]`, not `int[]`. The
+                // NewArrayExpression must carry the full ARRAY type so the writer prints the right
+                // number of `[]`; otherwise `int[][] m = {{..}}` decompiles to `new int[]{..}`
+                // ("int[] cannot be converted to int[][]") and `new int[n][]` loses its trailing `[]`.
+                Type arrType;
                 if (className != null && className.startsWith("[")) {
-                    elemType = parseType(className);
+                    Type elem = parseType(className); // e.g. "[I" -> ArrayType(int, 1)
+                    if (elem instanceof ArrayType) {
+                        ArrayType at = (ArrayType) elem;
+                        arrType = new ArrayType(at.getElementType(), at.getDimension() + 1);
+                    } else {
+                        arrType = new ArrayType(elem, 1);
+                    }
                 } else {
-                    elemType = new ObjectType(className != null ? className : "java/lang/Object");
+                    arrType = new ArrayType(
+                        new ObjectType(className != null ? className : "java/lang/Object"), 1);
                 }
-                stack.push(new NewArrayExpression(line, elemType, Collections.singletonList(count)));
+                stack.push(new NewArrayExpression(line, arrType, Collections.singletonList(count)));
                 break;
+                // END_CHANGE: BUG-2026-0066-1
             }
 
             // Misc
@@ -2598,7 +2737,23 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         // START_CHANGE: LIM-0002-20260324-1 - Infer type from RHS when descriptor is unavailable (e.g., TWR temp vars)
         if (type == ObjectType.OBJECT && value != null && value.getType() != null
             && value.getType() != ObjectType.OBJECT && !(value instanceof NullExpression)) {
-            type = value.getType();
+            // START_CHANGE: BUG-2026-0063-20260608-1 - The declared local must be the ARRAY type,
+            // otherwise `int[] a = {..}` decompiled to `int a = new int[..]` ("int[] cannot be
+            // converted to int").
+            // BUG-2026-0066: `anewarray` now stores the full ARRAY type on the NewArrayExpression
+            // (e.g. `int[][]` for `anewarray [I`), so use it directly. `newarray` (primitive) still
+            // stores a dimension-0 ELEMENT type, so add the single bracket from the count operand.
+            if (value instanceof NewArrayExpression) {
+                Type vt = value.getType();
+                if (vt instanceof ArrayType) {
+                    type = vt;
+                } else {
+                    type = new ArrayType(vt, 1);
+                }
+            } else {
+                type = value.getType();
+            }
+            // END_CHANGE: BUG-2026-0063-1
         }
         // END_CHANGE: LIM-0002-1
 
@@ -2617,6 +2772,102 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             Expression var = new LocalVariableExpression(line, type, name, index);
             statements.add(new ExpressionStatement(
                 new AssignmentExpression(line, type, var, "=", value)));
+        }
+    }
+
+    /**
+     * BUG-2026-0077: promote the first bare `v = expr;` of a local that has NO declaration anywhere in the
+     * method (and is not a parameter) into a `Type v = expr;` declaration.
+     */
+    private void promoteUndeclaredAssignments(List<Statement> stmts, java.util.Set<String> paramNames) {
+        java.util.Set<String> declared = new java.util.HashSet<String>(paramNames);
+        collectDeclaredNames(stmts, declared);
+        java.util.Set<String> undeclared = new java.util.HashSet<String>();
+        collectAssignedUndeclared(stmts, declared, undeclared);
+        if (!undeclared.isEmpty()) promoteFirst(stmts, undeclared);
+    }
+
+    private void collectDeclaredNames(List<Statement> stmts, java.util.Set<String> d) {
+        if (stmts == null) return;
+        for (Statement s : stmts) collectDeclaredNames(s, d);
+    }
+    private void collectDeclaredNames(Statement s, java.util.Set<String> d) {
+        if (s == null) return;
+        if (s instanceof VariableDeclarationStatement) d.add(((VariableDeclarationStatement) s).getName());
+        else if (s instanceof ForEachStatement) { d.add(((ForEachStatement) s).getVariableName()); collectDeclaredNames(((ForEachStatement) s).getBody(), d); }
+        else if (s instanceof BlockStatement) collectDeclaredNames(((BlockStatement) s).getStatements(), d);
+        else if (s instanceof IfStatement) { collectPatternBindings(((IfStatement) s).getCondition(), d); collectDeclaredNames(((IfStatement) s).getThenBody(), d); }
+        else if (s instanceof IfElseStatement) { collectPatternBindings(((IfElseStatement) s).getCondition(), d); collectDeclaredNames(((IfElseStatement) s).getThenBody(), d); collectDeclaredNames(((IfElseStatement) s).getElseBody(), d); }
+        else if (s instanceof WhileStatement) { collectPatternBindings(((WhileStatement) s).getCondition(), d); collectDeclaredNames(((WhileStatement) s).getBody(), d); }
+        else if (s instanceof DoWhileStatement) collectDeclaredNames(((DoWhileStatement) s).getBody(), d);
+        else if (s instanceof ForStatement) { collectDeclaredNames(((ForStatement) s).getInit(), d); collectDeclaredNames(((ForStatement) s).getBody(), d); }
+        else if (s instanceof LabelStatement) collectDeclaredNames(((LabelStatement) s).getBody(), d);
+        else if (s instanceof SynchronizedStatement) collectDeclaredNames(((SynchronizedStatement) s).getBody(), d);
+        else if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            collectDeclaredNames(t.getResources(), d);
+            collectDeclaredNames(t.getTryBody(), d);
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) { if (cc.variableName != null) d.add(cc.variableName); collectDeclaredNames(cc.body, d); }
+            collectDeclaredNames(t.getFinallyBody(), d);
+        }
+        else if (s instanceof SwitchStatement) for (SwitchStatement.SwitchCase c : ((SwitchStatement) s).getCases()) collectDeclaredNames(c.getStatements(), d);
+    }
+    private void collectPatternBindings(Expression e, java.util.Set<String> d) {
+        if (e instanceof InstanceOfExpression) { String n = ((InstanceOfExpression) e).getPatternVariableName(); if (n != null) d.add(n); }
+        else if (e instanceof BinaryOperatorExpression) { collectPatternBindings(((BinaryOperatorExpression) e).getLeft(), d); collectPatternBindings(((BinaryOperatorExpression) e).getRight(), d); }
+        else if (e instanceof UnaryOperatorExpression) collectPatternBindings(((UnaryOperatorExpression) e).getExpression(), d);
+    }
+    private void collectAssignedUndeclared(List<Statement> stmts, java.util.Set<String> declared, java.util.Set<String> out) {
+        if (stmts == null) return;
+        for (Statement s : stmts) collectAssignedUndeclared(s, declared, out);
+    }
+    private void collectAssignedUndeclared(Statement s, java.util.Set<String> declared, java.util.Set<String> out) {
+        if (s == null) return;
+        if (s instanceof ExpressionStatement) {
+            Expression e = ((ExpressionStatement) s).getExpression();
+            if (e instanceof AssignmentExpression && "=".equals(((AssignmentExpression) e).getOperator())
+                    && ((AssignmentExpression) e).getLeft() instanceof LocalVariableExpression) {
+                String n = ((LocalVariableExpression) ((AssignmentExpression) e).getLeft()).getName();
+                if (!declared.contains(n)) out.add(n);
+            }
+        } else if (s instanceof BlockStatement) collectAssignedUndeclared(((BlockStatement) s).getStatements(), declared, out);
+        else if (s instanceof IfStatement) collectAssignedUndeclared(((IfStatement) s).getThenBody(), declared, out);
+        else if (s instanceof IfElseStatement) { collectAssignedUndeclared(((IfElseStatement) s).getThenBody(), declared, out); collectAssignedUndeclared(((IfElseStatement) s).getElseBody(), declared, out); }
+        else if (s instanceof WhileStatement) collectAssignedUndeclared(((WhileStatement) s).getBody(), declared, out);
+        else if (s instanceof DoWhileStatement) collectAssignedUndeclared(((DoWhileStatement) s).getBody(), declared, out);
+        else if (s instanceof ForStatement) { collectAssignedUndeclared(((ForStatement) s).getInit(), declared, out); collectAssignedUndeclared(((ForStatement) s).getBody(), declared, out); }
+        else if (s instanceof ForEachStatement) collectAssignedUndeclared(((ForEachStatement) s).getBody(), declared, out);
+        else if (s instanceof LabelStatement) collectAssignedUndeclared(((LabelStatement) s).getBody(), declared, out);
+        else if (s instanceof SynchronizedStatement) collectAssignedUndeclared(((SynchronizedStatement) s).getBody(), declared, out);
+        else if (s instanceof TryCatchStatement) { TryCatchStatement t = (TryCatchStatement) s; collectAssignedUndeclared(t.getTryBody(), declared, out); for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) collectAssignedUndeclared(cc.body, declared, out); collectAssignedUndeclared(t.getFinallyBody(), declared, out); }
+        else if (s instanceof SwitchStatement) for (SwitchStatement.SwitchCase c : ((SwitchStatement) s).getCases()) collectAssignedUndeclared(c.getStatements(), declared, out);
+    }
+    private void promoteFirst(List<Statement> stmts, java.util.Set<String> undeclared) {
+        if (stmts == null) return;
+        for (int i = 0; i < stmts.size() && !undeclared.isEmpty(); i++) {
+            Statement s = stmts.get(i);
+            if (s instanceof ExpressionStatement) {
+                Expression e = ((ExpressionStatement) s).getExpression();
+                if (e instanceof AssignmentExpression && "=".equals(((AssignmentExpression) e).getOperator())
+                        && ((AssignmentExpression) e).getLeft() instanceof LocalVariableExpression) {
+                    LocalVariableExpression lv = (LocalVariableExpression) ((AssignmentExpression) e).getLeft();
+                    if (undeclared.contains(lv.getName())) {
+                        stmts.set(i, new VariableDeclarationStatement(s.getLineNumber(), lv.getType(), lv.getName(),
+                            ((AssignmentExpression) e).getRight(), false, false));
+                        undeclared.remove(lv.getName());
+                        continue;
+                    }
+                }
+            }
+            if (s instanceof BlockStatement) promoteFirst(((BlockStatement) s).getStatements(), undeclared);
+            else if (s instanceof IfStatement && ((IfStatement) s).getThenBody() instanceof BlockStatement) promoteFirst(((BlockStatement) ((IfStatement) s).getThenBody()).getStatements(), undeclared);
+            else if (s instanceof IfElseStatement) {
+                if (((IfElseStatement) s).getThenBody() instanceof BlockStatement) promoteFirst(((BlockStatement) ((IfElseStatement) s).getThenBody()).getStatements(), undeclared);
+                if (((IfElseStatement) s).getElseBody() instanceof BlockStatement) promoteFirst(((BlockStatement) ((IfElseStatement) s).getElseBody()).getStatements(), undeclared);
+            }
+            else if (s instanceof WhileStatement && ((WhileStatement) s).getBody() instanceof BlockStatement) promoteFirst(((BlockStatement) ((WhileStatement) s).getBody()).getStatements(), undeclared);
+            else if (s instanceof ForStatement && ((ForStatement) s).getBody() instanceof BlockStatement) promoteFirst(((BlockStatement) ((ForStatement) s).getBody()).getStatements(), undeclared);
+            else if (s instanceof ForEachStatement && ((ForEachStatement) s).getBody() instanceof BlockStatement) promoteFirst(((BlockStatement) ((ForEachStatement) s).getBody()).getStatements(), undeclared);
         }
     }
 

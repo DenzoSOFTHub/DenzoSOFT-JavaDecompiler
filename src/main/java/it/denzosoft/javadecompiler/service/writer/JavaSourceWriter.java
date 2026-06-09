@@ -418,8 +418,10 @@ public class JavaSourceWriter implements Processor {
             }
         }
 
-        // Permits (sealed)
-        if (result.isSealed()) {
+        // Permits (sealed). BUG-2026-0075: an enum with constant bodies carries a PermittedSubclasses
+        // attribute (its `Enum$N` constant classes), but `enum ... permits ...` is illegal — never emit
+        // permits/sealed for enums or records.
+        if (result.isSealed() && !result.isEnum() && !result.isRecord()) {
             printer.printText(" ");
             printer.printKeyword("permits");
             printer.printText(" ");
@@ -489,6 +491,9 @@ public class JavaSourceWriter implements Processor {
                             }
                             printer.printText(")");
                         }
+                        // BUG-2026-0070: inline the per-constant class body if present.
+                        lineNumber = writeEnumConstantBody(printer, ne.getInternalTypeName(),
+                            internalName, lineNumber);
                         inlinedFieldNames.add(field.name);
                     }
                     first = false;
@@ -556,6 +561,10 @@ public class JavaSourceWriter implements Processor {
                 if (method.isConstructor() && method.parameterTypes.size() <= 2) continue;
             }
             // END_CHANGE: ISS-2026-0012-2
+            // START_CHANGE: BUG-2026-0059-20260608-1 - Suppress compiler-generated record members
+            // (auto toString/hashCode/equals, trivial component accessors, trivial canonical ctor).
+            if (result.isRecord() && isImplicitRecordMember(method, recordComponentNames)) continue;
+            // END_CHANGE: BUG-2026-0059-1
             // START_CHANGE: BUG-2026-0047-20260420-3 - Always skip clinit on interfaces
             // (Java forbids `static { ... }` inside an interface body).
             if (result.isInterface() && "<clinit>".equals(method.name)) continue;
@@ -597,6 +606,14 @@ public class JavaSourceWriter implements Processor {
                 printer.endLine();
             }
             firstVisibleMethod = false;
+            if (result.isRecord() && method.isConstructor() && result.getRecordComponents() != null
+                    && method.parameterTypes.size() == result.getRecordComponents().size()) {
+                int[] ref = new int[]{lineNumber};
+                if (writeCompactRecordConstructor(printer, method, result, internalName, ref)) {
+                    lineNumber = ref[0];
+                    continue;
+                }
+            }
             lineNumber = writeMethod(printer, method, result, internalName, lineNumber);
         }
 
@@ -668,11 +685,15 @@ public class JavaSourceWriter implements Processor {
                 printer.printKeyword("static");
                 printer.printText(" ");
             }
+            // START_CHANGE: BUG-2026-0061-20260608-1 - An enum with constant bodies is implicitly
+            // abstract; `abstract enum` is a compile error ("modifier abstract not allowed here").
             if ((flags & StringConstants.ACC_ABSTRACT) != 0
-                && (flags & StringConstants.ACC_INTERFACE) == 0) {
+                && (flags & StringConstants.ACC_INTERFACE) == 0
+                && (flags & 0x4000) == 0) { // not enum
                 printer.printKeyword("abstract");
                 printer.printText(" ");
             }
+            // END_CHANGE: BUG-2026-0061-1
             if ((flags & StringConstants.ACC_FINAL) != 0
                 && (flags & 0x4000) == 0) { // not enum
                 printer.printKeyword("final");
@@ -800,6 +821,14 @@ public class JavaSourceWriter implements Processor {
                             }
                             printer.printText(")");
                         }
+                        // START_CHANGE: BUG-2026-0070-20260608-1 - Inline the per-constant body
+                        // (`ADD("+") { int apply(...) {...} }`). A constant with a constant-specific
+                        // class body compiles to `new Enum$N(...)`; emit that subclass's user methods as
+                        // the constant body instead of dropping them (which left the enum's abstract
+                        // method unimplemented).
+                        lineNumber = writeEnumConstantBody(printer, ne.getInternalTypeName(),
+                            innerInternalName, lineNumber);
+                        // END_CHANGE: BUG-2026-0070-1
                         innerInlinedFieldNames.add(field.name);
                     }
                     first = false;
@@ -862,6 +891,10 @@ public class JavaSourceWriter implements Processor {
                 if (method.isConstructor() && method.parameterTypes.size() <= 2) continue;
                 if ("<clinit>".equals(method.name)) continue;
             }
+            // START_CHANGE: BUG-2026-0059-20260608-2 - Suppress compiler-generated record members
+            // for nested records too (same rules as the top-level loop).
+            if (inner.isRecord() && isImplicitRecordMember(method, innerRecordCompNames)) continue;
+            // END_CHANGE: BUG-2026-0059-2
             // START_CHANGE: BUG-2026-0047-20260420-2 - Suppress clinit in interfaces entirely
             // (the Java grammar forbids `static { ... }` inside an interface body). Fields that
             // required initialization were already inlined above; anything else in clinit
@@ -899,6 +932,14 @@ public class JavaSourceWriter implements Processor {
                 printer.endLine();
             }
             innerFirstMethod = false;
+            if (inner.isRecord() && method.isConstructor() && inner.getRecordComponents() != null
+                    && method.parameterTypes.size() == inner.getRecordComponents().size()) {
+                int[] ref = new int[]{lineNumber};
+                if (writeCompactRecordConstructor(printer, method, inner, innerInternalName, ref)) {
+                    lineNumber = ref[0];
+                    continue;
+                }
+            }
             lineNumber = writeMethod(printer, method, inner, innerInternalName, lineNumber);
         }
         // END_CHANGE: ISS-2026-0012-7
@@ -1140,11 +1181,16 @@ public class JavaSourceWriter implements Processor {
             collectStatementImports(imports, ((ForEachStatement) stmt).getBody(), thisPackage);
         } else if (stmt instanceof TryCatchStatement) {
             TryCatchStatement tcs = (TryCatchStatement) stmt;
+            // BUG-2026-0068: try-with-resources resource declarations also reference types.
+            if (tcs.getResources() != null) {
+                for (Statement res : tcs.getResources()) { collectStatementImports(imports, res, thisPackage); }
+            }
             collectStatementImports(imports, tcs.getTryBody(), thisPackage);
             for (TryCatchStatement.CatchClause cc : tcs.getCatchClauses()) {
                 for (Type et : cc.exceptionTypes) { addTypeImport(imports, et, thisPackage); }
                 collectStatementImports(imports, cc.body, thisPackage);
             }
+            if (tcs.getFinallyBody() != null) collectStatementImports(imports, tcs.getFinallyBody(), thisPackage);
         } else if (stmt instanceof DoWhileStatement) {
             collectStatementImports(imports, ((DoWhileStatement) stmt).getBody(), thisPackage);
         } else if (stmt instanceof SwitchStatement) {
@@ -1205,6 +1251,44 @@ public class JavaSourceWriter implements Processor {
             collectExprImports(imports, te.getFalseExpression(), thisPackage);
         } else if (expr instanceof NewArrayExpression) {
             addTypeImport(imports, ((NewArrayExpression) expr).getType(), thisPackage);
+            NewArrayExpression nae = (NewArrayExpression) expr;
+            if (nae.getInitValues() != null) {
+                for (Expression iv : nae.getInitValues()) { collectExprImports(imports, iv, thisPackage); }
+            }
+        // START_CHANGE: BUG-2026-0072-20260608-1 - Collect imports for method references
+        // (e.g. `ArrayList::new` needs an `import java.util.ArrayList;`) and recurse the rest.
+        } else if (expr instanceof MethodReferenceExpression) {
+            MethodReferenceExpression mre = (MethodReferenceExpression) expr;
+            if (mre.getObject() != null) {
+                collectExprImports(imports, mre.getObject(), thisPackage);
+            } else {
+                addImport(imports, mre.getOwnerInternalName(), thisPackage);
+            }
+        } else if (expr instanceof ArrayAccessExpression) {
+            collectExprImports(imports, ((ArrayAccessExpression) expr).getArray(), thisPackage);
+            collectExprImports(imports, ((ArrayAccessExpression) expr).getIndex(), thisPackage);
+        } else if (expr instanceof UnaryOperatorExpression) {
+            collectExprImports(imports, ((UnaryOperatorExpression) expr).getExpression(), thisPackage);
+        } else if (expr instanceof InstanceOfExpression) {
+            InstanceOfExpression ioe = (InstanceOfExpression) expr;
+            addTypeImport(imports, ioe.getCheckType(), thisPackage);
+            if (ioe.hasRecordPattern()) collectRecordPatternImports(imports, ioe.getRecordPattern(), thisPackage);
+            collectExprImports(imports, ioe.getExpression(), thisPackage);
+        }
+        // END_CHANGE: BUG-2026-0072-1
+    }
+
+    // BUG-2026-0067: record-pattern component types need imports.
+    private void collectRecordPatternImports(Set<String> imports,
+            it.denzosoft.javadecompiler.model.javasyntax.expression.RecordPattern rp, String thisPackage) {
+        if (rp == null) return;
+        for (it.denzosoft.javadecompiler.model.javasyntax.expression.RecordPattern.Component c : rp.getComponents()) {
+            if (c.isNested()) {
+                addTypeImport(imports, c.getType(), thisPackage);
+                collectRecordPatternImports(imports, c.getNested(), thisPackage);
+            } else if (!c.isVar()) {
+                addTypeImport(imports, c.getType(), thisPackage);
+            }
         }
     }
     // END_CHANGE: BUG-2026-0036-1
@@ -1295,6 +1379,13 @@ public class JavaSourceWriter implements Processor {
         // so a single bad signature doesn't poison the imports block with e.g. "::Ljava.lang..."
         if (!isValidInternalName(internalName)) return;
         // END_CHANGE: BUG-2026-0043-2
+        // START_CHANGE: BUG-2026-0058-20260608-3 - Never import the synthetic invokedynamic
+        // bootstrap classes; they only appear as decode sentinels (e.g. the record ObjectMethods
+        // marker) and are not real source-level references.
+        if ("java/lang/runtime/ObjectMethods".equals(internalName)
+                || "java/lang/invoke/StringConcatFactory".equals(internalName)
+                || "java/lang/runtime/SwitchBootstraps".equals(internalName)) return;
+        // END_CHANGE: BUG-2026-0058-3
         // For inner classes (Outer$Inner), import the outer class only
         int dollar = internalName.indexOf('$');
         String importName = dollar >= 0 ? internalName.substring(0, dollar) : internalName;
@@ -1347,7 +1438,10 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("abstract");
             printer.printText(" ");
         } else if ((accessFlags & StringConstants.ACC_ABSTRACT) != 0 && isClass
-                   && (accessFlags & StringConstants.ACC_INTERFACE) == 0) {
+                   && (accessFlags & StringConstants.ACC_INTERFACE) == 0
+                   && (accessFlags & StringConstants.ACC_ENUM) == 0) {
+            // BUG-2026-0061: enums are implicitly abstract when they have constant bodies; `abstract
+            // enum` is illegal.
             printer.printKeyword("abstract");
             printer.printText(" ");
         }
@@ -1380,6 +1474,32 @@ public class JavaSourceWriter implements Processor {
             }
         }
     }
+
+    // START_CHANGE: BUG-2026-0067-20260608-10 - Render a record deconstruction pattern `Type(c, c, ...)`.
+    private void writeRecordPattern(Printer printer, Type outerType,
+                                    it.denzosoft.javadecompiler.model.javasyntax.expression.RecordPattern rp,
+                                    String ownerInternalName) {
+        writeType(printer, outerType, ownerInternalName);
+        printer.printText("(");
+        java.util.List<it.denzosoft.javadecompiler.model.javasyntax.expression.RecordPattern.Component> comps = rp.getComponents();
+        for (int i = 0; i < comps.size(); i++) {
+            if (i > 0) printer.printText(", ");
+            it.denzosoft.javadecompiler.model.javasyntax.expression.RecordPattern.Component c = comps.get(i);
+            if (c.isNested()) {
+                writeRecordPattern(printer, c.getType(), c.getNested(), ownerInternalName);
+            } else if (c.isVar()) {
+                printer.printKeyword("var");
+                printer.printText(" ");
+                printer.printText(sn(c.getBindingName(), "var"));
+            } else {
+                writeType(printer, c.getType(), ownerInternalName);
+                printer.printText(" ");
+                printer.printText(sn(c.getBindingName(), "var"));
+            }
+        }
+        printer.printText(")");
+    }
+    // END_CHANGE: BUG-2026-0067-10
 
     private void writeType(Printer printer, Type type, String ownerInternalName) {
         if (type instanceof PrimitiveType) {
@@ -1489,6 +1609,173 @@ public class JavaSourceWriter implements Processor {
         printer.printText(";");
     }
 
+    // START_CHANGE: BUG-2026-0059-20260608-5 - Emit a record's validating canonical constructor in
+    // compact form (`Range { ...validation... }`), renaming the synthetic `argN` parameters to the
+    // component names and dropping the implicit `super()` / field assignments. Returns true if emitted.
+    private boolean writeCompactRecordConstructor(Printer printer, JavaSyntaxResult.MethodDeclaration method,
+                                                  JavaSyntaxResult result, String ownerInternalName, int[] lineNumberRef) {
+        if (method.body == null || result.getRecordComponents() == null) return false;
+        List<JavaSyntaxResult.RecordComponentInfo> comps = result.getRecordComponents();
+        if (method.parameterTypes.size() != comps.size()) return false;
+
+        final java.util.Map<String, String> rename = new java.util.HashMap<String, String>();
+        for (int i = 0; i < comps.size() && i < method.parameterNames.size(); i++) {
+            rename.put(method.parameterNames.get(i), comps.get(i).name);
+        }
+        java.util.Set<String> compNames = new HashSet<String>();
+        for (JavaSyntaxResult.RecordComponentInfo c : comps) compNames.add(c.name);
+
+        // Keep only the non-implicit statements (validation / normalization).
+        List<Statement> residual = new ArrayList<Statement>();
+        for (Statement s : method.body) {
+            if (s instanceof ReturnStatement && !((ReturnStatement) s).hasExpression()) continue;
+            if (s instanceof ExpressionStatement) {
+                Expression e = ((ExpressionStatement) s).getExpression();
+                if (e instanceof MethodInvocationExpression
+                        && "super".equals(((MethodInvocationExpression) e).getMethodName())) continue;
+                if (e instanceof AssignmentExpression) {
+                    Expression lhs = ((AssignmentExpression) e).getLeft();
+                    if (lhs instanceof FieldAccessExpression
+                            && compNames.contains(((FieldAccessExpression) lhs).getName())) continue;
+                }
+            }
+            residual.add(s);
+        }
+        if (residual.isEmpty()) return false; // nothing user-written -> let the implicit ctor stand
+
+        it.denzosoft.javadecompiler.service.converter.transform.AstLocalRewriter rw =
+            new it.denzosoft.javadecompiler.service.converter.transform.AstLocalRewriter() {
+                protected Expression onLocal(LocalVariableExpression lv) {
+                    String nn = rename.get(lv.getName());
+                    return nn != null ? new LocalVariableExpression(lv.getLineNumber(), lv.getType(), nn, lv.getIndex()) : lv;
+                }
+            };
+
+        int lineNumber = lineNumberRef[0];
+        printer.startLine(lineNumber++);
+        emitDecl(printer, Printer.CONSTRUCTOR, ownerInternalName,
+            TypeNameUtil.simpleNameFromInternal(ownerInternalName), method.descriptor);
+        printer.printText(" {");
+        printer.endLine();
+        printer.indent();
+        for (Statement s : residual) {
+            lineNumber = writeStatement(printer, rw.rewrite(s), ownerInternalName, lineNumber);
+        }
+        printer.unindent();
+        printer.startLine(lineNumber++);
+        printer.printText("}");
+        printer.endLine();
+        lineNumberRef[0] = lineNumber;
+        return true;
+    }
+    // END_CHANGE: BUG-2026-0059-5
+
+    // START_CHANGE: BUG-2026-0070-20260608-2 - Emit an enum constant's class body by inlining the
+    // user methods of its synthetic subclass (`Enum$N`).
+    private int writeEnumConstantBody(Printer printer, String constSubclassName,
+                                      String enumInternalName, int lineNumber) {
+        if (constSubclassName == null || constSubclassName.equals(enumInternalName)) return lineNumber;
+        JavaSyntaxResult body = findInnerClassResult(currentResult, constSubclassName);
+        if (body == null) return lineNumber;
+        List<JavaSyntaxResult.MethodDeclaration> methods = new ArrayList<JavaSyntaxResult.MethodDeclaration>();
+        for (JavaSyntaxResult.MethodDeclaration m : body.getMethods()) {
+            if (m.isConstructor() || "<clinit>".equals(m.name)) continue;
+            if (m.name.startsWith("$") || m.name.startsWith("access$")) continue;
+            if ((m.accessFlags & 0x1000) != 0) continue; // ACC_SYNTHETIC (bridge etc.)
+            methods.add(m);
+        }
+        if (methods.isEmpty()) return lineNumber;
+        printer.printText(" {");
+        printer.endLine();
+        printer.indent();
+        lineNumber++;
+        for (int mi = 0; mi < methods.size(); mi++) {
+            if (mi > 0) { printer.startLine(lineNumber++); printer.endLine(); }
+            lineNumber = writeMethod(printer, methods.get(mi), body, constSubclassName, lineNumber);
+        }
+        printer.unindent();
+        printer.startLine(lineNumber++);
+        printer.printText("}");
+        return lineNumber;
+    }
+    // END_CHANGE: BUG-2026-0070-2
+
+    // START_CHANGE: BUG-2026-0059-20260608-3 - Detect implicit (compiler-generated) record members
+    // so they are not emitted verbatim (an explicit canonical ctor + ObjectMethods-backed
+    // toString/hashCode/equals do not recompile). Only TRIVIAL members are suppressed: a canonical
+    // constructor that carries extra logic (a user compact constructor with validation) is kept, so
+    // no user code is ever silently dropped.
+    private boolean isImplicitRecordMember(JavaSyntaxResult.MethodDeclaration method, Set<String> compNames) {
+        if (method.body == null) return false;
+        String n = method.name;
+        boolean autoSig = ("toString".equals(n) && method.parameterTypes.isEmpty())
+            || ("hashCode".equals(n) && method.parameterTypes.isEmpty())
+            || ("equals".equals(n) && method.parameterTypes.size() == 1);
+        if (autoSig && bodyReturnsObjectMethods(method.body)) return true;
+        if (compNames.contains(n) && method.parameterTypes.isEmpty() && !method.isStatic()
+                && bodyIsTrivialAccessor(method.body, n)) return true;
+        if (method.isConstructor() && method.parameterTypes.size() == compNames.size()
+                && canonicalCtorIsTrivial(method.body, compNames)) return true;
+        return false;
+    }
+
+    private boolean bodyReturnsObjectMethods(List<Statement> body) {
+        for (Statement s : body) {
+            if (s instanceof ReturnStatement && ((ReturnStatement) s).hasExpression()) {
+                Expression e = ((ReturnStatement) s).getExpression();
+                if (e instanceof StaticMethodInvocationExpression
+                        && "java/lang/runtime/ObjectMethods".equals(
+                            ((StaticMethodInvocationExpression) e).getOwnerInternalName())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean bodyIsTrivialAccessor(List<Statement> body, String comp) {
+        boolean sawReturn = false;
+        for (Statement s : body) {
+            if (!(s instanceof ReturnStatement)) return false;
+            ReturnStatement r = (ReturnStatement) s;
+            if (!r.hasExpression()) continue;
+            Expression e = r.getExpression();
+            // A generic record's accessor erases to `return (A) this.comp;` -- unwrap the cast.
+            if (e instanceof CastExpression) {
+                e = ((CastExpression) e).getExpression();
+            }
+            if (e instanceof FieldAccessExpression) {
+                FieldAccessExpression fa = (FieldAccessExpression) e;
+                Expression obj = fa.getObject();
+                if (comp.equals(fa.getName()) && (obj == null || obj instanceof ThisExpression)) {
+                    sawReturn = true;
+                    continue;
+                }
+            }
+            return false;
+        }
+        return sawReturn;
+    }
+
+    private boolean canonicalCtorIsTrivial(List<Statement> body, Set<String> compNames) {
+        for (Statement s : body) {
+            if (s instanceof ReturnStatement && !((ReturnStatement) s).hasExpression()) continue;
+            if (s instanceof ExpressionStatement) {
+                Expression e = ((ExpressionStatement) s).getExpression();
+                if (e instanceof MethodInvocationExpression
+                        && "super".equals(((MethodInvocationExpression) e).getMethodName())) continue;
+                if (e instanceof AssignmentExpression) {
+                    Expression lhs = ((AssignmentExpression) e).getLeft();
+                    if (lhs instanceof FieldAccessExpression
+                            && compNames.contains(((FieldAccessExpression) lhs).getName())) continue;
+                }
+            }
+            return false;
+        }
+        return true;
+    }
+    // END_CHANGE: BUG-2026-0059-3
+
     private int writeMethod(Printer printer, JavaSyntaxResult.MethodDeclaration method,
                              JavaSyntaxResult result, String ownerInternalName, int lineNumber) {
         // Method annotations
@@ -1565,6 +1852,19 @@ public class JavaSourceWriter implements Processor {
         }
 
         writeAccessFlags(printer, method.accessFlags, false);
+
+        // START_CHANGE: BUG-2026-0060-20260608-1 - There is no ACC bit for `default`; an interface
+        // instance method that is not abstract, not static and not private IS a default method. Without
+        // this it printed `public String greet() { ... }` inside an interface -> javac "interface
+        // abstract methods cannot have body".
+        if (result != null && result.isInterface() && !method.isConstructor()
+                && (method.accessFlags & StringConstants.ACC_ABSTRACT) == 0
+                && (method.accessFlags & StringConstants.ACC_STATIC) == 0
+                && (method.accessFlags & StringConstants.ACC_PRIVATE) == 0) {
+            printer.printKeyword("default");
+            printer.printText(" ");
+        }
+        // END_CHANGE: BUG-2026-0060-1
 
         // Method type parameters
         String[] genericParamTypes = null;
@@ -2523,10 +2823,15 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             printer.printKeyword("instanceof");
             printer.printText(" ");
-            writeType(printer, ioe.getCheckType(), ownerInternalName);
-            if (ioe.hasPatternVariable()) {
-                printer.printText(" ");
-                printer.printText(ioe.getPatternVariableName());
+            // BUG-2026-0067: record deconstruction `instanceof Type(comp, ...)`.
+            if (ioe.hasRecordPattern()) {
+                writeRecordPattern(printer, ioe.getCheckType(), ioe.getRecordPattern(), ownerInternalName);
+            } else {
+                writeType(printer, ioe.getCheckType(), ownerInternalName);
+                if (ioe.hasPatternVariable()) {
+                    printer.printText(" ");
+                    printer.printText(ioe.getPatternVariableName());
+                }
             }
         } else if (expr instanceof BinaryOperatorExpression) {
             // START_CHANGE: BUG-2026-0051-20260327-1 - Convert <=> (lcmp/dcmp) to valid Java comparison
@@ -2700,11 +3005,47 @@ public class JavaSourceWriter implements Processor {
             printer.printText("::");
             printer.printText(mre.getMethodName());
         } else if (expr instanceof SwitchExpression) {
+            // START_CHANGE: BUG-2026-0066-20260608-2 - Render a switch expression (single line so it
+            // can sit inside `return switch(...) {...};` without breaking the inline expression writer).
             SwitchExpression se = (SwitchExpression) expr;
             printer.printKeyword("switch");
             printer.printText(" (");
             writeExpression(printer, se.getSelector(), ownerInternalName);
-            printer.printText(") { /* switch expression */ }");
+            printer.printText(") { ");
+            for (SwitchExpression.SwitchCase sc : se.getCases()) {
+                if (sc.isPattern()) {
+                    // BUG-2026-0067: `case <Type> <binding> [when <guard>] -> value`
+                    printer.printKeyword("case");
+                    printer.printText(" ");
+                    if (sc.isRecordPattern()) {
+                        writeRecordPattern(printer, sc.getPatternType(), sc.getRecordPattern(), ownerInternalName);
+                    } else {
+                        writeType(printer, sc.getPatternType(), ownerInternalName);
+                        printer.printText(" ");
+                        printer.printText(sn(sc.getPatternBinding(), "var"));
+                    }
+                    if (sc.getGuard() != null) {
+                        printer.printText(" ");
+                        printer.printKeyword("when");
+                        printer.printText(" ");
+                        writeExpression(printer, sc.getGuard(), ownerInternalName);
+                    }
+                } else if (sc.getLabels() == null || sc.getLabels().isEmpty()) {
+                    printer.printKeyword("default");
+                } else {
+                    printer.printKeyword("case");
+                    printer.printText(" ");
+                    for (int li = 0; li < sc.getLabels().size(); li++) {
+                        if (li > 0) printer.printText(", ");
+                        writeExpression(printer, sc.getLabels().get(li), ownerInternalName);
+                    }
+                }
+                printer.printText(" -> ");
+                writeExpression(printer, sc.getValue(), ownerInternalName);
+                printer.printText("; ");
+            }
+            printer.printText("}");
+            // END_CHANGE: BUG-2026-0066-2
         } else if (expr instanceof TextBlockExpression) {
             TextBlockExpression tbe = (TextBlockExpression) expr;
             printer.printStringConstant("\"\"\"\n" + tbe.getValue() + "\"\"\"", ownerInternalName);
@@ -2964,15 +3305,30 @@ public class JavaSourceWriter implements Processor {
             // END_CHANGE: BUG-2026-0055-2
             printer.printText("(/* ... */)");
         } else if (val instanceof NewArrayExpression) {
-            // Prevent recursion: emit a simplified representation
+            // BUG-2026-0063: a nested array initializer (multi-dimensional `{{1,2},{3,4}}`) — render the
+            // real element values (`new int[]{1, 2}`) instead of a `/* N elements */` placeholder.
             NewArrayExpression innerNae = (NewArrayExpression) val;
             printer.printKeyword("new");
             printer.printText(" ");
-            writeType(printer, innerNae.getType(), ownerInternalName);
+            Type innerBase = innerNae.getType();
+            while (innerBase instanceof ArrayType) innerBase = ((ArrayType) innerBase).getElementType();
+            writeType(printer, innerBase, ownerInternalName);
             if (innerNae.hasInitValues()) {
-                printer.printText("[]{/* " + innerNae.getInitValues().size() + " elements */}");
+                printer.printText("[]{");
+                List<Expression> ivs = innerNae.getInitValues();
+                for (int k = 0; k < ivs.size(); k++) {
+                    if (k > 0) printer.printText(", ");
+                    writeExpressionSimple(printer, ivs.get(k), ownerInternalName);
+                }
+                printer.printText("}");
+            } else if (!innerNae.getDimensionExpressions().isEmpty()) {
+                for (Expression dim : innerNae.getDimensionExpressions()) {
+                    printer.printText("[");
+                    writeExpression(printer, dim, ownerInternalName);
+                    printer.printText("]");
+                }
             } else {
-                printer.printText("[...]");
+                printer.printText("[0]");
             }
         } else {
             // Final fallback - just print the class name to avoid recursion

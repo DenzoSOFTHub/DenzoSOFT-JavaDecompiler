@@ -10,3 +10,5 @@ target/
 .claude/
 *.trace
 /tmp/
+BOOT-INF/
+META-INF/

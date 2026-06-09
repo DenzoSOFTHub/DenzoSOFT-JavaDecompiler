@@ -64,7 +64,12 @@ public class ConstantPool {
      */
     public String getUtf8(int index) {
         if (index <= 0 || index >= size) return null;
-        return (String) values[index];
+        // BUG-2026-0076: only a CONSTANT_Utf8 entry holds a String; other tags (e.g. CONSTANT_Dynamic
+        // holds an int[]) must not be blindly cast — that threw a ClassCastException and aborted the
+        // decode of a nested typeSwitch under a guarded record pattern.
+        if (tags[index] != CONSTANT_Utf8) return null;
+        Object v = values[index];
+        return v instanceof String ? (String) v : null;
     }
 
     /**
