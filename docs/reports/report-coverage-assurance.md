@@ -58,7 +58,7 @@ production builds and JD-Core's own test fixtures use) changes the result:
 
 | Compile mode | Matrix recompile |
 |---|---|
-| default (no LVT/LVTT) | 32/55 (post batch-1) |
+| default (no LVT/LVTT) | 35/55 (post batches 1-6) |
 | `-g` (full debug) | 33/55 |
 
 Crucially the **failure set shifts**: with `-g` the lambda / functional-interface / generic-local classes
