@@ -120,7 +120,18 @@ public final class ForLoopDetector {
             }
             // END_CHANGE: ISS-2026-0006-1
 
-            ForStatement forStmt = new ForStatement(ws.getLineNumber(), init, condition, update,
+            // BUG-2026-0080: if the loop counter is referenced AFTER the loop, it cannot be declared in the
+            // for-init (that would scope it to the loop). Keep the declaration before the loop and use an
+            // empty for-init.
+            boolean keepDeclOutside = false;
+            if (init == current && current instanceof VariableDeclarationStatement) {
+                String cv = ((VariableDeclarationStatement) current).getName();
+                for (int k = i + 2; k < statements.size(); k++) {
+                    if (nameUsedInStatement(statements.get(k), cv)) { keepDeclOutside = true; break; }
+                }
+            }
+            ForStatement forStmt = new ForStatement(ws.getLineNumber(),
+                keepDeclOutside ? null : init, condition, update,
                 new BlockStatement(ws.getLineNumber(), forBody));
 
             // START_CHANGE: ISS-2026-0007-20260324-9 - Preserve label on converted for-loop
@@ -131,9 +142,13 @@ public final class ForLoopDetector {
                 finalStmt = forStmt;
             }
             // END_CHANGE: ISS-2026-0007-9
-            statements.set(i, finalStmt);
-            statements.remove(i + 1);
-            i--;
+            if (keepDeclOutside) {
+                statements.set(i + 1, finalStmt); // while -> for; the declaration stays at index i
+            } else {
+                statements.set(i, finalStmt);
+                statements.remove(i + 1);
+                i--;
+            }
         }
 
         return statements;
@@ -248,6 +263,44 @@ public final class ForLoopDetector {
         if (expr instanceof UnaryOperatorExpression) {
             return conditionUsesVar(((UnaryOperatorExpression) expr).getExpression(), varName);
         }
+        return false;
+    }
+
+    // BUG-2026-0080: does statement `s` reference local `v` (so it can't be scoped to a for-init)?
+    static boolean nameUsedInStatement(Statement s, String v) {
+        if (s == null) return false;
+        if (s instanceof ExpressionStatement) return exprUses(((ExpressionStatement) s).getExpression(), v);
+        if (s instanceof ReturnStatement) return ((ReturnStatement) s).hasExpression() && exprUses(((ReturnStatement) s).getExpression(), v);
+        if (s instanceof ThrowStatement) return exprUses(((ThrowStatement) s).getExpression(), v);
+        if (s instanceof VariableDeclarationStatement) { VariableDeclarationStatement d = (VariableDeclarationStatement) s; return d.hasInitializer() && exprUses(d.getInitializer(), v); }
+        if (s instanceof IfStatement) return exprUses(((IfStatement) s).getCondition(), v) || nameUsedInStatement(((IfStatement) s).getThenBody(), v);
+        if (s instanceof IfElseStatement) { IfElseStatement x = (IfElseStatement) s; return exprUses(x.getCondition(), v) || nameUsedInStatement(x.getThenBody(), v) || nameUsedInStatement(x.getElseBody(), v); }
+        if (s instanceof BlockStatement) { for (Statement c : ((BlockStatement) s).getStatements()) if (nameUsedInStatement(c, v)) return true; return false; }
+        if (s instanceof WhileStatement) return exprUses(((WhileStatement) s).getCondition(), v) || nameUsedInStatement(((WhileStatement) s).getBody(), v);
+        if (s instanceof DoWhileStatement) return exprUses(((DoWhileStatement) s).getCondition(), v) || nameUsedInStatement(((DoWhileStatement) s).getBody(), v);
+        if (s instanceof ForStatement) { ForStatement f = (ForStatement) s; return nameUsedInStatement(f.getInit(), v) || exprUses(f.getCondition(), v) || nameUsedInStatement(f.getUpdate(), v) || nameUsedInStatement(f.getBody(), v); }
+        if (s instanceof ForEachStatement) return exprUses(((ForEachStatement) s).getIterable(), v) || nameUsedInStatement(((ForEachStatement) s).getBody(), v);
+        if (s instanceof LabelStatement) return nameUsedInStatement(((LabelStatement) s).getBody(), v);
+        if (s instanceof SynchronizedStatement) return exprUses(((SynchronizedStatement) s).getMonitor(), v) || nameUsedInStatement(((SynchronizedStatement) s).getBody(), v);
+        if (s instanceof SwitchStatement) { for (SwitchStatement.SwitchCase c : ((SwitchStatement) s).getCases()) for (Statement cs : c.getStatements()) if (nameUsedInStatement(cs, v)) return true; return exprUses(((SwitchStatement) s).getSelector(), v); }
+        if (s instanceof TryCatchStatement) { TryCatchStatement t = (TryCatchStatement) s; if (nameUsedInStatement(t.getTryBody(), v)) return true; for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) if (nameUsedInStatement(cc.body, v)) return true; return t.getFinallyBody() != null && nameUsedInStatement(t.getFinallyBody(), v); }
+        return false;
+    }
+    private static boolean exprUses(Expression e, String v) {
+        if (e == null) return false;
+        if (e instanceof LocalVariableExpression) return v.equals(((LocalVariableExpression) e).getName());
+        if (e instanceof BinaryOperatorExpression) return exprUses(((BinaryOperatorExpression) e).getLeft(), v) || exprUses(((BinaryOperatorExpression) e).getRight(), v);
+        if (e instanceof UnaryOperatorExpression) return exprUses(((UnaryOperatorExpression) e).getExpression(), v);
+        if (e instanceof CastExpression) return exprUses(((CastExpression) e).getExpression(), v);
+        if (e instanceof AssignmentExpression) return exprUses(((AssignmentExpression) e).getLeft(), v) || exprUses(((AssignmentExpression) e).getRight(), v);
+        if (e instanceof TernaryExpression) { TernaryExpression t = (TernaryExpression) e; return exprUses(t.getCondition(), v) || exprUses(t.getTrueExpression(), v) || exprUses(t.getFalseExpression(), v); }
+        if (e instanceof FieldAccessExpression) return exprUses(((FieldAccessExpression) e).getObject(), v);
+        if (e instanceof ArrayAccessExpression) return exprUses(((ArrayAccessExpression) e).getArray(), v) || exprUses(((ArrayAccessExpression) e).getIndex(), v);
+        if (e instanceof InstanceOfExpression) return exprUses(((InstanceOfExpression) e).getExpression(), v);
+        if (e instanceof MethodInvocationExpression) { MethodInvocationExpression m = (MethodInvocationExpression) e; if (exprUses(m.getObject(), v)) return true; if (m.getArguments() != null) for (Expression a : m.getArguments()) if (exprUses(a, v)) return true; return false; }
+        if (e instanceof StaticMethodInvocationExpression) { if (((StaticMethodInvocationExpression) e).getArguments() != null) for (Expression a : ((StaticMethodInvocationExpression) e).getArguments()) if (exprUses(a, v)) return true; return false; }
+        if (e instanceof NewExpression) { if (((NewExpression) e).getArguments() != null) for (Expression a : ((NewExpression) e).getArguments()) if (exprUses(a, v)) return true; return false; }
+        if (e instanceof NewArrayExpression) { NewArrayExpression n = (NewArrayExpression) e; if (n.getDimensionExpressions() != null) for (Expression a : n.getDimensionExpressions()) if (exprUses(a, v)) return true; if (n.getInitValues() != null) for (Expression a : n.getInitValues()) if (exprUses(a, v)) return true; return false; }
         return false;
     }
 
