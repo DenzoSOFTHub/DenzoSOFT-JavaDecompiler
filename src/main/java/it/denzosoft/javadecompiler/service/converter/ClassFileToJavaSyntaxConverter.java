@@ -1237,6 +1237,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     result = PatternSwitchReconstructor.reconstruct(result, patternSwitchLabels);
                 }
                 // END_CHANGE: LIM-0005-4
+                // BUG-2026-0080: hoist a var declared in a switch case but used in another case / after.
+                result = it.denzosoft.javadecompiler.service.converter.transform.SwitchVarHoister.reconstruct(result);
                 // Prepend variable pre-declarations (for vars used across if/else branches)
                 if (!preDeclarations.isEmpty()) {
                     List<Statement> withDecls = new ArrayList<Statement>();
