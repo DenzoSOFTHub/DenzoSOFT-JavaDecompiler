@@ -470,3 +470,20 @@ switch-expression reconstruction (duplicate + re-decode the return-merge per arm
 work — sequenced as a dedicated future effort with the foundation now in place.
 
 State: legacy corpus 146 → 44 (70%), 5/13 round-trip, DecompilerTest 31/32, regression 157 classes 0 crashes.
+
+---
+
+## Addendum 12 — SWITCH-form record patterns COMPLETE on the JD pipeline (2026-06-09)
+
+The decode-once blocker is solved. Four pieces (BUG-2026-0079): (1) return tail-duplication recovers per-arm
+values from the shared `*return` merge; (2) dead-guard elimination (`iconst_1;ifeq`) connects the value path;
+(3) `TypeSwitchRecordFolder` folds the typeSwitch arms into `return switch(s){case T(comps) -> v}` via
+`RecordDeconstructionFolder.foldArm`; (4) selective activation routes ONLY typeSwitch+MatchException methods
+to JD, accepts JD only when the fold succeeded, and restores pre-JD decode state (`patternSwitchLabels`,
+`declaredVars`) on fallback so legacy stays clean.
+
+`J21RecordPattern.sum` now reconstructs exactly: `return switch (var2) { case
+J21RecordPattern.Line(J21RecordPattern.Point(int x,int y), J21RecordPattern.Point(int x,int y)) -> ...; case
+J21RecordPattern.Point(int x,int y) -> ...; default -> 0; }`. **J21RecordPattern 19 → 0 (6th class to
+round-trip); corpus 44 → 25.** DecompilerTest 32/33; regression 159 classes 0 crashes; legacy byte-identical.
+Residual: the `when`-guarded switch arm stays on legacy (PIECE 4, deferred).

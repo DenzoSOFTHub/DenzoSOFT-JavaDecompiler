@@ -493,6 +493,62 @@ public class ControlFlowGraphMaker {
             next.setType(BasicBlock.TYPE_DELETED);
         }
 
+        // ----- Pass 6: eliminate synthetic always-dead constant guards -----
+        // START_CHANGE: BUG-2026-0065-20260609-1 - Java 21 record-pattern switches
+        // emit an unguarded record arm as `iconst_1; ifeq L` (and occasionally
+        // `iconst_0; ifne L`) where L is a "restart" block (`<n> = nextIdx; goto
+        // switchHeader`). The constant compared to 0 makes the branch statically
+        // dead: `1 == 0` is always false, so `ifeq L` never taken; `0 != 0` is
+        // always false, so `ifne L` never taken. Both ALWAYS fall through. The
+        // downstream reducer otherwise keeps the restart branch and drops the
+        // real value path, losing the deconstructed components. Here we turn the
+        // conditional into an unconditional fall-through and sever the branch edge
+        // to L so the value path connects.
+        //
+        // SAFETY: We only fire on the exact peephole where the ENTIRE block is
+        // `ICONST_<n>; IFEQ/IFNE L` (4 bytes, constant as the block's first and
+        // only non-branch instruction). Requiring fromOffset==constOffset and a
+        // 4-byte block guarantees `constOffset` is a real instruction boundary --
+        // NOT a coincidental operand byte of a preceding 3-byte instruction such
+        // as `instanceof #idx` (whose trailing index byte can fall in the ICONST
+        // opcode range 3..8). Real `instanceof X; ifeq L` guards span 8 bytes with
+        // the instanceof (not a constant) immediately before the branch, so they
+        // are correctly excluded. A constant compared to 0 is *always* a dead
+        // branch, so this never mis-fires on genuine `if(true)`/`if(false)` either.
+        for (BasicBlock bb : cfg.getBasicBlocks()) {
+            if (bb.getType() != BasicBlock.TYPE_CONDITIONAL_BRANCH) continue;
+            if (bb.getToOffset() - bb.getFromOffset() != 4) continue;
+            int ifOffset = bb.getToOffset() - 3;
+            if (ifOffset < bb.getFromOffset() || ifOffset < 0 || ifOffset >= length) continue;
+            int ifOpcode = code[ifOffset] & 0xFF;
+            // Only single-operand IFEQ (153) / IFNE (154) compare-to-zero forms.
+            if (ifOpcode != 153 && ifOpcode != 154) continue;
+            int constOffset = ifOffset - 1;
+            if (constOffset != bb.getFromOffset()) continue;
+            int constOpcode = code[constOffset] & 0xFF;
+            // ICONST_0 (3) .. ICONST_5 (8): a known integer constant feeding the if.
+            if (constOpcode < 3 || constOpcode > 8) continue;
+            int constValue = constOpcode - 3; // ICONST_N -> N
+            // IFEQ branches when value == 0; IFNE branches when value != 0.
+            boolean branchTaken = (ifOpcode == 153) ? (constValue == 0) : (constValue != 0);
+            if (branchTaken) {
+                // Always-taken: would need to keep the branch and drop the
+                // fall-through; the record-pattern desugaring never produces
+                // this shape, so leave it for the reducer rather than guess.
+                continue;
+            }
+            // Always-falls-through: drop the branch edge, keep `next`.
+            BasicBlock deadTarget = bb.getBranch();
+            if (deadTarget != BasicBlock.END) {
+                deadTarget.getPredecessors().remove(bb);
+            }
+            bb.setBranch(BasicBlock.END);
+            // Demote to a plain fall-through block so the reducer treats it as
+            // straight-line code. `next` and its predecessor link are unchanged.
+            bb.setType(BasicBlock.TYPE_STATEMENTS);
+        }
+        // END_CHANGE: BUG-2026-0065-1
+
         return cfg;
     }
 
