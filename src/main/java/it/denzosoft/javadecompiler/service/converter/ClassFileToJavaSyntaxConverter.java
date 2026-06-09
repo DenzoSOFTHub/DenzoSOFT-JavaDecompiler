@@ -2815,14 +2815,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         dimExprs.add(0, stack.pop());
                     }
                 }
-                // Parse the full array type, then extract its base element type
-                // because NewArrayExpression will add the dimension brackets itself
+                // BUG-2026-0080 (RC-5): keep the FULL array type (e.g. int[][]) on the NewArrayExpression so
+                // its static type matches the declaration and the writer derives the dimension count from it
+                // (mirrors anewarray/BUG-2026-0066). Extracting the element type lost a dimension, producing
+                // `new int[][d1][d2]` and `int[][] = <int[]>` type-mismatch errors.
                 Type fullType = parseType(className != null ? className : "Ljava/lang/Object;");
-                Type baseType = fullType;
-                if (baseType instanceof ArrayType) {
-                    baseType = ((ArrayType) baseType).getElementType();
-                }
-                stack.push(new NewArrayExpression(line, baseType, dimExprs));
+                stack.push(new NewArrayExpression(line, fullType, dimExprs));
                 break;
             }
 

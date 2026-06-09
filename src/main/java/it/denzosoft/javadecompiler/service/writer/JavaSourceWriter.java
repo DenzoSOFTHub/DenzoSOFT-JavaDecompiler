@@ -406,7 +406,7 @@ public class JavaSourceWriter implements Processor {
         }
 
         // Implements / extends interfaces
-        String[] interfaces = result.getInterfaces();
+        String[] interfaces = result.isAnnotation() ? null : result.getInterfaces();
         if (interfaces != null && interfaces.length > 0) {
             printer.printText(" ");
             printer.printKeyword(result.isInterface() ? "extends" : "implements");
@@ -751,7 +751,7 @@ public class JavaSourceWriter implements Processor {
         }
 
         // Implements / extends interfaces
-        String[] interfaces = inner.getInterfaces();
+        String[] interfaces = inner.isAnnotation() ? null : inner.getInterfaces();
         if (interfaces != null && interfaces.length > 0) {
             printer.printText(" ");
             printer.printKeyword(inner.isInterface() ? "extends" : "implements");
@@ -3270,40 +3270,14 @@ public class JavaSourceWriter implements Processor {
             printer.printText(fae.getName());
         } else if (val instanceof ThisExpression) {
             printer.printKeyword("this");
-        } else if (val instanceof MethodInvocationExpression) {
-            MethodInvocationExpression mie = (MethodInvocationExpression) val;
-            // START_CHANGE: BUG-2026-0052-20260421-3 - Parens cast receivers in simple path too
-            if (mie.getObject() instanceof CastExpression) {
-                printer.printText("(");
-                writeExpressionSimple(printer, mie.getObject(), ownerInternalName);
-                printer.printText(")");
-            } else {
-                writeExpressionSimple(printer, mie.getObject(), ownerInternalName);
-            }
-            // END_CHANGE: BUG-2026-0052-3
-            printer.printText(".");
-            printer.printText(mie.getMethodName());
-            printer.printText("(/* ... */)");
-        } else if (val instanceof StaticMethodInvocationExpression) {
-            StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) val;
-            if (smie.getOwnerInternalName() != null && !smie.getOwnerInternalName().isEmpty()) {
-                printer.printText(TypeNameUtil.simpleNameFromInternal(smie.getOwnerInternalName()));
-                printer.printText(".");
-            }
-            printer.printText(smie.getMethodName());
-            printer.printText("(/* ... */)");
-        } else if (val instanceof NewExpression) {
-            NewExpression ne = (NewExpression) val;
-            printer.printKeyword("new");
-            printer.printText(" ");
-            // START_CHANGE: BUG-2026-0055-20260327-2 - Fix numeric class names in simple new expressions
-            String simpleNewName = TypeNameUtil.simpleNameFromInternal(ne.getInternalTypeName());
-            if (simpleNewName.length() > 0 && Character.isDigit(simpleNewName.charAt(0))) {
-                simpleNewName = "_" + simpleNewName;
-            }
-            printer.printText(simpleNewName);
-            // END_CHANGE: BUG-2026-0055-2
-            printer.printText("(/* ... */)");
+        } else if (val instanceof MethodInvocationExpression
+                || val instanceof StaticMethodInvocationExpression
+                || val instanceof NewExpression) {
+            // BUG-2026-0080 (SHARED-1): method/static-method/constructor invocations inside an array
+            // initializer element are bounded nodes — render them in full (with real arguments) rather than
+            // dropping the args as `(/* ... */)`. The simple path only existed to avoid deep recursion on
+            // large constant arrays, which these node kinds are not.
+            writeExpression(printer, val, ownerInternalName);
         } else if (val instanceof NewArrayExpression) {
             // BUG-2026-0063: a nested array initializer (multi-dimensional `{{1,2},{3,4}}`) — render the
             // real element values (`new int[]{1, 2}`) instead of a `/* N elements */` placeholder.
@@ -3471,9 +3445,14 @@ public class JavaSourceWriter implements Processor {
     private void writeAnnotation(Printer printer, AnnotationInfo annotation, String ownerInternalName) {
         printer.printText("@");
         String typeDesc = annotation.getTypeDescriptor();
-        // Convert descriptor like "Ljava/lang/Override;" to simple name
-        String annTypeName = descriptorToSimpleName(typeDesc);
-        printer.printText(annTypeName);
+        // BUG-2026-0080 (Anno RC-4): route the annotation type through emitRef so a NESTED annotation type
+        // (`LOuter$Inner;`) renders as `Outer.Inner` (was the bare `Inner`, which does not resolve).
+        if (typeDesc != null && typeDesc.length() > 2 && typeDesc.charAt(0) == 'L' && typeDesc.endsWith(";")) {
+            String annInternal = typeDesc.substring(1, typeDesc.length() - 1);
+            emitRef(printer, Printer.TYPE, annInternal, descriptorToSimpleName(typeDesc), "", null);
+        } else {
+            printer.printText(descriptorToSimpleName(typeDesc));
+        }
 
         List<AnnotationInfo.ElementValuePair> pairs = annotation.getElementValuePairs();
         if (pairs != null && !pairs.isEmpty()) {
