@@ -452,3 +452,21 @@ Remaining 44, by criticality (deferred — each is high-risk CFG surgery or arch
 - Inference-needed: raw-generic locals (`ArrayList`/`Predicate` without LVTT) — 3 errors; needs type
   inference from usage, not recoverable from the class file.
 - Local/anonymous classes + captured locals — 2 errors.
+
+---
+
+## Addendum 11 — SWITCH-form record patterns: JD pipeline foundation (2026-06-09)
+
+A 4-agent workflow root-caused the switch-form record reconstruction on the JD-Core pipeline (the legacy path
+structurally cannot do it). Landed the FOUNDATION (all flag-gated — legacy corpus stays at 44, 0 regressions):
+JD accessor-receiver fix (see-through TRY_DECLARATION predecessors → `var4.start()`), JD post-proc parity
+(RecordPattern transforms; J21RecordPattern under the flag 38→21), and a public `foldArm` entry point.
+
+The core blocker is DEFERRED (IMP-2026-0063): the JD pipeline decodes each block ONCE, but a switch-expression
+desugars its arms onto a SHARED `*return` merge — so case-1/default values are lost (the shared return bakes in
+the first arm's value; the goto-reducer collapses the per-arm value blocks). A per-case `visited` scope was
+tried and rejected (later arms re-emit the first arm's out-of-scope value). The real fix is a JD-level
+switch-expression reconstruction (duplicate + re-decode the return-merge per arm), which is HIGH-effort reducer
+work — sequenced as a dedicated future effort with the foundation now in place.
+
+State: legacy corpus 146 → 44 (70%), 5/13 round-trip, DecompilerTest 31/32, regression 157 classes 0 crashes.

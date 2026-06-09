@@ -126,6 +126,24 @@ public final class RecordDeconstructionFolder {
         Fold(List<RecordPattern.Component> c, List<Statement> s, int b) { this.components = c; this.finalStmts = s; this.bodyStart = b; }
     }
 
+    /**
+     * BUG-2026-0079: public entry for SWITCH-arm folding. Folds the record deconstruction of {@code subject}
+     * over {@code body} (the statements after the `Type subject = (Type) sel;` cast). Returns the component
+     * list + the remaining body (the arm value), or null if the body is not a deconstruction.
+     */
+    public static ArmFold foldArm(String subject, List<Statement> body) {
+        Fold f = foldFlat(subject, body);
+        if (f == null) return null;
+        return new ArmFold(f.components,
+            new ArrayList<Statement>(f.finalStmts.subList(f.bodyStart, f.finalStmts.size())));
+    }
+
+    public static final class ArmFold {
+        public final List<RecordPattern.Component> components;
+        public final List<Statement> remainingBody;
+        ArmFold(List<RecordPattern.Component> c, List<Statement> r) { this.components = c; this.remainingBody = r; }
+    }
+
     /** Consume the component-extraction prefix of a then-block for subject {@code subjectName}. */
     private static Fold foldFlat(String subjectName, List<Statement> stmts) {
         Walk w = new Walk(stmts, 0);

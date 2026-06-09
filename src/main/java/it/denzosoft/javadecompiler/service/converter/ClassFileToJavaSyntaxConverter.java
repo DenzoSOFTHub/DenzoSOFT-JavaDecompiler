@@ -634,6 +634,44 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         if (legacyPred != null) preds.add(legacyPred);
                     }
                     // END_CHANGE: IMP-2026-0062-26
+                    // START_CHANGE: BUG-2026-0064-20260609-1 - See through TRY_DECLARATION
+                    // predecessors. A Java 21 record-pattern switch desugars each record
+                    // accessor invocation into its own try-region whose `from` PC lands on
+                    // the invokevirtual. ControlFlowGraphMaker marks that PC as a block leader
+                    // (Pass 1, line 295: map[entry.startPc]=MARK) and Pass 4 wraps the region
+                    // in a TYPE_TRY_DECLARATION block inserted between the producer block (the
+                    // one ending with `aload N` that pushes the accessor receiver) and the
+                    // consumer block (the one starting with the invokevirtual). The decoder
+                    // bridge never decodes TRY_DECLARATION blocks (JdFlowBuilder.build only
+                    // decodes the GROUP_CODE-ish mask), so they have no exitStack and the
+                    // receiver value is lost -> the invoke path falls back to `new
+                    // ThisExpression` (this.start() instead of var4.start()). Resolve any
+                    // TRY_DECLARATION predecessor to the real (decoded) producer block(s)
+                    // sitting before it so the exitStack seeding in decodeBasicBlock carries
+                    // the receiver across the synthetic try boundary.
+                    if (preds.isEmpty()) {
+                        java.util.Set<Integer> seen = new java.util.HashSet<Integer>();
+                        java.util.List<it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock> worklist =
+                            new java.util.ArrayList<it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock>();
+                        for (it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock jp : bb.getPredecessors()) {
+                            worklist.add(jp);
+                        }
+                        while (!worklist.isEmpty()) {
+                            it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock jp =
+                                worklist.remove(worklist.size() - 1);
+                            if (!seen.add(Integer.valueOf(jp.getIndex()))) continue;
+                            BasicBlock legacyPred = jdToLegacy.get(Integer.valueOf(jp.getIndex()));
+                            if (legacyPred != null) {
+                                preds.add(legacyPred);
+                            } else if (jp.getType() == it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock.TYPE_TRY_DECLARATION) {
+                                // Undecoded synthetic try-region: descend to its predecessors.
+                                for (it.denzosoft.javadecompiler.service.converter.cfg.jd.BasicBlock pp : jp.getPredecessors()) {
+                                    worklist.add(pp);
+                                }
+                            }
+                        }
+                    }
+                    // END_CHANGE: BUG-2026-0064-1
                     BasicBlock transient_ = decodeBytecodeRangeFull(bb.getFromOffset(), bb.getToOffset(),
                         pool, method, localVarNames, localVarDescriptors, bb.getFirstLineNumber(),
                         isHandler, handlerType, legacyType, preds);
@@ -1032,7 +1070,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     String retDesc = TypeNameUtil.parseMethodReturnDescriptor(method.getDescriptor());
                     boolean returnIsBoolean = "Z".equals(retDesc);
                     jdResult = BooleanSimplifier.simplify(jdResult, returnIsBoolean);
+                    // BUG-2026-0079: record-pattern transforms (parity with the legacy pipeline). The JD
+                    // emitter preserves the clean desugar (MatchException try/catch + if(1!=0) + nested
+                    // instanceof + value in place), which these folders reconstruct into real patterns.
+                    jdResult = it.denzosoft.javadecompiler.service.converter.transform.RecordPatternReconstructor.reconstruct(jdResult);
                     jdResult = it.denzosoft.javadecompiler.service.converter.transform.InstanceOfPatternReconstructor.reconstruct(jdResult);
+                    jdResult = it.denzosoft.javadecompiler.service.converter.transform.RecordDeconstructionFolder.reconstruct(jdResult);
                     jdResult = reconstructAsserts(jdResult);
                     jdResult = reconstructSynchronized(jdResult);
                     jdResult = CompoundAssignmentSimplifier.simplify(jdResult);
