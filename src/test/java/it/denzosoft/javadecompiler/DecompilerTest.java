@@ -63,6 +63,7 @@ public class DecompilerTest {
         testRecordPatternCleanup(); // BUG-2026-0067: flat record deconstruction
         testNestedRecordPattern();  // BUG-2026-0067: nested record deconstruction
         testGenericRecordPattern(); // BUG-2026-0067: generic record deconstruction (cast type)
+        testSwitchRecordPattern();  // BUG-2026-0079: SWITCH-form record deconstruction (JD pipeline)
         testInstanceofAmpersand();  // BUG-2026-0067: `o instanceof X v && v.m()` binding
         testUndeclaredAssignPromotion(); // BUG-2026-0077: reused slot gets a declaration
         testWhileTrueBreak();       // BUG-2026-0078: break out of while(true)
@@ -435,6 +436,25 @@ public class DecompilerTest {
             "}\n",
             new String[]{"instanceof", "Box(", "String", "toUpperCase"},
             new String[]{"MatchException", "Object var"});
+    }
+
+    // BUG-2026-0079: the SWITCH form of record patterns reconstructs to `return switch(s){case T(...) -> v}`
+    // via the JD pipeline (selectively activated for typeSwitch + MatchException methods).
+    private static void testSwitchRecordPattern() {
+        runTestFull("SwRec",
+            "public class SwRec {\n" +
+            "    record P(int x, int y) {}\n" +
+            "    record L(P a, P b) {}\n" +
+            "    int sum(Object o) {\n" +
+            "        return switch (o) {\n" +
+            "            case L(P(int x1, int y1), P(int x2, int y2)) -> x1 + y1 + x2 + y2;\n" +
+            "            case P(int x, int y) -> x + y;\n" +
+            "            default -> 0;\n" +
+            "        };\n" +
+            "    }\n" +
+            "}\n",
+            new String[]{"switch", "L(", "P(", "->", "default"},
+            new String[]{"SwitchBootstraps", "typeSwitch", "MatchException"});
     }
 
     // BUG-2026-0067: a pattern binding used in the `&&` tail is recovered: `o instanceof X v && v.m()`.

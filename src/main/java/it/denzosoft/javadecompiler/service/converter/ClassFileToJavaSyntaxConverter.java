@@ -585,6 +585,17 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             it.denzosoft.javadecompiler.service.converter.cfg.jd.ControlFlowGraphMaker.make(method, pool);
         if (jdCfg == null) return null;
 
+        // START_CHANGE: BUG-2026-0065-20260609-2 - Tail-duplicate the shared `*return`
+        // merge block that switch-EXPRESSION arms all `goto`. Each arm's value lives on
+        // the operand stack at the END of that arm's own predecessor block; the JD
+        // pipeline decodes each block once, so a SINGLE shared return block would seed
+        // its `ireturn` from only ONE predecessor's exitStack (case-1/default lose
+        // theirs). Giving every predecessor its own copy of the return block makes the
+        // per-block decode seed each copy from that arm's exitStack, so each arm
+        // returns its own value.
+        it.denzosoft.javadecompiler.service.converter.cfg.jd.ReturnMergeTailDuplicator.duplicate(jdCfg);
+        // END_CHANGE: BUG-2026-0065-2
+
         // Map from handler-entry block.index -> throwable internal name.
         // null name => catch-all / finally handler.
         final java.util.Map<Integer, String> handlerTypes = new java.util.HashMap<Integer, String>();
@@ -1042,7 +1053,16 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         // the CFG graph (no "visited as claim-tracker" truncation). If it succeeds we
         // return its output; if it throws we fall through to the legacy path so a
         // single failure cannot regress the whole build.
-        if (useJdPipeline()) {
+        // BUG-2026-0079: selectively route record-pattern SWITCH methods (typeSwitch + MatchException) to the
+        // JD pipeline even when the global flag is off — the legacy path structurally cannot reconstruct them.
+        // The per-method quality gate below still falls back to legacy when the JD fold does not succeed.
+        boolean recordSwitchMethod = methodHasTypeSwitch(currentBytecode, pool);
+        // BUG-2026-0079: running the JD pipeline mutates per-method decode state (e.g. patternSwitchLabels)
+        // that the legacy fallback also consumes — snapshot it so a fall-through to legacy starts clean.
+        Map<String, List<String>> savedPatternSwitchLabels = patternSwitchLabels == null
+            ? null : new HashMap<String, List<String>>(patternSwitchLabels);
+        Set<Integer> savedDeclaredVars = declaredVars == null ? null : new HashSet<Integer>(declaredVars);
+        if (useJdPipeline() || recordSwitchMethod) {
             // START_CHANGE: IMP-2026-0062-20260422-24 - Per-method quality check.
             // Run the JD pipeline into a sandbox (diagnostics snapshot + captured
             // result). If the JD pass recorded any STACK_UNDERFLOW / DECODE_ERROR
@@ -1076,6 +1096,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     jdResult = it.denzosoft.javadecompiler.service.converter.transform.RecordPatternReconstructor.reconstruct(jdResult);
                     jdResult = it.denzosoft.javadecompiler.service.converter.transform.InstanceOfPatternReconstructor.reconstruct(jdResult);
                     jdResult = it.denzosoft.javadecompiler.service.converter.transform.RecordDeconstructionFolder.reconstruct(jdResult);
+                    // BUG-2026-0079: fold the typeSwitch record-pattern switch into `return switch(subj){...}`.
+                    jdResult = it.denzosoft.javadecompiler.service.converter.transform.TypeSwitchRecordFolder.reconstruct(jdResult);
                     jdResult = reconstructAsserts(jdResult);
                     jdResult = reconstructSynchronized(jdResult);
                     jdResult = CompoundAssignmentSimplifier.simplify(jdResult);
@@ -1092,7 +1114,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         jdResult = withDecls;
                     }
                     mergeDeclarationsWithAssignments(jdResult);
-                    return jdResult;
+                    // BUG-2026-0079: a record-pattern switch method is only routed to JD when the
+                    // TypeSwitchRecordFolder actually produced a record-deconstruction switch expression
+                    // (`return switch(subj){ case T(comps) -> ... }`). Simple pattern switches (no
+                    // deconstruction) and guarded arms do not fold — for those the legacy path is better, so
+                    // fall through. This keeps selective activation from regressing area/classify-style methods.
+                    if (!recordSwitchMethod || foldedRecordPatternSwitch(jdResult)) {
+                        return jdResult;
+                    }
                 }
                 // JD produced a degraded result; roll back diagnostics so the
                 // legacy run can decide for itself without false-positive noise.
@@ -1109,6 +1138,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     + " -- falling back to legacy StructuredFlowBuilder");
             }
             // END_CHANGE: IMP-2026-0062-24
+            // BUG-2026-0079: JD pipeline declined / fell through — restore the pre-JD decode state so the
+            // legacy builder reconstructs from a clean slate (else the JD decode's slot-declaration tracking
+            // makes legacy emit bare assignments instead of `Type v = ...` declarations).
+            patternSwitchLabels = savedPatternSwitchLabels;
+            declaredVars = savedDeclaredVars;
         }
         // END_CHANGE: IMP-2026-0062-18
 
@@ -1440,6 +1474,97 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         if (size > 0) {
             reader.skip(size);
         }
+    }
+
+    // BUG-2026-0079: is this a record-DECONSTRUCTION switch method — a `SwitchBootstraps.typeSwitch` dispatch
+    // AND a `new java/lang/MatchException` (the record-deconstruction scaffolding)? Only those are routed to
+    // the JD pipeline; plain pattern switches (typeSwitch but no deconstruction, e.g. `case Circle c ->`) have
+    // no MatchException and stay on the legacy path which handles them well. Walks instructions with
+    // OpcodeInfo so tableswitch/lookupswitch/wide are length-correct.
+    private boolean methodHasTypeSwitch(byte[] code, ConstantPool pool) {
+        if (code == null || pool == null) return false;
+        boolean hasTypeSwitch = false, hasMatchException = false;
+        int pc = 0;
+        while (pc >= 0 && pc < code.length) {
+            int op = code[pc] & 0xff;
+            try {
+                if (op == 0xBA && pc + 2 < code.length) { // invokedynamic
+                    int cpIndex = ((code[pc + 1] & 0xff) << 8) | (code[pc + 2] & 0xff);
+                    int[] indy = pool.getValue(cpIndex);
+                    if (indy != null && indy.length > 1) {
+                        String name = pool.getNameFromNameAndType(indy[1]);
+                        if ("typeSwitch".equals(name) || "enumSwitch".equals(name)) hasTypeSwitch = true;
+                    }
+                } else if (op == 0xBB && pc + 2 < code.length) { // new
+                    int cpIndex = ((code[pc + 1] & 0xff) << 8) | (code[pc + 2] & 0xff);
+                    String cn = pool.getClassName(cpIndex);
+                    if ("java/lang/MatchException".equals(cn)) hasMatchException = true;
+                }
+            } catch (RuntimeException ignore) {
+                // malformed entry — keep scanning
+            }
+            if (hasTypeSwitch && hasMatchException) return true;
+            int size = OpcodeInfo.operandSize(op, code, pc);
+            if (size < 0) return false; // unknown opcode -> give up safely
+            pc += 1 + size;
+        }
+        return false;
+    }
+
+    // BUG-2026-0079: true if the JD result contains a record-deconstruction switch expression
+    // (`return switch(s){ case T(comps) -> ... }`) produced by TypeSwitchRecordFolder — the signal that JD
+    // genuinely reconstructed a record-pattern switch and should be preferred over legacy.
+    private boolean foldedRecordPatternSwitch(List<Statement> stmts) {
+        if (stmts == null) return false;
+        for (Statement s : stmts) {
+            Expression e = null;
+            if (s instanceof ReturnStatement && ((ReturnStatement) s).hasExpression()) e = ((ReturnStatement) s).getExpression();
+            else if (s instanceof ExpressionStatement) e = ((ExpressionStatement) s).getExpression();
+            if (e instanceof SwitchExpression) {
+                for (SwitchExpression.SwitchCase c : ((SwitchExpression) e).getCases()) {
+                    if (c.isRecordPattern()) return true;
+                }
+            }
+            if (s instanceof BlockStatement && foldedRecordPatternSwitch(((BlockStatement) s).getStatements())) return true;
+        }
+        return false;
+    }
+
+    // BUG-2026-0079: true if the statement tree still holds a raw `switch(SwitchBootstraps.typeSwitch(...))`
+    // — i.e. the TypeSwitchRecordFolder bailed and the JD output is degraded.
+    private boolean containsResidualTypeSwitch(List<Statement> stmts) {
+        if (stmts == null) return false;
+        for (Statement s : stmts) if (residualTypeSwitch(s)) return true;
+        return false;
+    }
+    private boolean residualTypeSwitch(Statement s) {
+        if (s == null) return false;
+        if (s instanceof SwitchStatement) {
+            SwitchStatement sw = (SwitchStatement) s;
+            Expression sel = sw.getSelector();
+            if (sel instanceof StaticMethodInvocationExpression) {
+                String n = ((StaticMethodInvocationExpression) sel).getMethodName();
+                if ("typeSwitch".equals(n) || "enumSwitch".equals(n)) return true;
+            }
+            for (SwitchStatement.SwitchCase c : sw.getCases()) if (containsResidualTypeSwitch(c.getStatements())) return true;
+            return false;
+        }
+        if (s instanceof BlockStatement) return containsResidualTypeSwitch(((BlockStatement) s).getStatements());
+        if (s instanceof IfStatement) return residualTypeSwitch(((IfStatement) s).getThenBody());
+        if (s instanceof IfElseStatement) return residualTypeSwitch(((IfElseStatement) s).getThenBody()) || residualTypeSwitch(((IfElseStatement) s).getElseBody());
+        if (s instanceof WhileStatement) return residualTypeSwitch(((WhileStatement) s).getBody());
+        if (s instanceof DoWhileStatement) return residualTypeSwitch(((DoWhileStatement) s).getBody());
+        if (s instanceof ForStatement) return residualTypeSwitch(((ForStatement) s).getBody());
+        if (s instanceof ForEachStatement) return residualTypeSwitch(((ForEachStatement) s).getBody());
+        if (s instanceof LabelStatement) return residualTypeSwitch(((LabelStatement) s).getBody());
+        if (s instanceof SynchronizedStatement) return residualTypeSwitch(((SynchronizedStatement) s).getBody());
+        if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            if (residualTypeSwitch(t.getTryBody())) return true;
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) if (residualTypeSwitch(cc.body)) return true;
+            return t.getFinallyBody() != null && residualTypeSwitch(t.getFinallyBody());
+        }
+        return false;
     }
 
     /**
