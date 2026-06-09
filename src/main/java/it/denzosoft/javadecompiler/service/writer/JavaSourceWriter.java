@@ -1476,6 +1476,20 @@ public class JavaSourceWriter implements Processor {
     }
 
     // START_CHANGE: BUG-2026-0067-20260608-10 - Render a record deconstruction pattern `Type(c, c, ...)`.
+    // BUG-2026-0080 (B-rec): NaN/Infinity have no literal form — emit the Double/Float constant references.
+    private String doubleLiteral(double d) {
+        if (Double.isNaN(d)) return "Double.NaN";
+        if (d == Double.POSITIVE_INFINITY) return "Double.POSITIVE_INFINITY";
+        if (d == Double.NEGATIVE_INFINITY) return "Double.NEGATIVE_INFINITY";
+        return String.valueOf(d);
+    }
+    private String floatLiteral(float f) {
+        if (Float.isNaN(f)) return "Float.NaN";
+        if (f == Float.POSITIVE_INFINITY) return "Float.POSITIVE_INFINITY";
+        if (f == Float.NEGATIVE_INFINITY) return "Float.NEGATIVE_INFINITY";
+        return f + "F";
+    }
+
     private void writeRecordPattern(Printer printer, Type outerType,
                                     it.denzosoft.javadecompiler.model.javasyntax.expression.RecordPattern rp,
                                     String ownerInternalName) {
@@ -1653,6 +1667,11 @@ public class JavaSourceWriter implements Processor {
 
         int lineNumber = lineNumberRef[0];
         printer.startLine(lineNumber++);
+        // BUG-2026-0080 (D-rec): the canonical constructor must be at least as accessible as the record
+        // (a public record needs a public canonical ctor) — emit the access modifier.
+        if ((method.accessFlags & StringConstants.ACC_PUBLIC) != 0) { printer.printKeyword("public"); printer.printText(" "); }
+        else if ((method.accessFlags & StringConstants.ACC_PROTECTED) != 0) { printer.printKeyword("protected"); printer.printText(" "); }
+        else if ((method.accessFlags & StringConstants.ACC_PRIVATE) != 0) { printer.printKeyword("private"); printer.printText(" "); }
         emitDecl(printer, Printer.CONSTRUCTOR, ownerInternalName,
             TypeNameUtil.simpleNameFromInternal(ownerInternalName), method.descriptor);
         printer.printText(" {");
@@ -2490,11 +2509,9 @@ public class JavaSourceWriter implements Processor {
             LongConstantExpression lce = (LongConstantExpression) expr;
             printer.printNumericConstant(lce.getValue() + "L");
         } else if (expr instanceof FloatConstantExpression) {
-            FloatConstantExpression fce = (FloatConstantExpression) expr;
-            printer.printNumericConstant(fce.getValue() + "F");
+            printer.printNumericConstant(floatLiteral(((FloatConstantExpression) expr).getValue()));
         } else if (expr instanceof DoubleConstantExpression) {
-            DoubleConstantExpression dce = (DoubleConstantExpression) expr;
-            printer.printNumericConstant(String.valueOf(dce.getValue()));
+            printer.printNumericConstant(doubleLiteral(((DoubleConstantExpression) expr).getValue()));
         } else if (expr instanceof StringConstantExpression) {
             StringConstantExpression sce = (StringConstantExpression) expr;
             // START_CHANGE: LIM-0006-20260324-3 - Emit text block for Java 15+ strings with newlines
@@ -3231,9 +3248,9 @@ public class JavaSourceWriter implements Processor {
         } else if (val instanceof LongConstantExpression) {
             printer.printNumericConstant(((LongConstantExpression) val).getValue() + "L");
         } else if (val instanceof FloatConstantExpression) {
-            printer.printNumericConstant(((FloatConstantExpression) val).getValue() + "F");
+            printer.printNumericConstant(floatLiteral(((FloatConstantExpression) val).getValue()));
         } else if (val instanceof DoubleConstantExpression) {
-            printer.printNumericConstant(String.valueOf(((DoubleConstantExpression) val).getValue()));
+            printer.printNumericConstant(doubleLiteral(((DoubleConstantExpression) val).getValue()));
         } else if (val instanceof StringConstantExpression) {
             printer.printStringConstant("\"" + escapeString(((StringConstantExpression) val).getValue()) + "\"", ownerInternalName);
         } else if (val instanceof NullExpression) {
