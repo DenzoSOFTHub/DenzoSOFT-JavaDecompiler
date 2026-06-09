@@ -208,6 +208,13 @@ public final class BooleanSimplifier {
                 }
             }
             // END_CHANGE: BUG-2026-0057-1
+            // BUG-2026-0080: a plain invocation/new statement (`list.add(cond ? a : b)`) — simplify it so a
+            // `boolMethod() != 0` comparison nested in an argument is reduced.
+            if (expr instanceof MethodInvocationExpression || expr instanceof StaticMethodInvocationExpression
+                    || expr instanceof NewExpression) {
+                Expression s = simplifyBooleanExpr(expr);
+                if (s != expr) return new ExpressionStatement(s);
+            }
             if (expr instanceof AssignmentExpression) {
                 AssignmentExpression ae = (AssignmentExpression) expr;
                 if (ae.getRight() instanceof TernaryExpression) {
@@ -307,6 +314,35 @@ public final class BooleanSimplifier {
             return expr;
         }
         // END_CHANGE: BUG-2026-0060-1
+        // BUG-2026-0080: recurse into invocation/new ARGUMENTS so a `boolMethod() != 0` comparison used as
+        // an argument (e.g. inside a ternary passed to `list.add(...)`) is simplified too.
+        if (expr instanceof MethodInvocationExpression) {
+            MethodInvocationExpression m = (MethodInvocationExpression) expr;
+            Expression obj = m.getObject() != null ? simplifyBooleanExpr(m.getObject()) : null;
+            java.util.List<Expression> args = simplifyArgList(m.getArguments());
+            if (obj != m.getObject() || args != m.getArguments()) {
+                return new MethodInvocationExpression(m.getLineNumber(), m.getType(), obj,
+                    m.getOwnerInternalName(), m.getMethodName(), m.getDescriptor(), args);
+            }
+            return expr;
+        }
+        if (expr instanceof StaticMethodInvocationExpression) {
+            StaticMethodInvocationExpression m = (StaticMethodInvocationExpression) expr;
+            java.util.List<Expression> args = simplifyArgList(m.getArguments());
+            if (args != m.getArguments()) {
+                return new StaticMethodInvocationExpression(m.getLineNumber(), m.getType(),
+                    m.getOwnerInternalName(), m.getMethodName(), m.getDescriptor(), args);
+            }
+            return expr;
+        }
+        if (expr instanceof NewExpression) {
+            NewExpression n = (NewExpression) expr;
+            java.util.List<Expression> args = simplifyArgList(n.getArguments());
+            if (args != n.getArguments()) {
+                return new NewExpression(n.getLineNumber(), n.getType(), n.getInternalTypeName(), n.getDescriptor(), args);
+            }
+            return expr;
+        }
         if (!(expr instanceof BinaryOperatorExpression)) return expr;
         BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
         Expression left = boe.getLeft();
@@ -356,6 +392,19 @@ public final class BooleanSimplifier {
             }
         }
         return expr;
+    }
+
+    // BUG-2026-0080: simplify each argument; return the original list if nothing changed.
+    private static java.util.List<Expression> simplifyArgList(java.util.List<Expression> args) {
+        if (args == null || args.isEmpty()) return args;
+        java.util.List<Expression> out = null;
+        for (int i = 0; i < args.size(); i++) {
+            Expression a = args.get(i);
+            Expression s = simplifyBooleanExpr(a);
+            if (s != a && out == null) { out = new java.util.ArrayList<Expression>(args); }
+            if (out != null) out.set(i, s);
+        }
+        return out != null ? out : args;
     }
 
     private static boolean isIntConstant(Expression expr, int value) {
