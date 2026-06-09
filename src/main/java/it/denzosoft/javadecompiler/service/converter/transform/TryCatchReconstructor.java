@@ -742,6 +742,34 @@ public class TryCatchReconstructor {
             if (inner != ce.getExpression()) {
                 return new CastExpression(ce.getLineNumber(), ce.getType(), inner);
             }
+        } else if (expr instanceof NewExpression) {
+            // BUG-2026-0080 (RC-8): recurse into constructor args (e.g. `throw new RuntimeException(msg, e)`).
+            NewExpression ne = (NewExpression) expr;
+            List<Expression> args = renameVarInExpressions(ne.getArguments(), oldName, newName);
+            if (args != ne.getArguments()) {
+                return new NewExpression(ne.getLineNumber(), ne.getType(), ne.getInternalTypeName(), ne.getDescriptor(), args);
+            }
+        } else if (expr instanceof UnaryOperatorExpression) {
+            UnaryOperatorExpression uoe = (UnaryOperatorExpression) expr;
+            Expression inner = renameVarInExpression(uoe.getExpression(), oldName, newName);
+            if (inner != uoe.getExpression()) {
+                return new UnaryOperatorExpression(uoe.getLineNumber(), uoe.getType(), uoe.getOperator(), inner, uoe.isPrefix());
+            }
+        } else if (expr instanceof TernaryExpression) {
+            TernaryExpression te = (TernaryExpression) expr;
+            Expression c = renameVarInExpression(te.getCondition(), oldName, newName);
+            Expression t = renameVarInExpression(te.getTrueExpression(), oldName, newName);
+            Expression f = renameVarInExpression(te.getFalseExpression(), oldName, newName);
+            if (c != te.getCondition() || t != te.getTrueExpression() || f != te.getFalseExpression()) {
+                return new TernaryExpression(te.getLineNumber(), te.getType(), c, t, f);
+            }
+        } else if (expr instanceof FieldAccessExpression) {
+            FieldAccessExpression fae = (FieldAccessExpression) expr;
+            Expression obj = renameVarInExpression(fae.getObject(), oldName, newName);
+            if (obj != fae.getObject()) {
+                return new FieldAccessExpression(fae.getLineNumber(), fae.getType(), obj,
+                    fae.getOwnerInternalName(), fae.getName(), fae.getDescriptor());
+            }
         }
         return expr;
     }
