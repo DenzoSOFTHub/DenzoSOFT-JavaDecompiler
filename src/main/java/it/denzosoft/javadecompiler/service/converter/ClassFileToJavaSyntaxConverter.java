@@ -1031,6 +1031,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
         // Initialize variable declaration tracking
         declaredVars = new HashSet<Integer>();
+        // START_CHANGE: BUG-2026-0096-20260610-2 - Reset per-method slot typing/split state
+        slotDeclCategories = new HashMap<Integer, Integer>();
+        slotRenames = new HashMap<Integer, String>();
+        slotSplitCounts = new HashMap<Integer, Integer>();
+        // END_CHANGE: BUG-2026-0096-2
         String[] paramDescs = TypeNameUtil.parseMethodParameterDescriptors(method.getDescriptor());
         int paramSlot = method.isStatic() ? 0 : 1;
         for (int pi = 0; pi < paramDescs.length; pi++) {
@@ -1272,6 +1277,13 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             // makes legacy emit bare assignments instead of `Type v = ...` declarations).
             patternSwitchLabels = savedPatternSwitchLabels;
             declaredVars = savedDeclaredVars;
+            // START_CHANGE: BUG-2026-0096-20260610-3 - Discard any slot splits the JD decode
+            // recorded; the legacy re-decode must start from a clean slot-typing slate or its
+            // first declarations would pick up stale fresh names.
+            slotDeclCategories = new HashMap<Integer, Integer>();
+            slotRenames = new HashMap<Integer, String>();
+            slotSplitCounts = new HashMap<Integer, Integer>();
+            // END_CHANGE: BUG-2026-0096-3
         }
         // END_CHANGE: IMP-2026-0062-18
 
@@ -1423,6 +1435,16 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     private boolean suppressBranchComments = false;
     // Tracks which local variable slots have been declared (for variable declaration tracking)
     private Set<Integer> declaredVars;
+    // START_CHANGE: BUG-2026-0096-20260610-1 - Per-slot declaration typing for no-LVT slot reuse.
+    // slotDeclCategories: verifier type category (int-family/long/float/double/reference) recorded
+    // when a slot's declaration is emitted; a later store of a DIFFERENT category means javac
+    // reused a dead slot for an unrelated variable, so the slot is split into a fresh name.
+    // slotRenames: active fresh name per split slot (consulted by load/store/iinc decoding).
+    // slotSplitCounts: per-slot split counter for deterministic fresh-name suffixes.
+    private Map<Integer, Integer> slotDeclCategories;
+    private Map<Integer, String> slotRenames;
+    private Map<Integer, Integer> slotSplitCounts;
+    // END_CHANGE: BUG-2026-0096-1
     // Generic signatures from LocalVariableTypeTable (index -> signature like "TT;")
     private Map<Integer, String> currentLocalVarSignatures;
     // Map of synthetic lambda method names to their decompiled bodies
@@ -1861,6 +1883,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
         // Initialize variable declaration tracking for linear mode
         declaredVars = new HashSet<Integer>();
+        // START_CHANGE: BUG-2026-0096-20260610-4 - Reset per-method slot typing/split state (linear mode)
+        slotDeclCategories = new HashMap<Integer, Integer>();
+        slotRenames = new HashMap<Integer, String>();
+        slotSplitCounts = new HashMap<Integer, Integer>();
+        // END_CHANGE: BUG-2026-0096-4
         String[] paramDescsLin = TypeNameUtil.parseMethodParameterDescriptors(method.getDescriptor());
         int paramSlotLin = method.isStatic() ? 0 : 1;
         for (int pi = 0; pi < paramDescsLin.length; pi++) {
@@ -1928,6 +1955,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     private void decodeIinc(int varIdx, int incr, Deque<Expression> stack,
                             List<Statement> statements, Map<Integer, String> localVarNames, int line) {
         String name = localVarNames.containsKey(varIdx) ? (String) localVarNames.get(varIdx) : "var" + varIdx;
+        // START_CHANGE: BUG-2026-0096-20260610-5 - iinc on a split slot targets the fresh variable
+        if (slotRenames != null && slotRenames.containsKey(Integer.valueOf(varIdx))) {
+            name = (String) slotRenames.get(Integer.valueOf(varIdx));
+        }
+        // END_CHANGE: BUG-2026-0096-5
         if ((incr == 1 || incr == -1) && !stack.isEmpty()
                 && stack.peek() instanceof LocalVariableExpression
                 && ((LocalVariableExpression) stack.peek()).getIndex() == varIdx) {
@@ -2099,8 +2131,31 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             case 0x2E: case 0x2F: case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: { // iaload..saload
                 Expression idx = popOrUnderflowInt(stack, line);
                 Expression arr = popOrUnderflowRef(stack);
-                stack.push(new ArrayAccessExpression(line, PrimitiveType.INT, arr, idx));
+                // START_CHANGE: BUG-2026-0069-20260610-6 - Array loads carried a hardcoded `int`
+                // element type, so without LVT `String s = arr[i]` (aaload) declared an int local
+                // via the LIM-0002 RHS inference and array for-each loops garbled their element
+                // type. Type each load by its opcode; aaload/baload derive the component type
+                // from the array expression's static type (baload serves both byte[] and
+                // boolean[], so it stays byte unless the array is known boolean[]).
+                Type elemType;
+                Type arrType = arr != null ? arr.getType() : null;
+                switch (opcode) {
+                    case 0x2F: elemType = PrimitiveType.LONG; break;
+                    case 0x30: elemType = PrimitiveType.FLOAT; break;
+                    case 0x31: elemType = PrimitiveType.DOUBLE; break;
+                    case 0x32: elemType = arrayComponentType(arrType); break;
+                    case 0x33: {
+                        Type ct = arrayComponentType(arrType);
+                        elemType = ct == PrimitiveType.BOOLEAN ? PrimitiveType.BOOLEAN : PrimitiveType.BYTE;
+                        break;
+                    }
+                    case 0x34: elemType = PrimitiveType.CHAR; break;
+                    case 0x35: elemType = PrimitiveType.SHORT; break;
+                    default: elemType = PrimitiveType.INT; break;
+                }
+                stack.push(new ArrayAccessExpression(line, elemType, arr, idx));
                 break;
+                // END_CHANGE: BUG-2026-0069-6
             }
 
             // Stores
@@ -3171,9 +3226,16 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                             Map<Integer, String> names, Map<Integer, String> descriptors,
                             int line, Type defaultType) {
         String name = names.containsKey(index) ? (String) names.get(index) : "var" + index;
+        // START_CHANGE: BUG-2026-0096-20260610-6 - Loads of a split slot resolve to the fresh
+        // variable; the slot's LVT/LVTT info belongs to the pre-split variable, so skip it.
+        boolean slotRenamed = slotRenames != null && slotRenames.containsKey(Integer.valueOf(index));
+        if (slotRenamed) {
+            name = (String) slotRenames.get(Integer.valueOf(index));
+        }
+        // END_CHANGE: BUG-2026-0096-6
         // Prefer generic signature type over erased descriptor
         Type type = defaultType;
-        if (currentLocalVarSignatures != null) {
+        if (!slotRenamed && currentLocalVarSignatures != null) {
             String sig = (String) currentLocalVarSignatures.get(index);
             if (sig != null) {
                 Type sigType = parseSignatureType(sig);
@@ -3182,7 +3244,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 }
             }
         }
-        if (type == defaultType) {
+        if (!slotRenamed && type == defaultType) {
             String desc = descriptors.get(index);
             type = desc != null ? parseType(desc) : defaultType;
         }
@@ -3193,9 +3255,50 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                              Map<Integer, String> names, Map<Integer, String> descriptors,
                              List<Statement> statements, int line, Type defaultType) {
         String name = names.containsKey(index) ? (String) names.get(index) : "var" + index;
+        // START_CHANGE: BUG-2026-0096-20260610-7 - Per-slot declared-type conflict map: javac
+        // reuses dead slots for unrelated typed temporaries (e.g. astore 5 of a Point, later
+        // istore 5 of an int). Without LVT the decoder identified variables purely by slot, so
+        // the later store emitted `var5 = <int expr>` against a Point-typed declaration. When a
+        // store's verifier category (int-family/long/float/double/reference) conflicts with the
+        // category recorded at the slot's declaration, split the slot: allocate a fresh name,
+        // route all subsequent loads/stores/iincs to it, and emit a new declaration. The whole
+        // int family (int/byte/short/char/boolean) shares one category — boolean stores int
+        // constants and byte/short/char widen to int, so those must NOT split. long/double
+        // occupy two slots but are always addressed through their first slot, so categories are
+        // tracked per declaration slot only.
+        boolean slotRenamed = slotRenames != null && slotRenames.containsKey(Integer.valueOf(index));
+        if (slotRenamed) {
+            name = (String) slotRenames.get(Integer.valueOf(index));
+        }
+        int storeCat = storeCategory(defaultType);
+        // Never split on the synthetic `$exception` handler seed (BUG-2026-0050): the handler's
+        // opening astore is consumed by the try/catch reconstruction, which names the catch
+        // variable itself — a split here would leave a dangling `Type varNa = $exception;`.
+        boolean exceptionSeedStore = !stack.isEmpty()
+            && stack.peek() instanceof LocalVariableExpression
+            && "$exception".equals(((LocalVariableExpression) stack.peek()).getName());
+        if (declaredVars != null && declaredVars.contains(index) && slotDeclCategories != null
+            && !exceptionSeedStore) {
+            Integer prevCat = (Integer) slotDeclCategories.get(Integer.valueOf(index));
+            if (prevCat != null && prevCat.intValue() != storeCat) {
+                int splits = 0;
+                if (slotSplitCounts != null) {
+                    Integer prev = (Integer) slotSplitCounts.get(Integer.valueOf(index));
+                    splits = prev == null ? 0 : prev.intValue();
+                    slotSplitCounts.put(Integer.valueOf(index), Integer.valueOf(splits + 1));
+                }
+                name = "var" + index + (char) ('a' + (splits % 26));
+                if (slotRenames != null) {
+                    slotRenames.put(Integer.valueOf(index), name);
+                }
+                slotRenamed = true;
+                declaredVars.remove(Integer.valueOf(index));
+            }
+        }
+        // END_CHANGE: BUG-2026-0096-7
         // Prefer generic signature type (e.g., "TT;" -> GenericType "T") over erased descriptor
         Type type = defaultType;
-        if (currentLocalVarSignatures != null) {
+        if (!slotRenamed && currentLocalVarSignatures != null) {
             String sig = (String) currentLocalVarSignatures.get(index);
             if (sig != null) {
                 Type sigType = parseSignatureType(sig);
@@ -3204,11 +3307,26 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 }
             }
         }
-        if (type == defaultType) {
+        boolean typeFromDebugInfo = type != defaultType;
+        if (!slotRenamed && type == defaultType) {
             String desc = (String) descriptors.get(index);
-            type = desc != null ? parseType(desc) : defaultType;
+            if (desc != null) {
+                type = parseType(desc);
+                typeFromDebugInfo = true;
+            }
         }
         Expression value = popOrUnderflowRef(stack);
+
+        // START_CHANGE: BUG-2026-0096-20260610-8 - With no LVT/LVTT info `istore` defaults the
+        // declaration to int, but the stored value may be boolean-typed (e.g. `List.add` returns
+        // Z: `boolean ok = list.add(1)` decompiled to `int var3 = list.add(1)`). boolean is the
+        // only int-category verifier type not assignable to int in source; byte/short/char widen
+        // fine, so only the BOOLEAN case is corrected.
+        if (!typeFromDebugInfo && defaultType == PrimitiveType.INT
+            && value != null && value.getType() == PrimitiveType.BOOLEAN) {
+            type = PrimitiveType.BOOLEAN;
+        }
+        // END_CHANGE: BUG-2026-0096-8
 
         // START_CHANGE: LIM-0002-20260324-1 - Infer type from RHS when descriptor is unavailable (e.g., TWR temp vars)
         if (type == ObjectType.OBJECT && value != null && value.getType() != null
@@ -3250,13 +3368,30 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         if (declaredVars != null && !declaredVars.contains(index)) {
             // First assignment - emit as variable declaration
             declaredVars.add(index);
+            // START_CHANGE: BUG-2026-0096-20260610-9 - Record the slot's verifier category so a
+            // later store of a conflicting category triggers the slot split above.
+            if (slotDeclCategories != null) {
+                slotDeclCategories.put(Integer.valueOf(index), Integer.valueOf(storeCat));
+            }
+            // END_CHANGE: BUG-2026-0096-9
             VariableDeclarationStatement vdsNew = new VariableDeclarationStatement(line, type, name, value, false, false);
             // START_CHANGE: BUG-2026-0065-20260421-3 - Propagate LVTT signature to declaration
-            if (currentLocalVarSignatures != null) {
+            // (BUG-2026-0096: unless the slot was split — the LVTT entry is the old variable's)
+            if (currentLocalVarSignatures != null && !slotRenamed) {
                 String sig = currentLocalVarSignatures.get(index);
                 if (sig != null) vdsNew.setGenericSignature(sig);
             }
             // END_CHANGE: BUG-2026-0065-3
+            // START_CHANGE: BUG-2026-0069-20260610-3 - Erasure-generics Stage B: a local without
+            // LVTT info initialized from a known JDK generic factory (Arrays.asList, List.of,
+            // Optional.of, Stream.of, ...) gets its parameterized signature synthesized from the
+            // arguments' static types when they are homogeneous (heterogeneous/unknown stay
+            // erased). `List var1 = Arrays.asList(new String[]{...})` -> `List<String> var1`.
+            if (vdsNew.getGenericSignature() == null) {
+                String factorySig = inferFactoryGenericSignature(value, type);
+                if (factorySig != null) vdsNew.setGenericSignature(factorySig);
+            }
+            // END_CHANGE: BUG-2026-0069-3
             statements.add(vdsNew);
         } else {
             Expression var = new LocalVariableExpression(line, type, name, index);
@@ -3264,6 +3399,122 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 new AssignmentExpression(line, type, var, "=", value)));
         }
     }
+
+    // START_CHANGE: BUG-2026-0069-20260610-7 - Component type of an array expression's static
+    // type, used to type aaload/baload results. Falls back to Object when the array type is
+    // unknown (better than the previous hardcoded int: Object stays assignable in source).
+    private static Type arrayComponentType(Type t) {
+        if (t instanceof ArrayType) {
+            ArrayType at = (ArrayType) t;
+            if (at.getDimension() <= 1) return at.getElementType();
+            return new ArrayType(at.getElementType(), at.getDimension() - 1);
+        }
+        if (t instanceof ObjectType && t.getDimension() > 0) {
+            return ((ObjectType) t).createArrayType(t.getDimension() - 1);
+        }
+        return ObjectType.OBJECT;
+    }
+    // END_CHANGE: BUG-2026-0069-7
+
+    // START_CHANGE: BUG-2026-0096-20260610-10 - Verifier type category of a store opcode's
+    // default type: 0 = int family (istore: int/byte/short/char/boolean), 1 = long, 2 = float,
+    // 3 = double, 4 = reference (astore: objects and arrays).
+    private static int storeCategory(Type t) {
+        if (t == PrimitiveType.LONG) return 1;
+        if (t == PrimitiveType.FLOAT) return 2;
+        if (t == PrimitiveType.DOUBLE) return 3;
+        if (t instanceof PrimitiveType) return 0;
+        return 4;
+    }
+    // END_CHANGE: BUG-2026-0096-10
+
+    // START_CHANGE: BUG-2026-0069-20260610-4 - Erasure-generics Stage B: known-generic-factory
+    // table. When a declaration's initializer is a call to a JDK factory whose return type is
+    // generic in its arguments (Arrays.asList/List.of/Set.of/Map.of/Collections.singletonList/
+    // Optional.of/Optional.ofNullable/Stream.of), synthesize the parameterized field signature
+    // (e.g. `Ljava/util/List<Ljava/lang/String;>;`) from the arguments' static types. Rules:
+    // a single `new E[]{...}`-style reference-array argument matching the factory's sole varargs
+    // parameter contributes its component type; otherwise all arguments must be homogeneous
+    // (same erased reference type). Heterogeneous/unknown/Object-typed arguments and zero-arg
+    // factories (Collections.emptyList, Optional.empty, List.of()) stay erased — conservative.
+    private String inferFactoryGenericSignature(Expression value, Type declaredType) {
+        if (!(value instanceof StaticMethodInvocationExpression)) return null;
+        if (!(declaredType instanceof ObjectType) || declaredType.getDimension() != 0) return null;
+        StaticMethodInvocationExpression call = (StaticMethodInvocationExpression) value;
+        String owner = call.getOwnerInternalName();
+        String mname = call.getMethodName();
+        if (owner == null || mname == null) return null;
+        String container = null;
+        boolean keyValue = false;
+        if ("java/util/Arrays".equals(owner) && "asList".equals(mname)) {
+            container = "java/util/List";
+        } else if ("java/util/List".equals(owner) && "of".equals(mname)) {
+            container = "java/util/List";
+        } else if ("java/util/Set".equals(owner) && "of".equals(mname)) {
+            container = "java/util/Set";
+        } else if ("java/util/Map".equals(owner) && "of".equals(mname)) {
+            container = "java/util/Map";
+            keyValue = true;
+        } else if ("java/util/Collections".equals(owner) && "singletonList".equals(mname)) {
+            container = "java/util/List";
+        } else if ("java/util/Optional".equals(owner)
+                   && ("of".equals(mname) || "ofNullable".equals(mname))) {
+            container = "java/util/Optional";
+        } else if ("java/util/stream/Stream".equals(owner) && "of".equals(mname)) {
+            container = "java/util/stream/Stream";
+        }
+        if (container == null) return null;
+        // Only parameterize when the declared type IS the factory's container — the typical
+        // no-LVT case where the declared type was inferred from the call's erased return type.
+        if (!container.equals(((ObjectType) declaredType).getInternalName())) return null;
+        List<Expression> args = call.getArguments();
+        if (args == null || args.isEmpty()) return null;
+        if (!keyValue && args.size() == 1) {
+            // Varargs form: the sole argument is a one-dimensional reference array passed to the
+            // factory's single array parameter — the element type is the array component type.
+            Expression a0 = args.get(0);
+            String[] pds = TypeNameUtil.parseMethodParameterDescriptors(call.getDescriptor());
+            if (pds.length == 1 && pds[0].startsWith("[")
+                && a0.getType() instanceof ArrayType
+                && ((ArrayType) a0.getType()).getDimension() == 1) {
+                String comp = referenceTypeSig(((ArrayType) a0.getType()).getElementType());
+                return comp == null ? null : "L" + container + "<" + comp + ">;";
+            }
+        }
+        if (keyValue) {
+            if (args.size() < 2 || args.size() % 2 != 0) return null;
+            String k = homogeneousArgSig(args, 0, 2);
+            String v = homogeneousArgSig(args, 1, 2);
+            if (k == null || v == null) return null;
+            return "L" + container + "<" + k + v + ">;";
+        }
+        String e = homogeneousArgSig(args, 0, 1);
+        return e == null ? null : "L" + container + "<" + e + ">;";
+    }
+
+    /** Common erased reference-type signature of every step-th argument, or null if mixed/unknown. */
+    private String homogeneousArgSig(List<Expression> args, int from, int step) {
+        String sig = null;
+        for (int i = from; i < args.size(); i += step) {
+            String s = referenceTypeSig(args.get(i).getType());
+            if (s == null) return null;
+            if (sig == null) {
+                sig = s;
+            } else if (!sig.equals(s)) {
+                return null;
+            }
+        }
+        return sig;
+    }
+
+    /** Field-signature form of a plain (non-array, non-Object) reference type, else null. */
+    private String referenceTypeSig(Type t) {
+        if (!(t instanceof ObjectType) || t.getDimension() != 0) return null;
+        String internal = ((ObjectType) t).getInternalName();
+        if (internal == null || "java/lang/Object".equals(internal)) return null;
+        return "L" + internal + ";";
+    }
+    // END_CHANGE: BUG-2026-0069-4
 
     /**
      * BUG-2026-0077: promote the first bare `v = expr;` of a local that has NO declaration anywhere in the

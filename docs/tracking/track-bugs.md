@@ -28,7 +28,7 @@ Index shows ONLY open items.
 | BUG-2026-0091 | HIGH | Count-based finally dedup deletes trailing returns | [BUG-2026-0091](items/BUG-2026-0091.md) |
 | BUG-2026-0092 | HIGH | Nested synchronized flattened; `static synchronized` modifier dropped | [BUG-2026-0092](items/BUG-2026-0092.md) |
 | BUG-2026-0093 | HIGH | Cast operand printed without precedence parens (`(T) a >= 0 ? x : y`) | [BUG-2026-0093](items/BUG-2026-0093.md) |
-| BUG-2026-0096 | MEDIUM | No-LVT slot typing: boolean as int; incompatible slot reuse shares one var | [BUG-2026-0096](items/BUG-2026-0096.md) |
+| BUG-2026-0096 | MEDIUM | No-LVT slot typing: RESOLVED 2026-06-10 (boolean istore inference + per-slot category-conflict split; C_Unnamed residual 2 errors = 0067 flow-level, see item) | [BUG-2026-0096](items/BUG-2026-0096.md) |
 | BUG-2026-0097 | HIGH | Local classes never loaded; anonymous `val$` captures unmapped; outer param leaks | [BUG-2026-0097](items/BUG-2026-0097.md) |
 | BUG-2026-0098 | COSMETIC | Synthetic `Objects.requireNonNull(receiver)` leaks as statement | [BUG-2026-0098](items/BUG-2026-0098.md) |
 | BUG-2026-0099 | MEDIUM | module-info `requires transitive`/`static` modifiers dropped | [BUG-2026-0099](items/BUG-2026-0099.md) |
@@ -40,8 +40,8 @@ Index shows ONLY open items.
 | BUG-2026-0053 | HIGH | Ternary in lambda body (→ consolidated in BUG-2026-0083) | [BUG-2026-0053](items/BUG-2026-0053.md) |
 | BUG-2026-0056 | HIGH | Try-catch-finally: catch-conditional body still dropped (post-try part FIXED) | [BUG-2026-0056](items/BUG-2026-0056.md) |
 | BUG-2026-0067 | HIGH | Pattern switch: transform folding DONE (exhaustive tail reclaim, `_` components); guarded/unnamed statement-form leak = flow-level (see item residuals 1–2) | [BUG-2026-0067](items/BUG-2026-0067.md) |
-| BUG-2026-0068 | HIGH | Modern TWR: nested/multi-resource/effectively-final shapes still uncollapsed | [BUG-2026-0068](items/BUG-2026-0068.md) |
-| BUG-2026-0069 | HIGH | Local decl/type loss (ternary part → 0083; slot part → 0096; generics → erasure plan) | [BUG-2026-0069](items/BUG-2026-0069.md) |
-| BUG-2026-0080 | HIGH | Construct-matrix umbrella (37/57 clean; full plan in report-construct-matrix-gap-analysis.md) | [BUG-2026-0080](items/BUG-2026-0080.md) |
+| BUG-2026-0068 | HIGH | Modern TWR: RESOLVED 2026-06-10 (single/multi-resource, nested, TWR+catch/finally, single effectively-final all collapse; C_Java7TryResources 3→0). Residuals: multi-resource effectively-final, same-line multi-resource header, parameter resource (see item) | [BUG-2026-0068](items/BUG-2026-0068.md) |
+| BUG-2026-0069 | HIGH | Local decl/type loss: erasure Stages A+B DONE 2026-06-10 (foreach back-prop, factory table, aaload component type — C_VarInference/C_Optional/C_StreamsAdvanced cleared); remaining: Stage C indy SAM types + (a) branch-scoped declaration hoisting (see item) | [BUG-2026-0069](items/BUG-2026-0069.md) |
+| BUG-2026-0080 | HIGH | Construct-matrix umbrella (52/57 clean after wave 5; full plan in report-construct-matrix-gap-analysis.md) | [BUG-2026-0080](items/BUG-2026-0080.md) |
 
 Closed 2026-06-10 (verified fixed in v1.9.0, files in docs/releases/v1.9.0/): BUG-2026-0052, BUG-2026-0054, BUG-2026-0055.
