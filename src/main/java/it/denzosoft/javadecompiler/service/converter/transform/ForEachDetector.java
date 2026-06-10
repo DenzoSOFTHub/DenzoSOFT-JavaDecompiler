@@ -122,7 +122,99 @@ public final class ForEachDetector {
      * declaration (found among the already-emitted same-scope statements). Conservative: first
      * loop wins, existing signatures are never overwritten, unknown/raw element types are skipped.
      */
+    // START_CHANGE: BUG-2026-0069-20260610-19 - Stage A extension: a raw JDK Map iterated via
+    // entrySet()/keySet()/values() leaves the loop element as Object and fails to recompile.
+    // Parameterize the map declaration: entrySet -> <Object,Object>, keySet -> <E,Object>,
+    // values -> <Object,E>. First loop wins (signature never overwritten, same as below).
+    private static final java.util.Set<String> TWO_PARAM_MAPS =
+        new java.util.HashSet<String>(java.util.Arrays.asList(new String[] {
+            "java/util/Map", "java/util/HashMap", "java/util/LinkedHashMap",
+            "java/util/TreeMap", "java/util/Hashtable", "java/util/SortedMap",
+            "java/util/NavigableMap", "java/util/IdentityHashMap", "java/util/WeakHashMap",
+            "java/util/concurrent/ConcurrentHashMap", "java/util/concurrent/ConcurrentMap"
+        }));
+    // END_CHANGE: BUG-2026-0069-19
+
+    // START_CHANGE: BUG-2026-0069-20260610-21 - Second back-prop pass, run AFTER the
+    // BUG-2026-0077 promotion has materialized first-store declarations: at ForEachDetector
+    // time a reused/late slot is still a bare assignment, so the signature has nowhere to go.
+    public static void backPropagateSignatures(List<Statement> stmts) {
+        if (stmts == null) return;
+        for (int i = 0; i < stmts.size(); i++) {
+            Statement s = stmts.get(i);
+            if (s instanceof ForEachStatement) {
+                backPropagateElementType((ForEachStatement) s, stmts.subList(0, i));
+                backPropagateSignaturesInto(((ForEachStatement) s).getBody());
+            } else {
+                backPropagateSignaturesInto(s);
+            }
+        }
+    }
+
+    private static void backPropagateSignaturesInto(Statement s) {
+        if (s instanceof BlockStatement) {
+            backPropagateSignatures(((BlockStatement) s).getStatements());
+        } else if (s instanceof IfStatement) {
+            backPropagateSignaturesInto(((IfStatement) s).getThenBody());
+        } else if (s instanceof IfElseStatement) {
+            backPropagateSignaturesInto(((IfElseStatement) s).getThenBody());
+            backPropagateSignaturesInto(((IfElseStatement) s).getElseBody());
+        } else if (s instanceof WhileStatement) {
+            backPropagateSignaturesInto(((WhileStatement) s).getBody());
+        } else if (s instanceof TryCatchStatement) {
+            TryCatchStatement tcs = (TryCatchStatement) s;
+            backPropagateSignaturesInto(tcs.getTryBody());
+            for (TryCatchStatement.CatchClause cc : tcs.getCatchClauses()) {
+                backPropagateSignaturesInto(cc.body);
+            }
+            if (tcs.getFinallyBody() != null) backPropagateSignaturesInto(tcs.getFinallyBody());
+        }
+    }
+    // END_CHANGE: BUG-2026-0069-21
+
     private static void backPropagateElementType(ForEachStatement fes, List<Statement> emitted) {
+        // START_CHANGE: BUG-2026-0069-20260610-20 - raw-Map view iteration (see TWO_PARAM_MAPS)
+        if (fes.getIterable() instanceof MethodInvocationExpression) {
+            MethodInvocationExpression mie = (MethodInvocationExpression) fes.getIterable();
+            String vm = mie.getMethodName();
+            if (("entrySet".equals(vm) || "keySet".equals(vm) || "values".equals(vm))
+                    && (mie.getArguments() == null || mie.getArguments().isEmpty())
+                    && mie.getObject() instanceof LocalVariableExpression) {
+                String mapName = ((LocalVariableExpression) mie.getObject()).getName();
+                Type elem = fes.getVariableType();
+                String elemInt = (elem instanceof it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType
+                        && elem.getDimension() == 0)
+                    ? ((it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType) elem).getInternalName()
+                    : null;
+                for (int k = emitted.size() - 1; k >= 0; k--) {
+                    Statement s = emitted.get(k);
+                    if (!(s instanceof VariableDeclarationStatement)) continue;
+                    VariableDeclarationStatement vds = (VariableDeclarationStatement) s;
+                    if (!mapName.equals(vds.getName())) continue;
+                    if (vds.getGenericSignature() != null) return;
+                    Type dt = vds.getType();
+                    if (!(dt instanceof it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType)
+                        || dt.getDimension() != 0) return;
+                    String rawMap =
+                        ((it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType) dt).getInternalName();
+                    if (!TWO_PARAM_MAPS.contains(rawMap)) return;
+                    String kSig = "Ljava/lang/Object;";
+                    String vSig = "Ljava/lang/Object;";
+                    if ("entrySet".equals(vm)) {
+                        // element must be Map.Entry (raw) for <Object,Object> to assign
+                        if (elemInt != null && !"java/util/Map$Entry".equals(elemInt)
+                                && !"java/lang/Object".equals(elemInt)) return;
+                    } else if (elemInt != null && !"java/lang/Object".equals(elemInt)) {
+                        if ("keySet".equals(vm)) kSig = "L" + elemInt + ";";
+                        else vSig = "L" + elemInt + ";";
+                    }
+                    vds.setGenericSignature("L" + rawMap + "<" + kSig + vSig + ">;");
+                    return;
+                }
+                return;
+            }
+        }
+        // END_CHANGE: BUG-2026-0069-20
         if (!(fes.getIterable() instanceof LocalVariableExpression)) return;
         Type elemType = fes.getVariableType();
         if (!(elemType instanceof it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType)
