@@ -40,6 +40,15 @@ public class StructuredFlowBuilder {
     private List<Integer> outerLoopMergePoints = new ArrayList<Integer>();
     // BUG-2026-0078: exit PCs of enclosing `while(true)` loops; a goto to one of these is a plain `break`.
     private List<Integer> whileTrueExitStack = new ArrayList<Integer>();
+    // START_CHANGE: BUG-2026-0083-20260610-3 - Ternaries whose merge block carries the merged
+    // value onward on the operand stack (e.g. the first of two ternary call arguments: the
+    // merge block IS the next ternary's condition block and has no statements of its own).
+    // The consumer statement lives in a LATER merge block and references this ternary's arm
+    // value by object identity (exit-stack seeding propagates the same Expression objects).
+    // Each entry is {trueValue, falseValue, ternary}; applied and cleared by
+    // replaceTernaryInMergeStatements when the eventual consumer statement is rewritten.
+    private final List<Expression[]> pendingStackTernaries = new ArrayList<Expression[]>();
+    // END_CHANGE: BUG-2026-0083-3
     private Map<Integer, String> labeledBreakLabels = new HashMap<Integer, String>();
     private int labelCounter = 0;
     // END_CHANGE: ISS-2026-0007-1
@@ -631,48 +640,69 @@ public class StructuredFlowBuilder {
                         // Check what the merge block does with the value
                         if (mergeBlock != null) {
                             // START_CHANGE: BUG-2026-0015-20260324-1 - Only emit return if merge block is pure return (no prior statements)
-                            visited.add(mergeBlock.startPc);
                             boolean pureReturn = mergeBlock.isReturn()
                                 && (mergeBlock.statements == null || mergeBlock.statements.isEmpty());
-                            // START_CHANGE: BUG-2026-0025-20260325-1 - Treat merge block with single ReturnStatement as pure return for ternary
+                            // START_CHANGE: BUG-2026-0083-20260610-1 - The BUG-2026-0025 shortcut treated ANY
+                            // single-ReturnStatement merge block as a pure return and emitted `return <ternary>`,
+                            // discarding the decoded return expression. That is only correct when the returned
+                            // expression IS the arm value (the merge stack is seeded with the same Expression
+                            // objects as the branch stackTopExpressions, so identity matching works). When the
+                            // arm value is embedded deeper (e.g. `return new Slope(cond ? a : b)`), the shortcut
+                            // silently deleted the consumer expression. Take the shortcut only for a direct
+                            // arm-value return; everything else goes through the generalized consumer rewriter.
                             if (!pureReturn && mergeBlock.isReturn()
                                 && mergeBlock.statements != null && mergeBlock.statements.size() == 1
                                 && mergeBlock.statements.get(0) instanceof ReturnStatement) {
-                                pureReturn = true;
+                                Expression retExpr = ((ReturnStatement) mergeBlock.statements.get(0)).getExpression();
+                                if (retExpr == null || isTernaryArmValue(retExpr, trueValue, falseValue, false)) {
+                                    pureReturn = true;
+                                }
                             }
-                            // END_CHANGE: BUG-2026-0025-1
                             if (pureReturn) {
                                 // return condition ? A : B;
+                                visited.add(mergeBlock.startPc);
                                 preStatements.add(new ReturnStatement(line, ternary));
-                            } else if (mergeBlock.isReturn() && mergeBlock.statements != null && !mergeBlock.statements.isEmpty()) {
-                                // Merge block has statements then return - ternary is consumed as argument
-                                // Replace the stack-derived argument in the merge block's statements with the ternary
-                                // Use condBlock's stackTopExpression as the method receiver if available
-                                Expression receiver = condBlock.stackTopExpression;
-                                replaceTernaryInMergeStatements(preStatements, mergeBlock.statements, ternary, trueValue, falseValue, receiver);
                             } else if (mergeBlock.statements != null && !mergeBlock.statements.isEmpty()) {
-                            // END_CHANGE: BUG-2026-0015-1
-                                // The merge block has a store - replace with ternary assignment
-                                Statement mergeStmt = mergeBlock.statements.get(0);
-                                if (mergeStmt instanceof ExpressionStatement) {
-                                    Expression mergeExpr = ((ExpressionStatement) mergeStmt).getExpression();
-                                    if (mergeExpr instanceof AssignmentExpression) {
-                                        AssignmentExpression ae = (AssignmentExpression) mergeExpr;
-                                        preStatements.add(new ExpressionStatement(
-                                            new AssignmentExpression(line, ternaryType, ae.getLeft(), "=", ternary)));
-                                        // Add remaining merge statements
-                                        for (int mi = 1; mi < mergeBlock.statements.size(); mi++) {
-                                            preStatements.add(mergeBlock.statements.get(mi));
-                                        }
-                                    } else {
-                                        preStatements.add(new ExpressionStatement(ternary));
-                                    }
-                                } else {
-                                    preStatements.add(new ExpressionStatement(ternary));
-                                }
+                                // The merge block consumes the merged value (local store/declaration
+                                // initializer, field write, invocation/constructor argument, return
+                                // value, ...). Locate the seeded arm-value reference inside the merge
+                                // statements and substitute the ternary there, recursing into nested
+                                // expressions. Previously only a leading ExpressionStatement wrapping a
+                                // MethodInvocationExpression (return merges) or an AssignmentExpression
+                                // (store merges) was handled; every other consumer shape copied the merge
+                                // statements verbatim with ONE arm's value, silently deleting the
+                                // condition and the other branch (C_FlexibleCtor$Sub's lstore-to-
+                                // declaration shape).
+                                //
+                                // The substitution is done IN PLACE on the merge block's statement list
+                                // and the block is deliberately NOT marked visited: the merge block can
+                                // continue the flow (fall-through chain, another conditional sharing the
+                                // block, return/goto handling). Direct consumption used to truncate the
+                                // method right after the ternary (`int a = c ? x : y;` followed by more
+                                // code dropped everything after the store). Setting
+                                // lastEffectiveMergePoint steers the caller INTO the merge block so the
+                                // regular machinery emits it exactly once.
+                                Expression receiver = condBlock.stackTopExpression;
+                                List<Statement> rewritten = new ArrayList<Statement>();
+                                replaceTernaryInMergeStatements(rewritten, mergeBlock.statements, ternary, trueValue, falseValue, receiver);
+                                mergeBlock.statements.clear();
+                                mergeBlock.statements.addAll(rewritten);
+                                lastEffectiveMergePoint = mergeBlock.startPc;
+                            } else if (mergeBlock.isConditional() && !visited.contains(mergeBlock.startPc)) {
+                                // No statements: the merged value stays on the operand stack and the
+                                // merge block immediately starts the next condition (chained ternary
+                                // arguments: `fmt(c1 ? a : b, c2 ? x : y)`). Register the ternary as
+                                // pending — the eventual consumer (a later merge block's statement)
+                                // references this ternary's arm value via the seeded stack — and
+                                // continue INTO the merge block so the chain keeps being processed.
+                                pendingStackTernaries.add(new Expression[] { trueValue, falseValue, ternary });
+                                lastEffectiveMergePoint = mergeBlock.startPc;
                             } else {
+                                visited.add(mergeBlock.startPc);
                                 preStatements.add(new ExpressionStatement(ternary));
                             }
+                            // END_CHANGE: BUG-2026-0083-1
+                            // END_CHANGE: BUG-2026-0015-1
                         } else {
                             preStatements.add(new ReturnStatement(line, ternary));
                         }
@@ -1626,23 +1656,447 @@ public class StructuredFlowBuilder {
     }
 
     // START_CHANGE: BUG-2026-0015-20260324-2 - Replace ternary value in merge block statements
+    // START_CHANGE: BUG-2026-0083-20260610-2 - Generalized recursive consumer rewriter. The merge
+    // block's operand stack is seeded with the SAME Expression objects as the branch
+    // stackTopExpressions (BUG-2026-0051 exit-stack seeding), so the statement that consumes the
+    // merged value embeds one arm value by object identity — possibly nested inside an
+    // invocation/constructor argument, a cast, a binary operand, a declaration initializer, an
+    // assignment RHS, a return value, etc. Find that reference and substitute the full
+    // TernaryExpression in place. Previously only `i == 0` ExpressionStatement +
+    // MethodInvocationExpression was handled; every other consumer shape copied the merge
+    // statements verbatim with ONE arm's value, silently deleting the condition and the other
+    // branch (e.g. C_FlexibleCtor$Sub: `long abs = stamp < 0 ? -stamp : stamp` became
+    // `long var4 = -arg1`).
     private void replaceTernaryInMergeStatements(List<Statement> output,
             List<Statement> mergeStmts, Expression ternary,
             Expression trueValue, Expression falseValue, Expression receiver) {
+        List<Statement> result = new ArrayList<Statement>();
+        substituteTernaryIntoStatements(result, mergeStmts, ternary, trueValue, falseValue, receiver);
+        // Earlier ternaries whose value rode the operand stack through statement-less merge
+        // blocks (chained ternary arguments) are also consumed here: replace their arm-value
+        // references in the rewritten statements.
+        applyPendingStackTernaries(result);
+        output.addAll(result);
+    }
+
+    /** Apply (and clear) pending stack-carried ternary substitutions to the statements. */
+    private void applyPendingStackTernaries(List<Statement> stmts) {
+        for (int p = pendingStackTernaries.size() - 1; p >= 0; p--) {
+            Expression[] pending = pendingStackTernaries.get(p);
+            for (int i = 0; i < stmts.size(); i++) {
+                Statement replaced = substituteTernaryInStatement(stmts.get(i),
+                    pending[2], pending[0], pending[1], true);
+                if (replaced != null) {
+                    stmts.set(i, replaced);
+                    pendingStackTernaries.remove(p);
+                    break;
+                }
+            }
+        }
+    }
+
+    private void substituteTernaryIntoStatements(List<Statement> output,
+            List<Statement> mergeStmts, Expression ternary,
+            Expression trueValue, Expression falseValue, Expression receiver) {
+        // Pass 1 (strict identity): the consumer references the seeded arm value object.
         for (int i = 0; i < mergeStmts.size(); i++) {
-            Statement s = mergeStmts.get(i);
-            if (i == 0 && s instanceof ExpressionStatement) {
-                Expression expr = ((ExpressionStatement) s).getExpression();
-                // Replace the value argument with the ternary expression
+            Statement replaced = substituteTernaryInStatement(mergeStmts.get(i), ternary,
+                trueValue, falseValue, true);
+            if (replaced != null) {
+                for (int j = 0; j < mergeStmts.size(); j++) {
+                    output.add(j == i ? replaced : mergeStmts.get(j));
+                }
+                return;
+            }
+        }
+        // Pass 2 (loose): constant re-decoding can break identity (e.g. iconst arms re-created
+        // during the merge block decode). Retry the first statement with value-equality matching.
+        if (!mergeStmts.isEmpty()) {
+            Statement replaced = substituteTernaryInStatement(mergeStmts.get(0), ternary,
+                trueValue, falseValue, false);
+            if (replaced != null) {
+                output.add(replaced);
+                for (int j = 1; j < mergeStmts.size(); j++) {
+                    output.add(mergeStmts.get(j));
+                }
+                return;
+            }
+        }
+        // Legacy fallbacks — preserve pre-existing behaviour when no arm-value reference is found.
+        Statement first = mergeStmts.isEmpty() ? null : mergeStmts.get(0);
+        if (mergeStmts.size() == 1 && first instanceof ReturnStatement) {
+            // BUG-2026-0025 behaviour: a lone opaque return consumes the merged value directly
+            // (e.g. the decoder rebuilt the returned constant as a different object).
+            output.add(new ReturnStatement(first.getLineNumber(), ternary));
+            return;
+        }
+        if (first instanceof ExpressionStatement) {
+            Expression expr = ((ExpressionStatement) first).getExpression();
+            if (expr instanceof MethodInvocationExpression) {
+                // BUG-2026-0015 behaviour: force-replace the last invocation argument, overriding
+                // the receiver with the condition block's leftover stack top when available.
                 Expression replaced = replaceArgWithTernary(expr, ternary, trueValue, falseValue, receiver);
                 if (replaced != null) {
                     output.add(new ExpressionStatement(replaced));
-                    continue;
+                    for (int j = 1; j < mergeStmts.size(); j++) {
+                        output.add(mergeStmts.get(j));
+                    }
+                    return;
+                }
+            } else if (expr instanceof AssignmentExpression) {
+                // Pre-0083 store-merge behaviour: force the assignment RHS to the ternary.
+                AssignmentExpression ae = (AssignmentExpression) expr;
+                output.add(new ExpressionStatement(new AssignmentExpression(
+                    ae.getLineNumber(), ternary.getType(), ae.getLeft(), "=", ternary)));
+                for (int j = 1; j < mergeStmts.size(); j++) {
+                    output.add(mergeStmts.get(j));
+                }
+                return;
+            }
+        }
+        // Last resort: keep the merge statements unchanged rather than dropping them.
+        output.addAll(mergeStmts);
+    }
+
+    /**
+     * Check whether {@code expr} is one of the ternary's arm values. With {@code strict} the
+     * match is by object identity only; otherwise constant value-equality is also accepted.
+     * Built (nested) TernaryExpression arms are unwrapped: the merge stack is seeded with the
+     * LEAF arm value object, not with the synthesized inner ternary.
+     */
+    private boolean isTernaryArmValue(Expression expr, Expression trueValue, Expression falseValue,
+            boolean strict) {
+        if (expr == null) return false;
+        if (matchesArm(expr, trueValue, strict) || matchesArm(expr, falseValue, strict)) {
+            return true;
+        }
+        if (trueValue instanceof TernaryExpression) {
+            TernaryExpression te = (TernaryExpression) trueValue;
+            if (isTernaryArmValue(expr, te.getTrueExpression(), te.getFalseExpression(), strict)) {
+                return true;
+            }
+        }
+        if (falseValue instanceof TernaryExpression) {
+            TernaryExpression te = (TernaryExpression) falseValue;
+            if (isTernaryArmValue(expr, te.getTrueExpression(), te.getFalseExpression(), strict)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesArm(Expression expr, Expression value, boolean strict) {
+        if (strict) {
+            return expr == value;
+        }
+        return expressionMatchesValue(expr, value);
+    }
+
+    /**
+     * Substitute the ternary for the arm-value reference inside a merge statement.
+     * Returns the rewritten statement, or null if the statement does not reference an arm value.
+     */
+    private Statement substituteTernaryInStatement(Statement s, Expression ternary,
+            Expression trueValue, Expression falseValue, boolean strict) {
+        if (s instanceof ExpressionStatement) {
+            Expression r = substituteTernaryInExpression(((ExpressionStatement) s).getExpression(),
+                ternary, trueValue, falseValue, strict);
+            return r != null ? new ExpressionStatement(r) : null;
+        }
+        if (s instanceof ReturnStatement) {
+            ReturnStatement rs = (ReturnStatement) s;
+            Expression r = substituteTernaryInExpression(rs.getExpression(),
+                ternary, trueValue, falseValue, strict);
+            return r != null ? new ReturnStatement(rs.getLineNumber(), r) : null;
+        }
+        if (s instanceof ThrowStatement) {
+            ThrowStatement ts = (ThrowStatement) s;
+            Expression r = substituteTernaryInExpression(ts.getExpression(),
+                ternary, trueValue, falseValue, strict);
+            return r != null ? new ThrowStatement(ts.getLineNumber(), r) : null;
+        }
+        if (s instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) s;
+            Expression r = substituteTernaryInExpression(vds.getInitializer(),
+                ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                VariableDeclarationStatement nv = new VariableDeclarationStatement(
+                    vds.getLineNumber(), vds.getType(), vds.getName(), r,
+                    vds.isFinal(), vds.isVar());
+                nv.setGenericSignature(vds.getGenericSignature());
+                return nv;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * Recursively locate the arm-value reference inside {@code expr} and substitute the ternary.
+     * Returns a rebuilt expression (nodes along the matched path are copied; everything else is
+     * shared), or null when {@code expr} does not reference an arm value. Exactly one
+     * occurrence — the first found in stack-top-biased order (arguments last-to-first, RHS
+     * before LHS) — is replaced.
+     */
+    private Expression substituteTernaryInExpression(Expression expr, Expression ternary,
+            Expression trueValue, Expression falseValue, boolean strict) {
+        if (expr == null) return null;
+        if (isTernaryArmValue(expr, trueValue, falseValue, strict)) {
+            return ternary;
+        }
+        if (expr instanceof AssignmentExpression) {
+            AssignmentExpression ae = (AssignmentExpression) expr;
+            Expression r = substituteTernaryInExpression(ae.getRight(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                return new AssignmentExpression(ae.getLineNumber(), ae.getType(), ae.getLeft(),
+                    ae.getOperator(), r);
+            }
+            r = substituteTernaryInExpression(ae.getLeft(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                return new AssignmentExpression(ae.getLineNumber(), ae.getType(), r,
+                    ae.getOperator(), ae.getRight());
+            }
+            return null;
+        }
+        if (expr instanceof MethodInvocationExpression) {
+            MethodInvocationExpression mie = (MethodInvocationExpression) expr;
+            List<Expression> args = mie.getArguments();
+            if (args != null) {
+                for (int i = args.size() - 1; i >= 0; i--) {
+                    Expression r = substituteTernaryInExpression(args.get(i), ternary, trueValue, falseValue, strict);
+                    if (r != null) {
+                        List<Expression> newArgs = new ArrayList<Expression>(args);
+                        newArgs.set(i, r);
+                        return new MethodInvocationExpression(mie.getLineNumber(), mie.getType(),
+                            mie.getObject(), mie.getOwnerInternalName(), mie.getMethodName(),
+                            mie.getDescriptor(), newArgs);
+                    }
                 }
             }
-            output.add(s);
+            Expression r = substituteTernaryInExpression(mie.getObject(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                return new MethodInvocationExpression(mie.getLineNumber(), mie.getType(), r,
+                    mie.getOwnerInternalName(), mie.getMethodName(), mie.getDescriptor(), args);
+            }
+            return null;
         }
+        if (expr instanceof StaticMethodInvocationExpression) {
+            StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) expr;
+            List<Expression> args = smie.getArguments();
+            if (args != null) {
+                for (int i = args.size() - 1; i >= 0; i--) {
+                    Expression r = substituteTernaryInExpression(args.get(i), ternary, trueValue, falseValue, strict);
+                    if (r != null) {
+                        List<Expression> newArgs = new ArrayList<Expression>(args);
+                        newArgs.set(i, r);
+                        return new StaticMethodInvocationExpression(smie.getLineNumber(), smie.getType(),
+                            smie.getOwnerInternalName(), smie.getMethodName(), smie.getDescriptor(), newArgs);
+                    }
+                }
+            }
+            return null;
+        }
+        if (expr instanceof NewExpression) {
+            NewExpression ne = (NewExpression) expr;
+            List<Expression> args = ne.getArguments();
+            if (args != null) {
+                for (int i = args.size() - 1; i >= 0; i--) {
+                    Expression r = substituteTernaryInExpression(args.get(i), ternary, trueValue, falseValue, strict);
+                    if (r != null) {
+                        List<Expression> newArgs = new ArrayList<Expression>(args);
+                        newArgs.set(i, r);
+                        return new NewExpression(ne.getLineNumber(), ne.getType(),
+                            ne.getInternalTypeName(), ne.getDescriptor(), newArgs);
+                    }
+                }
+            }
+            return null;
+        }
+        if (expr instanceof CastExpression) {
+            CastExpression ce = (CastExpression) expr;
+            Expression r = substituteTernaryInExpression(ce.getExpression(), ternary, trueValue, falseValue, strict);
+            return r != null ? new CastExpression(ce.getLineNumber(), ce.getType(), r) : null;
+        }
+        if (expr instanceof UnaryOperatorExpression) {
+            UnaryOperatorExpression ue = (UnaryOperatorExpression) expr;
+            Expression r = substituteTernaryInExpression(ue.getExpression(), ternary, trueValue, falseValue, strict);
+            if (r == null) return null;
+            // A ternary as a unary operand would render without the parentheses Java
+            // requires (`-c ? x : y` re-parses as `(-c) ? x : y`). Distributing the pure
+            // prefix operator into the arms is always evaluation-order-safe.
+            if (r instanceof TernaryExpression && ue.isPrefix()
+                && ("-".equals(ue.getOperator()) || "~".equals(ue.getOperator())
+                    || "!".equals(ue.getOperator()) || "+".equals(ue.getOperator()))) {
+                TernaryExpression t = (TernaryExpression) r;
+                return new TernaryExpression(t.getLineNumber(), ue.getType(), t.getCondition(),
+                    new UnaryOperatorExpression(ue.getLineNumber(), ue.getType(), ue.getOperator(),
+                        t.getTrueExpression(), true),
+                    new UnaryOperatorExpression(ue.getLineNumber(), ue.getType(), ue.getOperator(),
+                        t.getFalseExpression(), true));
+            }
+            if (r instanceof TernaryExpression) {
+                return null; // would mis-render; let the fallback tiers handle it
+            }
+            return new UnaryOperatorExpression(ue.getLineNumber(), ue.getType(),
+                ue.getOperator(), r, ue.isPrefix());
+        }
+        if (expr instanceof BinaryOperatorExpression) {
+            BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
+            Expression r = substituteTernaryInExpression(boe.getRight(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                if (r instanceof TernaryExpression) {
+                    // `left op <ternary>` would render without the parentheses Java requires
+                    // (ternary binds lowest: `a + c ? x : y` re-parses as `(a + c) ? x : y`,
+                    // sometimes still compiling with WRONG semantics). Distribute the binary
+                    // into the arms — `c ? left op x : left op y` — when that cannot change
+                    // observable evaluation order: `left` must be a simple operand (its read
+                    // is hoisted past the condition) and the condition side-effect-free.
+                    TernaryExpression t = (TernaryExpression) r;
+                    if (isSimpleOperand(boe.getLeft()) && isSideEffectFree(t.getCondition())) {
+                        return new TernaryExpression(t.getLineNumber(), boe.getType(), t.getCondition(),
+                            new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
+                                boe.getLeft(), boe.getOperator(), t.getTrueExpression()),
+                            new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
+                                boe.getLeft(), boe.getOperator(), t.getFalseExpression()));
+                    }
+                    return null; // would mis-render; let the fallback tiers handle it
+                }
+                return new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
+                    boe.getLeft(), boe.getOperator(), r);
+            }
+            r = substituteTernaryInExpression(boe.getLeft(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                if (r instanceof TernaryExpression) {
+                    // `<ternary> op right`: evaluation order (condition, arm, right) is
+                    // preserved by distribution; only `right` gets duplicated, so it must
+                    // be a simple operand.
+                    TernaryExpression t = (TernaryExpression) r;
+                    if (isSimpleOperand(boe.getRight())) {
+                        return new TernaryExpression(t.getLineNumber(), boe.getType(), t.getCondition(),
+                            new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
+                                t.getTrueExpression(), boe.getOperator(), boe.getRight()),
+                            new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
+                                t.getFalseExpression(), boe.getOperator(), boe.getRight()));
+                    }
+                    return null; // would mis-render; let the fallback tiers handle it
+                }
+                return new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
+                    r, boe.getOperator(), boe.getRight());
+            }
+            return null;
+        }
+        if (expr instanceof ArrayAccessExpression) {
+            ArrayAccessExpression aae = (ArrayAccessExpression) expr;
+            Expression r = substituteTernaryInExpression(aae.getIndex(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                return new ArrayAccessExpression(aae.getLineNumber(), aae.getType(), aae.getArray(), r);
+            }
+            r = substituteTernaryInExpression(aae.getArray(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                return new ArrayAccessExpression(aae.getLineNumber(), aae.getType(), r, aae.getIndex());
+            }
+            return null;
+        }
+        if (expr instanceof FieldAccessExpression) {
+            FieldAccessExpression fae = (FieldAccessExpression) expr;
+            Expression r = substituteTernaryInExpression(fae.getObject(), ternary, trueValue, falseValue, strict);
+            return r != null ? new FieldAccessExpression(fae.getLineNumber(), fae.getType(), r,
+                fae.getOwnerInternalName(), fae.getName(), fae.getDescriptor()) : null;
+        }
+        if (expr instanceof TernaryExpression) {
+            TernaryExpression te = (TernaryExpression) expr;
+            Expression r = substituteTernaryInExpression(te.getTrueExpression(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                return new TernaryExpression(te.getLineNumber(), te.getType(),
+                    te.getCondition(), r, te.getFalseExpression());
+            }
+            r = substituteTernaryInExpression(te.getFalseExpression(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                return new TernaryExpression(te.getLineNumber(), te.getType(),
+                    te.getCondition(), te.getTrueExpression(), r);
+            }
+            r = substituteTernaryInExpression(te.getCondition(), ternary, trueValue, falseValue, strict);
+            if (r != null) {
+                return new TernaryExpression(te.getLineNumber(), te.getType(),
+                    r, te.getTrueExpression(), te.getFalseExpression());
+            }
+            return null;
+        }
+        if (expr instanceof NewArrayExpression) {
+            NewArrayExpression nae = (NewArrayExpression) expr;
+            List<Expression> dims = nae.getDimensionExpressions();
+            if (dims != null) {
+                for (int i = dims.size() - 1; i >= 0; i--) {
+                    Expression r = substituteTernaryInExpression(dims.get(i), ternary, trueValue, falseValue, strict);
+                    if (r != null) {
+                        List<Expression> newDims = new ArrayList<Expression>(dims);
+                        newDims.set(i, r);
+                        NewArrayExpression rebuilt = new NewArrayExpression(nae.getLineNumber(),
+                            nae.getType(), newDims);
+                        if (nae.hasInitValues()) {
+                            for (int v = 0; v < nae.getInitValues().size(); v++) {
+                                rebuilt.addInitValue(nae.getInitValues().get(v));
+                            }
+                        }
+                        return rebuilt;
+                    }
+                }
+            }
+            return null;
+        }
+        return null;
     }
+
+    /**
+     * Simple operand: re-reading it after the ternary condition (instead of before) cannot be
+     * observed — constants, local variable loads and `this`.
+     */
+    private boolean isSimpleOperand(Expression e) {
+        return e instanceof IntegerConstantExpression || e instanceof LongConstantExpression
+            || e instanceof FloatConstantExpression || e instanceof DoubleConstantExpression
+            || e instanceof StringConstantExpression || e instanceof TextBlockExpression
+            || e instanceof NullExpression || e instanceof BooleanExpression
+            || e instanceof ClassExpression || e instanceof LocalVariableExpression
+            || e instanceof ThisExpression;
+    }
+
+    /**
+     * Conservative whitelist: true only when the expression provably has no side effects
+     * (no invocations, allocations, assignments or increments anywhere in the tree).
+     */
+    private boolean isSideEffectFree(Expression e) {
+        if (e == null) return true;
+        if (isSimpleOperand(e)) return true;
+        if (e instanceof UnaryOperatorExpression) {
+            UnaryOperatorExpression u = (UnaryOperatorExpression) e;
+            if ("++".equals(u.getOperator()) || "--".equals(u.getOperator())) return false;
+            return isSideEffectFree(u.getExpression());
+        }
+        if (e instanceof BinaryOperatorExpression) {
+            BinaryOperatorExpression b = (BinaryOperatorExpression) e;
+            return isSideEffectFree(b.getLeft()) && isSideEffectFree(b.getRight());
+        }
+        if (e instanceof CastExpression) {
+            return isSideEffectFree(((CastExpression) e).getExpression());
+        }
+        if (e instanceof FieldAccessExpression) {
+            return isSideEffectFree(((FieldAccessExpression) e).getObject());
+        }
+        if (e instanceof ArrayAccessExpression) {
+            ArrayAccessExpression aa = (ArrayAccessExpression) e;
+            return isSideEffectFree(aa.getArray()) && isSideEffectFree(aa.getIndex());
+        }
+        if (e instanceof InstanceOfExpression) {
+            return isSideEffectFree(((InstanceOfExpression) e).getExpression());
+        }
+        if (e instanceof TernaryExpression) {
+            TernaryExpression t = (TernaryExpression) e;
+            return isSideEffectFree(t.getCondition()) && isSideEffectFree(t.getTrueExpression())
+                && isSideEffectFree(t.getFalseExpression());
+        }
+        return false;
+    }
+    // END_CHANGE: BUG-2026-0083-2
 
     private Expression replaceArgWithTernary(Expression expr, Expression ternary,
             Expression trueValue, Expression falseValue, Expression receiver) {

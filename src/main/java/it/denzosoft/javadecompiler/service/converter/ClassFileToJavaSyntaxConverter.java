@@ -1270,6 +1270,18 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     // appear in the same constructor body.
     private String currentSuperClassInternalName;
     // END_CHANGE: BUG-2026-0055-4
+    // START_CHANGE: BUG-2026-0082-20260610-1 - Pending iinc state: an `iinc` decoded with no
+    // matching value on the operand stack is held here so it can fuse as a PREFIX ++var/--var
+    // into the immediately following iload of the same slot (restores `++a` value semantics,
+    // e.g. `a++ + ++a`). It is flushed as a standalone `var++;` statement at the first
+    // non-matching opcode and at every decode-run boundary (basic block end / linear end),
+    // so for-loop tail increments keep their current statement form.
+    private boolean pendingIincActive;
+    private int pendingIincSlot;
+    private int pendingIincIncr;
+    private int pendingIincLine;
+    private String pendingIincName;
+    // END_CHANGE: BUG-2026-0082-1
     // Shared bytecode reference for block-level decoding
     private byte[] currentBytecode;
     // When true, suppress branch/goto comment output (CFG handles control flow)
@@ -1396,6 +1408,9 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         reader.setOffset(block.startPc);
         int currentLine = block.lineNumber;
         suppressBranchComments = true; // CFG handles control flow
+        // START_CHANGE: BUG-2026-0082-20260610-5 - A pending iinc never crosses a decode run
+        pendingIincActive = false;
+        // END_CHANGE: BUG-2026-0082-5
 
         while (reader.getOffset() < block.endPc && reader.remaining() > 0) {
             int pc = reader.getOffset();
@@ -1440,6 +1455,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         "/* ERROR: opcode 0x" + Integer.toHexString(opcode) + " at pc=" + pc + " */")));
             }
         }
+
+        // START_CHANGE: BUG-2026-0082-20260610-6 - Block boundary: an unfused iinc becomes the
+        // plain statement form (this keeps for-loop tail increments exactly as before).
+        flushPendingIinc(stmts);
+        // END_CHANGE: BUG-2026-0082-6
 
         block.statements = stmts;
         if (block.lineNumber == 0 && currentLine > 0) {
@@ -1718,6 +1738,9 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
         ByteReader reader = new ByteReader(bytecode);
         int currentLine = 0;
+        // START_CHANGE: BUG-2026-0082-20260610-7 - A pending iinc never crosses a decode run
+        pendingIincActive = false;
+        // END_CHANGE: BUG-2026-0082-7
 
         while (reader.remaining() > 0) {
             int pc = reader.getOffset();
@@ -1749,8 +1772,79 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             }
         }
 
+        // START_CHANGE: BUG-2026-0082-20260610-8 - End-of-method boundary for an unfused iinc
+        flushPendingIinc(statements);
+        // END_CHANGE: BUG-2026-0082-8
+
         return statements;
     }
+
+    // START_CHANGE: BUG-2026-0082-20260610-2 - Shared iinc decoding (used by narrow 0x84 and
+    // wide 0xC4/0x84). Restores post/pre-increment VALUE semantics:
+    // (a) if the operand stack top is a load of the same slot (javac pattern `iload; iinc`),
+    //     replace it with a POSTFIX var++/var-- expression (e.g. `return a++` returned the OLD
+    //     value in the original; the previous statement-only decode returned the NEW value);
+    // (b) otherwise, for +-1 increments, record a pending iinc that fuses as PREFIX ++var/--var
+    //     into an immediately following iload of the same slot (javac pattern `iinc; iload`,
+    //     e.g. `a++ + ++a`), and is flushed as a `var++;` statement at any other opcode or at
+    //     the end of the decode run (so for-loop tail increments are unchanged);
+    // (c) non-unit increments keep the previous `var += N;` statement form, which is always
+    //     correct because javac never leaves a stale load of the slot on the stack for them.
+    private void decodeIinc(int varIdx, int incr, Deque<Expression> stack,
+                            List<Statement> statements, Map<Integer, String> localVarNames, int line) {
+        String name = localVarNames.containsKey(varIdx) ? (String) localVarNames.get(varIdx) : "var" + varIdx;
+        if ((incr == 1 || incr == -1) && !stack.isEmpty()
+                && stack.peek() instanceof LocalVariableExpression
+                && ((LocalVariableExpression) stack.peek()).getIndex() == varIdx) {
+            // (a) postfix: the loaded old value stays on the stack, the variable is bumped
+            Expression loaded = stack.pop();
+            stack.push(new UnaryOperatorExpression(line, PrimitiveType.INT,
+                incr == 1 ? "++" : "--", loaded, false));
+        } else if (incr == 1 || incr == -1) {
+            // (b) pending: may fuse as prefix into the immediately following iload
+            flushPendingIinc(statements); // at most one pending at a time
+            pendingIincActive = true;
+            pendingIincSlot = varIdx;
+            pendingIincIncr = incr;
+            pendingIincLine = line;
+            pendingIincName = name;
+        } else {
+            // (c) compound assignment statement (same emission as before this change)
+            Expression var = new LocalVariableExpression(line, PrimitiveType.INT, name, varIdx);
+            statements.add(new ExpressionStatement(
+                new AssignmentExpression(line, PrimitiveType.INT, var, "+=",
+                    IntegerConstantExpression.valueOf(line, incr))));
+        }
+    }
+
+    /** Flush a recorded-but-unfused iinc as the standalone statement form (`var++;`). */
+    private void flushPendingIinc(List<Statement> statements) {
+        if (!pendingIincActive) return;
+        pendingIincActive = false;
+        Expression var = new LocalVariableExpression(pendingIincLine, PrimitiveType.INT,
+            pendingIincName, pendingIincSlot);
+        statements.add(new ExpressionStatement(
+            new UnaryOperatorExpression(pendingIincLine, PrimitiveType.INT,
+                pendingIincIncr == 1 ? "++" : "--", var, false)));
+    }
+    // END_CHANGE: BUG-2026-0082-2
+
+    // START_CHANGE: BUG-2026-0081-20260610-1 - Receiver marker that the existing
+    // JavaSourceWriter renders as the bare keyword `super`. The writer has no dedicated
+    // super-receiver node; this composes two existing, stable writer behaviours:
+    // (1) a prefix UnaryOperatorExpression prints its operator string verbatim, and
+    // (2) an instance MethodInvocationExpression whose name starts with "access$" prints
+    //     nothing (synthetic-accessor suppression). The composition therefore renders
+    //     exactly `super`, so `super.m(args)` is emitted for invokespecial super-calls
+    //     instead of the previous `this.m(args)` (which dispatched virtually back to the
+    //     subclass override and recursed forever).
+    private Expression buildSuperReceiver(int line) {
+        Expression silent = new MethodInvocationExpression(line, VoidType.INSTANCE,
+            new ThisExpression(line, ObjectType.OBJECT), currentClassInternalName,
+            "access$superMarker", "()V", new ArrayList<Expression>());
+        return new UnaryOperatorExpression(line, ObjectType.OBJECT, "super", silent, true);
+    }
+    // END_CHANGE: BUG-2026-0081-1
 
     @SuppressWarnings("fallthrough")
     private void decodeOpcode(int opcode, ByteReader reader, Deque<Expression> stack,
@@ -1758,6 +1852,35 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                                Map<Integer, String> localVarNames,
                                Map<Integer, String> localVarDescriptors,
                                int line, MethodInfo method, byte[] bytecode, int pc) {
+
+        // START_CHANGE: BUG-2026-0082-20260610-3 - Fuse a pending iinc as a PREFIX ++var/--var
+        // into the immediately following iload of the same slot; flush it as a statement
+        // before ANY other opcode (conservative boundary: the fusion window is exactly one
+        // instruction, so basic-block layout, branches and for-loop tails are unaffected).
+        if (pendingIincActive) {
+            int loadSlot = -1;
+            if (opcode >= 0x1A && opcode <= 0x1D) { // iload_0..3
+                loadSlot = opcode - 0x1A;
+            } else if (opcode == 0x15) { // iload with u1 operand
+                int saved = reader.getOffset();
+                int idx = reader.readUnsignedByte();
+                if (idx == pendingIincSlot) {
+                    loadSlot = idx;
+                } else {
+                    reader.setOffset(saved); // un-read; the regular case 0x15 re-reads it
+                }
+            }
+            if (loadSlot == pendingIincSlot) {
+                pendingIincActive = false;
+                Expression var = new LocalVariableExpression(line, PrimitiveType.INT,
+                    pendingIincName, pendingIincSlot);
+                stack.push(new UnaryOperatorExpression(line, PrimitiveType.INT,
+                    pendingIincIncr == 1 ? "++" : "--", var, true));
+                return; // the iload is fully consumed by the fusion
+            }
+            flushPendingIinc(statements);
+        }
+        // END_CHANGE: BUG-2026-0082-3
 
         switch (opcode) {
             // Constants
@@ -2024,19 +2147,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             case 0x84: { // iinc
                 int varIdx = reader.readUnsignedByte();
                 int incr = reader.readByte();
-                String name = localVarNames.containsKey(varIdx) ? (String) localVarNames.get(varIdx) : "var" + varIdx;
-                Expression var = new LocalVariableExpression(line, PrimitiveType.INT, name, varIdx);
-                if (incr == 1) {
-                    statements.add(new ExpressionStatement(
-                        new UnaryOperatorExpression(line, PrimitiveType.INT, "++", var, false)));
-                } else if (incr == -1) {
-                    statements.add(new ExpressionStatement(
-                        new UnaryOperatorExpression(line, PrimitiveType.INT, "--", var, false)));
-                } else {
-                    statements.add(new ExpressionStatement(
-                        new AssignmentExpression(line, PrimitiveType.INT, var, "+=",
-                            IntegerConstantExpression.valueOf(line, incr))));
-                }
+                // START_CHANGE: BUG-2026-0082-20260610-4 - Decode through the shared helper that
+                // preserves post/pre-increment value semantics (was: always a `var++;` statement,
+                // which made `return a++` return the NEW value after recompilation).
+                decodeIinc(varIdx, incr, stack, statements, localVarNames, line);
+                // END_CHANGE: BUG-2026-0082-4
                 break;
             }
 
@@ -2322,8 +2437,23 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         statements.add(new ExpressionStatement(invocation));
                     }
                 } else {
+                    // START_CHANGE: BUG-2026-0081-20260610-2 - invokespecial on `this` targeting a
+                    // class other than the current one is a SUPER call (non-virtual dispatch).
+                    // Emitting it as `this.m()` redispatches virtually to the subclass override,
+                    // producing infinite recursion in the recompiled code. Emit `super.m()` instead.
+                    // Same-class targets (private/this methods) keep the `this.` receiver, and
+                    // CONSTANT_InterfaceMethodref targets (Interface.super.m() default-method calls)
+                    // are excluded because plain `super.` would resolve to the wrong type.
+                    Expression receiver = obj;
+                    if (opcode == 0xB7 && obj instanceof ThisExpression
+                            && currentClassInternalName != null
+                            && !className.equals(currentClassInternalName)
+                            && pool.getTag(index) == ConstantPool.CONSTANT_Methodref) {
+                        receiver = buildSuperReceiver(line);
+                    }
                     Expression invocation = new MethodInvocationExpression(
-                        line, retType, obj, className, methodName, desc, args);
+                        line, retType, receiver, className, methodName, desc, args);
+                    // END_CHANGE: BUG-2026-0081-2
                     if ("V".equals(retDesc)) {
                         statements.add(new ExpressionStatement(invocation));
                     } else {
@@ -2796,13 +2926,56 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
             // wide
             case 0xC4: {
+                // START_CHANGE: BUG-2026-0084-20260610-1 - Decode the wide forms instead of
+                // silently discarding their operands (e.g. `i += 1000` compiles to `wide iinc`
+                // because 1000 exceeds the s1 increment range, and the statement vanished from
+                // the output). Wide iinc shares the BUG-2026-0082 helper; wide loads/stores
+                // (u2 slot index) delegate to the same pushLocal/storeLocal paths the narrow
+                // forms use.
                 int wideOpcode = reader.readUnsignedByte();
-                if (wideOpcode == 0x84) { // wide iinc
-                    reader.readUnsignedShort();
-                    reader.readShort();
-                } else {
-                    reader.readUnsignedShort();
+                switch (wideOpcode) {
+                    case 0x84: { // wide iinc: u2 index, s2 const
+                        int wVarIdx = reader.readUnsignedShort();
+                        int wIncr = reader.readShort();
+                        decodeIinc(wVarIdx, wIncr, stack, statements, localVarNames, line);
+                        break;
+                    }
+                    case 0x15: // wide iload
+                        pushLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, line, PrimitiveType.INT);
+                        break;
+                    case 0x16: // wide lload
+                        pushLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, line, PrimitiveType.LONG);
+                        break;
+                    case 0x17: // wide fload
+                        pushLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, line, PrimitiveType.FLOAT);
+                        break;
+                    case 0x18: // wide dload
+                        pushLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, line, PrimitiveType.DOUBLE);
+                        break;
+                    case 0x19: // wide aload
+                        pushLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, line, ObjectType.OBJECT);
+                        break;
+                    case 0x36: // wide istore
+                        storeLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, statements, line, PrimitiveType.INT);
+                        break;
+                    case 0x37: // wide lstore
+                        storeLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, statements, line, PrimitiveType.LONG);
+                        break;
+                    case 0x38: // wide fstore
+                        storeLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, statements, line, PrimitiveType.FLOAT);
+                        break;
+                    case 0x39: // wide dstore
+                        storeLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, statements, line, PrimitiveType.DOUBLE);
+                        break;
+                    case 0x3A: // wide astore
+                        storeLocal(stack, reader.readUnsignedShort(), localVarNames, localVarDescriptors, statements, line, ObjectType.OBJECT);
+                        break;
+                    case 0xA9: // wide ret (jsr/ret legacy) - keep reader aligned, no statement
+                    default:
+                        reader.readUnsignedShort();
+                        break;
                 }
+                // END_CHANGE: BUG-2026-0084-1
                 break;
             }
 
