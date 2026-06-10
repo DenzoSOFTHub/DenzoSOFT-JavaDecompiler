@@ -2526,7 +2526,10 @@ public class JavaSourceWriter implements Processor {
                     && sVal.indexOf("\n") != sVal.lastIndexOf("\n")
                     && isTextBlockSafe(sVal)) {
             // END_CHANGE: BUG-2026-0023-1
-                printer.printStringConstant("\"\"\"\n" + sVal + "\"\"\"", ownerInternalName);
+                // START_CHANGE: BUG-2026-0088-20260610-1 - Escape trailing spaces/tabs on each line
+                // (\s / \t) so javac does not strip them as incidental whitespace (JLS 3.10.6)
+                printer.printStringConstant("\"\"\"\n" + escapeTextBlockTrailingWhitespace(sVal) + "\"\"\"", ownerInternalName);
+                // END_CHANGE: BUG-2026-0088-1
             } else {
                 printer.printStringConstant("\"" + escapeString(sVal) + "\"", ownerInternalName);
             }
@@ -2832,7 +2835,22 @@ public class JavaSourceWriter implements Processor {
                 printer.printText("(");
                 writeType(printer, castType, ownerInternalName);
                 printer.printText(") ");
-                writeExpression(printer, ce.getExpression(), ownerInternalName);
+                // START_CHANGE: BUG-2026-0093-20260610-1 - A cast binds at unary precedence
+                // (JLS 15.16): parenthesize operands of lower precedence, otherwise
+                // `(U) cmp >= 0 ? a : b` re-parses as `((U) cmp) >= 0 ? a : b`.
+                Expression castOperand = ce.getExpression();
+                boolean operandNeedsParens = castOperand instanceof TernaryExpression
+                        || castOperand instanceof BinaryOperatorExpression
+                        || castOperand instanceof AssignmentExpression
+                        || castOperand instanceof InstanceOfExpression;
+                if (operandNeedsParens) {
+                    printer.printText("(");
+                    writeExpression(printer, castOperand, ownerInternalName);
+                    printer.printText(")");
+                } else {
+                    writeExpression(printer, castOperand, ownerInternalName);
+                }
+                // END_CHANGE: BUG-2026-0093-1
             }
         } else if (expr instanceof InstanceOfExpression) {
             InstanceOfExpression ioe = (InstanceOfExpression) expr;
@@ -3457,6 +3475,35 @@ public class JavaSourceWriter implements Processor {
         return s.indexOf("\"\"\"") < 0;
     }
     // END_CHANGE: BUG-2026-0044-2
+
+    // START_CHANGE: BUG-2026-0088-20260610-2 - Per JLS 3.10.6 javac strips trailing whitespace
+    // on every text-block line (including the closing-delimiter line) as incidental whitespace,
+    // silently changing the string value. Replace each trailing space with the `\s` escape and
+    // each trailing tab with the `\t` escape so the recompiled constant is byte-identical.
+    // Escapes are processed after incidental-whitespace stripping, so they survive verbatim.
+    private static String escapeTextBlockTrailingWhitespace(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        int lineStart = 0;
+        for (int i = 0; i <= s.length(); i++) {
+            if (i == s.length() || s.charAt(i) == '\n') {
+                // Line content is s[lineStart, i). Find where its trailing space/tab run begins.
+                int wsStart = i;
+                while (wsStart > lineStart) {
+                    char w = s.charAt(wsStart - 1);
+                    if (w != ' ' && w != '\t') break;
+                    wsStart--;
+                }
+                sb.append(s, lineStart, wsStart);
+                for (int j = wsStart; j < i; j++) {
+                    sb.append(s.charAt(j) == ' ' ? "\\s" : "\\t");
+                }
+                if (i < s.length()) sb.append('\n');
+                lineStart = i + 1;
+            }
+        }
+        return sb.toString();
+    }
+    // END_CHANGE: BUG-2026-0088-2
 
     @SuppressWarnings("unchecked")
     private void writeAnnotation(Printer printer, AnnotationInfo annotation, String ownerInternalName) {

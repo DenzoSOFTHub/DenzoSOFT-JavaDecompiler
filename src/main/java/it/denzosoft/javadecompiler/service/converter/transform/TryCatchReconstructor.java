@@ -224,7 +224,13 @@ public class TryCatchReconstructor {
                 }
                 // END_CHANGE: ISS-2026-0005-12
 
+                // START_CHANGE: BUG-2026-0091-20260610-1 - Track whether the initial exception
+                // store was removed here, so filterFinallyBody does not strip a SECOND statement
+                // (a real finally statement) under the assumption it is the exception store.
+                int handlerSizeBeforeStoreStrip = handlerBody.size();
                 handlerBody = removeInitialExceptionStore(handlerBody, varName);
+                boolean exceptionStoreRemoved = handlerBody.size() < handlerSizeBeforeStoreStrip;
+                // END_CHANGE: BUG-2026-0091-1
 
                 int handlerLine = findLineForPc(handlerPc, sortedPcs);
                 if (handlerLine < 0) handlerLine = tryStartLine;
@@ -256,7 +262,11 @@ public class TryCatchReconstructor {
                     catchClauses.add(new TryCatchStatement.CatchClause(
                         types, varName, catchBody));
                 } else if (anyUntyped) {
-                    List<Statement> filteredFinally = filterFinallyBody(handlerBody);
+                    // START_CHANGE: BUG-2026-0091-20260610-2 - Tell filterFinallyBody whether the
+                    // exception store has already been stripped from the handler body.
+                    List<Statement> filteredFinally =
+                        filterFinallyBody(handlerBody, exceptionStoreRemoved);
+                    // END_CHANGE: BUG-2026-0091-2
                     if (!filteredFinally.isEmpty()) {
                         finallyBody = new BlockStatement(handlerLine, filteredFinally);
                     }
@@ -266,16 +276,21 @@ public class TryCatchReconstructor {
             if (catchClauses.isEmpty() && finallyBody == null) continue;
 
             if (finallyBody != null && finallyBody instanceof BlockStatement) {
-                int finallySize = ((BlockStatement) finallyBody).getStatements().size();
-                if (finallySize > 0) {
-                    tryBody = removeDuplicatedFinally(tryBody, finallySize);
+                // START_CHANGE: BUG-2026-0091-20260610-3 - Pass the actual finally statements
+                // (not just their count) so dedup only removes a structurally matching tail.
+                // The previous count-based truncation deleted real trailing returns (e.g. the
+                // synchronized desugar, where finally = [__MONITOREXIT__ marker] and the inlined
+                // monitorexit PRECEDES the return).
+                List<Statement> finallyStmts = ((BlockStatement) finallyBody).getStatements();
+                if (!finallyStmts.isEmpty()) {
+                    tryBody = removeDuplicatedFinally(tryBody, finallyStmts);
 
                     List<TryCatchStatement.CatchClause> cleanedClauses =
                         new ArrayList<TryCatchStatement.CatchClause>();
                     for (TryCatchStatement.CatchClause cc : catchClauses) {
                         if (cc.body instanceof BlockStatement) {
                             List<Statement> cleanedBody = removeDuplicatedFinally(
-                                ((BlockStatement) cc.body).getStatements(), finallySize);
+                                ((BlockStatement) cc.body).getStatements(), finallyStmts);
                             cleanedClauses.add(new TryCatchStatement.CatchClause(
                                 cc.exceptionTypes, cc.variableName,
                                 new BlockStatement(cc.body.getLineNumber(), cleanedBody)));
@@ -284,7 +299,21 @@ public class TryCatchReconstructor {
                         }
                     }
                     catchClauses = cleanedClauses;
+
+                    // javac also inlines the finally body on the normal exit path, i.e. at the
+                    // START of the code following the try region. Strip a structurally matching
+                    // leading duplicate from afterTry. Then, if the finally body itself ends in
+                    // a Return/Throw, the whole try statement completes abruptly and anything
+                    // left in afterTry is unreachable (javac rejects it) - drop it.
+                    afterTry = stripLeadingFinallyDuplicate(afterTry, finallyStmts);
+                    Statement lastFinallyStmt = finallyStmts.get(finallyStmts.size() - 1);
+                    if ((lastFinallyStmt instanceof ReturnStatement
+                            || lastFinallyStmt instanceof ThrowStatement)
+                            && !afterTry.isEmpty()) {
+                        afterTry = new ArrayList<Statement>();
+                    }
                 }
+                // END_CHANGE: BUG-2026-0091-3
             }
 
             // Validate try-catch quality: if the try body is empty or only contains
@@ -788,21 +817,32 @@ public class TryCatchReconstructor {
     // END_CHANGE: ISS-2026-0005-13
 
     public static List<Statement> filterFinallyBody(List<Statement> handlerBody) {
+        return filterFinallyBody(handlerBody, false);
+    }
+
+    // START_CHANGE: BUG-2026-0091-20260610-4 - Do not strip the first handler statement as an
+    // exception store when removeInitialExceptionStore already removed it; otherwise a real
+    // finally statement (declaration/assignment) is silently deleted.
+    public static List<Statement> filterFinallyBody(List<Statement> handlerBody,
+                                                     boolean exceptionStoreAlreadyRemoved) {
         if (handlerBody.isEmpty()) return handlerBody;
 
         List<Statement> filtered = new ArrayList<Statement>();
         int startIdx = 0;
         int endIdx = handlerBody.size();
 
-        Statement first = handlerBody.get(0);
-        if (first instanceof VariableDeclarationStatement) {
-            startIdx = 1;
-        } else if (first instanceof ExpressionStatement) {
-            Expression expr = ((ExpressionStatement) first).getExpression();
-            if (expr instanceof AssignmentExpression) {
+        if (!exceptionStoreAlreadyRemoved) {
+            Statement first = handlerBody.get(0);
+            if (first instanceof VariableDeclarationStatement) {
                 startIdx = 1;
+            } else if (first instanceof ExpressionStatement) {
+                Expression expr = ((ExpressionStatement) first).getExpression();
+                if (expr instanceof AssignmentExpression) {
+                    startIdx = 1;
+                }
             }
         }
+        // END_CHANGE: BUG-2026-0091-4
 
         if (endIdx > startIdx) {
             Statement last = handlerBody.get(endIdx - 1);
@@ -868,32 +908,160 @@ public class TryCatchReconstructor {
         return false;
     }
 
-    // START_CHANGE: BUG-2026-0021-20260324-1 - Only remove duplicated finally if last statements match
-    public static List<Statement> removeDuplicatedFinally(List<Statement> catchBody, int finallySize) {
+    // START_CHANGE: BUG-2026-0091-20260610-5 - Structural finally dedup (supersedes the
+    // count-based truncation of BUG-2026-0021-1). The old code removed the LAST finallySize
+    // statements by COUNT with a type-only whitelist that included ReturnStatement, so for the
+    // synchronized desugar (finally = [__MONITOREXIT__ marker], inlined monitorexit PRECEDING
+    // ireturn) it deleted the trailing `return` instead of the duplicated EXIT marker.
+    // Now statements are removed ONLY when they structurally match the actual finally body:
+    //   1. the trailing N statements match the finally statements -> remove them;
+    //   2. otherwise, if the body ends in a Return/Throw, the N statements immediately BEFORE
+    //      that terminator are compared (javac inlines finally before each exit point) and
+    //      removed on match, keeping the terminator;
+    //   3. fallback: if no structural match, the old count-based truncation is kept ONLY for
+    //      tails made exclusively of plain ExpressionStatements (ReturnStatement is no longer
+    //      whitelisted, so a trailing `return` can never be deleted by count);
+    //   4. otherwise remove nothing.
+    public static List<Statement> removeDuplicatedFinally(List<Statement> catchBody,
+                                                           List<Statement> finallyStmts) {
+        int finallySize = (finallyStmts == null) ? 0 : finallyStmts.size();
         if (finallySize <= 0 || catchBody.size() <= finallySize) return catchBody;
 
-        // Check if the last N statements are likely duplicated finally code
-        // by verifying they are ExpressionStatements (typical for inline finally)
-        int start = catchBody.size() - finallySize;
-        boolean allLikelyFinally = true;
-        for (int i = start; i < catchBody.size(); i++) {
-            Statement s = catchBody.get(i);
-            if (s instanceof ExpressionStatement || s instanceof ReturnStatement) {
-                continue; // typical finally statement
+        // Case 1: the trailing N statements structurally match the finally body
+        int tailStart = catchBody.size() - finallySize;
+        if (statementsMatchFinally(catchBody, tailStart, finallyStmts)) {
+            List<Statement> filtered = new ArrayList<Statement>();
+            for (int i = 0; i < tailStart; i++) {
+                filtered.add(catchBody.get(i));
             }
-            allLikelyFinally = false;
-            break;
+            return filtered;
         }
-        if (!allLikelyFinally) return catchBody;
 
-        List<Statement> filtered = new ArrayList<Statement>();
-        int keepCount = catchBody.size() - finallySize;
-        for (int i = 0; i < keepCount; i++) {
-            filtered.add(catchBody.get(i));
+        // Case 2: the body ends in a Return/Throw and the N statements immediately before
+        // it match the finally body - remove those, keep the terminator
+        Statement last = catchBody.get(catchBody.size() - 1);
+        if (last instanceof ReturnStatement || last instanceof ThrowStatement) {
+            int preStart = catchBody.size() - 1 - finallySize;
+            if (preStart >= 0 && statementsMatchFinally(catchBody, preStart, finallyStmts)) {
+                List<Statement> filtered = new ArrayList<Statement>();
+                for (int i = 0; i < preStart; i++) {
+                    filtered.add(catchBody.get(i));
+                }
+                filtered.add(last);
+                return filtered;
+            }
         }
-        return filtered;
+
+        // Case 3 (fallback, old count-based behavior minus the ReturnStatement whitelist):
+        // remove the trailing N statements when they are ALL plain ExpressionStatements.
+        // Inlined finally copies often render differently from the decoded handler body
+        // (e.g. different synthetic variable names), so the structural match can miss them;
+        // an expression-only tail can never swallow a trailing `return`/`throw`.
+        boolean allPlainExpressions = true;
+        for (int i = tailStart; i < catchBody.size(); i++) {
+            if (!(catchBody.get(i) instanceof ExpressionStatement)) {
+                allPlainExpressions = false;
+                break;
+            }
+        }
+        if (allPlainExpressions) {
+            List<Statement> filtered = new ArrayList<Statement>();
+            for (int i = 0; i < tailStart; i++) {
+                filtered.add(catchBody.get(i));
+            }
+            return filtered;
+        }
+
+        return catchBody; // conservative: no match, remove nothing
     }
-    // END_CHANGE: BUG-2026-0021-1
+
+    /**
+     * Strip a duplicated finally body inlined by javac at the START of the code that
+     * follows the try region (the normal completion path).
+     */
+    private static List<Statement> stripLeadingFinallyDuplicate(List<Statement> afterTry,
+                                                                 List<Statement> finallyStmts) {
+        int finallySize = (finallyStmts == null) ? 0 : finallyStmts.size();
+        if (finallySize <= 0 || afterTry.size() < finallySize) return afterTry;
+        if (!statementsMatchFinally(afterTry, 0, finallyStmts)) return afterTry;
+        List<Statement> result = new ArrayList<Statement>();
+        for (int i = finallySize; i < afterTry.size(); i++) {
+            result.add(afterTry.get(i));
+        }
+        return result;
+    }
+
+    private static boolean statementsMatchFinally(List<Statement> body, int offset,
+                                                   List<Statement> finallyStmts) {
+        for (int i = 0; i < finallyStmts.size(); i++) {
+            if (!sameStatementShape(body.get(offset + i), finallyStmts.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Two statements have the same shape when they are of the same class and their
+     * line-independent signatures (expression/initializer rendering) are equal.
+     * Compound statements (if/loops/blocks) are never considered equal: their content
+     * cannot be compared reliably, so dedup conservatively keeps them.
+     */
+    private static boolean sameStatementShape(Statement a, Statement b) {
+        if (a == null || b == null) return false;
+        if (!a.getClass().equals(b.getClass())) return false;
+        String sigA = statementSignature(a);
+        String sigB = statementSignature(b);
+        if (sigA == null || sigB == null) return false;
+        return sigA.equals(sigB);
+    }
+
+    /**
+     * Line-independent signature of a simple statement, or null for statement types
+     * that cannot be compared reliably.
+     */
+    private static String statementSignature(Statement s) {
+        if (s instanceof ExpressionStatement) {
+            return "expr:" + expressionSignature(((ExpressionStatement) s).getExpression());
+        }
+        if (s instanceof ReturnStatement) {
+            return "return:" + expressionSignature(((ReturnStatement) s).getExpression());
+        }
+        if (s instanceof ThrowStatement) {
+            return "throw:" + expressionSignature(((ThrowStatement) s).getExpression());
+        }
+        if (s instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) s;
+            return "decl:" + vds.getName() + "="
+                + expressionSignature(vds.getInitializer());
+        }
+        return null; // compound/unknown statement: never matches
+    }
+
+    /**
+     * Render an expression for structural comparison. Method invocations include their
+     * arguments (the plain toString elides them as "(...)").
+     */
+    private static String expressionSignature(Expression e) {
+        if (e == null) return "null";
+        if (e instanceof MethodInvocationExpression) {
+            MethodInvocationExpression mie = (MethodInvocationExpression) e;
+            StringBuilder sb = new StringBuilder();
+            sb.append(expressionSignature(mie.getObject()));
+            sb.append('.').append(mie.getMethodName()).append('(');
+            List<Expression> args = mie.getArguments();
+            if (args != null) {
+                for (int i = 0; i < args.size(); i++) {
+                    if (i > 0) sb.append(',');
+                    sb.append(expressionSignature(args.get(i)));
+                }
+            }
+            sb.append(')');
+            return sb.toString();
+        }
+        return String.valueOf(e);
+    }
+    // END_CHANGE: BUG-2026-0091-5
 
     // START_CHANGE: LIM-0008-20260326-2 - Helpers for try-with-resources resource extraction
 
