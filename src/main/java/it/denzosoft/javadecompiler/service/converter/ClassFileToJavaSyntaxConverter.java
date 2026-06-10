@@ -1600,6 +1600,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 }
                 promoteUndeclaredAssignments(result, paramNames077);
                 // END_CHANGE: BUG-2026-0077-1
+                // START_CHANGE: BUG-2026-0069-20260610-22 - Re-run the for-each signature
+                // back-prop now that promoted declarations exist (late/reused slots were bare
+                // assignments during ForEachDetector, so the first pass had no declaration target).
+                ForEachDetector.backPropagateSignatures(result);
+                // END_CHANGE: BUG-2026-0069-22
                 // Post-process: simplify boolean comparisons (x != 0 → x, x == 0 → !x)
                 String retDesc = TypeNameUtil.parseMethodReturnDescriptor(method.getDescriptor());
                 boolean returnIsBoolean = "Z".equals(retDesc);

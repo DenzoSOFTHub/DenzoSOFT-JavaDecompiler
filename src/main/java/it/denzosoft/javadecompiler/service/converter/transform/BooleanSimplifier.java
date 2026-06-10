@@ -271,6 +271,17 @@ public final class BooleanSimplifier {
                         vds.getName(), boolVal, vds.isFinal(), vds.isVar());
                 }
             }
+            // START_CHANGE: BUG-2026-0069-20260610-18 - A ternary INITIALIZER of any declaration
+            // never went through condition simplification (`String r = boolParam != 0 ? "yes" : "no"`
+            // failed to recompile). Value-context recursion keeps the arm values intact.
+            if (vds.hasInitializer() && vds.getInitializer() instanceof TernaryExpression) {
+                Expression simp = simplifyTernaryValueArm(vds.getInitializer());
+                if (simp != vds.getInitializer()) {
+                    return new VariableDeclarationStatement(vds.getLineNumber(), vds.getType(),
+                        vds.getName(), simp, vds.isFinal(), vds.isVar());
+                }
+            }
+            // END_CHANGE: BUG-2026-0069-18
         }
         return stmt;
     }

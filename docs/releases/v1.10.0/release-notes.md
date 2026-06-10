@@ -72,6 +72,15 @@ bytecode-proven via javap.
 - **IMP-2026-0001** — inner classes emitted interleaved at their original line positions
   (LineNumberTable anchors; byte-identical fallback without line info).
 
+### JD-Core official comparison (user-authorized, jd-cli 1.3.0-beta-1)
+
+- Matrix: ours **57/57** vs JD-Core **44/57** (6 classes with no output at all: records, sealed,
+  pattern switch, unnamed; 7 recompile failures incl. TWR and enum-switch).
+- Corpus: ours **7** total errors vs JD-Core **39** + 4 classes with no output.
+- Per-class: JD-Core produces a better result on **zero** classes — everything JD-Core
+  decompiles, this decompiler decompiles at least as well, plus Java 14–25 constructs
+  JD-Core cannot handle.
+
 ## Still open
 
 (none — all tracked bugs and improvements closed)
