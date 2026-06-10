@@ -2,6 +2,32 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.9.0] - 2026-06-10
+
+### Added
+- **SWITCH-form record patterns** (BUG-2026-0079, IMP-2026-0063) — `switch (o) { case Line(Point(int x, int y), ...) -> ... }`
+  now reconstructs on the JD-Core pipeline (return tail-duplication + dead-guard elimination + typeSwitch arm
+  folder), with selective activation that keeps the legacy path byte-identical for non-record-switch methods.
+- **Java 1.0–25 coverage assurance** — `docs/reports/report-coverage-assurance.md` + a standing
+  `src/test/resources/construct-matrix/` suite. Breadth test on 1,674 real JDK 25 classes: 0 crashes, 93.3%
+  marker-clean.
+
+### Fixed
+- **Post-Java-8 constructs reconstructed on the default path** (BUG-2026-0057 … 0078): records (compact/validating
+  canonical constructors), pattern `instanceof` (binding, `&&`-tail, record deconstruction flat/nested/generic),
+  switch expressions, pattern switch (sealed, `when` guards, `case null`), modern try-with-resources, interface
+  `default`, `sealed`, enum constant bodies, lambdas/method references.
+- **`StructuredFlowBuilder.canFormTernary`** no longer mutates the shared `visited` set (was silently truncating
+  if-cascades and loop bodies) — recovered ~6,300 lines on real code.
+- **Construct-matrix gaps** (BUG-2026-0080): annotations (`@interface`, nested annotation types),
+  multidimensional arrays, array-foreach element types, `Double.NaN`/`Infinity` literals, record canonical-ctor
+  access, for-loop variable scope, catch-variable rename recursion, switch-case variable hoisting, boolean
+  comparison simplification in call arguments.
+
+### Quality
+- Java 8→21 construct corpus: 0/13 → 5/13 round-trip; construct matrix 35/55; DecompilerTest 32/33; regression
+  (decompiler's own 160 classes) 0 crashes.
+
 ## [1.8.0] - 2026-04-20
 
 ### Added
