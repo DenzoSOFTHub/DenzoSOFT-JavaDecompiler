@@ -71,6 +71,10 @@ public class DecompilerTest {
         testInstanceofAmpersand();  // BUG-2026-0067: `o instanceof X v && v.m()` binding
         testUndeclaredAssignPromotion(); // BUG-2026-0077: reused slot gets a declaration
         testWhileTrueBreak();       // BUG-2026-0078: break out of while(true)
+        // START_CHANGE: BUG-2026-0097-20260610-1 - Inner classes: local class emission, anonymous
+        // capture substitution, member-inner synthetic outer parameter stripping.
+        testInnerClassCaptures();   // BUG-2026-0097: local/anon/member-inner round-trip
+        // END_CHANGE: BUG-2026-0097-1
 
         // Summary
         System.out.println("\n=====================================");
@@ -577,6 +581,41 @@ public class DecompilerTest {
     }
 
     // Helper: assert all of `mustContain` present AND none of `mustNotContain` present.
+    // START_CHANGE: BUG-2026-0097-20260610-2 - Inner-class capture round-trip: (1) method-local
+    // classes are emitted (as nested `_1Local` with their capture fields); (2) the anonymous
+    // class's captured local recovers its source name from the val$ field, so the inlined body
+    // resolves; (3) the member-inner constructor drops the synthetic outer-instance parameter,
+    // the Objects.requireNonNull(outer) preamble, and the leading `this` call-site argument.
+    private static void testInnerClassCaptures() {
+        runTestNested("InnerCap",
+            "public class InnerCap {\n" +
+            "    private int outerField = 42;\n" +
+            "    class Member {\n" +
+            "        int offset;\n" +
+            "        Member(int offset) { this.offset = offset; }\n" +
+            "        int compute() { return outerField + offset; }\n" +
+            "    }\n" +
+            "    Member makeMember(int o) { return new Member(o); }\n" +
+            "    int useLocal(final int multiplier) {\n" +
+            "        class Local { int run(int x) { return x * multiplier + outerField; } }\n" +
+            "        Local l = new Local();\n" +
+            "        return l.run(5);\n" +
+            "    }\n" +
+            "    Runnable makeAnon(final int captured) {\n" +
+            "        return new Runnable() { public void run() { System.out.println(captured + outerField); } };\n" +
+            "    }\n" +
+            "}",
+            new String[]{
+                "Member(int arg1)",            // ctor: synthetic outer param stripped
+                "new InnerCap.Member(arg0)",   // call site: leading `this` argument dropped
+                "class _1Local",               // local class emitted with sanitized name
+                "final int multiplier",        // capture field declared (val$ prefix stripped)
+                "makeAnon(int captured)",      // enclosing param renamed to the captured name
+                "captured + "                  // inlined anonymous body resolves the capture
+            });
+    }
+    // END_CHANGE: BUG-2026-0097-2
+
     private static void runTestFull(String className, String sourceCode,
                                     String[] mustContain, String[] mustNotContain) {
         total++;

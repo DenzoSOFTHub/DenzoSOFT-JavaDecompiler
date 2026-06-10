@@ -27,6 +27,9 @@ import it.denzosoft.javadecompiler.DecompilerLimits;
 import it.denzosoft.javadecompiler.service.converter.cfg.BasicBlock;
 import it.denzosoft.javadecompiler.service.converter.cfg.ControlFlowGraph;
 import it.denzosoft.javadecompiler.service.converter.cfg.StructuredFlowBuilder;
+// START_CHANGE: BUG-2026-0097-20260610-6 - Walker/rewriter used to restore captured-variable names
+import it.denzosoft.javadecompiler.service.converter.transform.AstLocalRewriter;
+// END_CHANGE: BUG-2026-0097-6
 import it.denzosoft.javadecompiler.service.converter.transform.BooleanSimplifier;
 import it.denzosoft.javadecompiler.service.converter.transform.CompoundAssignmentSimplifier;
 import it.denzosoft.javadecompiler.service.converter.transform.ForEachDetector;
@@ -71,9 +74,27 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         && ic.innerClassName != null && ic.innerClassName.startsWith(thisClassName + "$")) {
                         loadAndAddInnerClass(loader, ic, result);
                     }
+                    // START_CHANGE: BUG-2026-0097-20260610-1 - Load LOCAL classes (declared inside a
+                    // method): their InnerClasses entry has outer_class_info == null but a non-null
+                    // inner_name (javap: `#51= #18; // Local=class C_InnerClasses$1Local`). Previously
+                    // they matched neither branch above so the class was never emitted, while the use
+                    // site still referenced `C_InnerClasses._1Local` -> 'cannot find symbol'.
+                    if (ic.outerClassName == null && ic.innerName != null
+                        && ic.innerClassName != null && ic.innerClassName.startsWith(thisClassName + "$")) {
+                        loadAndAddInnerClass(loader, ic, result);
+                    }
+                    // END_CHANGE: BUG-2026-0097-1
                 }
             }
         }
+
+        // START_CHANGE: BUG-2026-0097-20260610-2 - Restore original capture names: rename
+        // synthesized enclosing locals (argN/varN) passed as captured constructor arguments
+        // to anonymous classes back to the source name preserved in the val$ capture field,
+        // so the inlined body's reference resolves to the right variable (and is not
+        // shadowed by the inlined method's own synthesized parameter names).
+        reconcileAnonymousCaptureNames(result);
+        // END_CHANGE: BUG-2026-0097-2
 
         message.setHeader("javaSyntaxResult", result);
         message.setBody(result);
@@ -91,6 +112,13 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     JavaSyntaxResult innerResult = innerConverter.convert(innerCf);
                     innerResult.setInnerClass(true);
                     innerResult.setInnerClassAccessFlags(ic.accessFlags);
+                    // START_CHANGE: BUG-2026-0097-20260610-3 - Mark method-local classes (no
+                    // outer_class_info but named) so the writer can emit them with a valid
+                    // identifier and the correct static-ness.
+                    if (ic.outerClassName == null && ic.innerName != null) {
+                        innerResult.setLocalClass(true);
+                    }
+                    // END_CHANGE: BUG-2026-0097-3
 
                     // START_CHANGE: BUG-2026-0059-20260421-1 - Recurse into the inner class's own
                     // InnerClasses attribute. Previously `convert()` only converted the top-level
@@ -106,7 +134,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                             } else if (sub.outerClassName == null && sub.innerName == null
                                     && sub.innerClassName != null && sub.innerClassName.startsWith(innerThisName + "$")) {
                                 innerConverter.loadAndAddInnerClass(loader, sub, innerResult);
+                            // START_CHANGE: BUG-2026-0097-20260610-4 - Also recurse into LOCAL classes
+                            // declared inside this nested class's methods (mirrors the new branch in
+                            // process(); BUG-2026-0059 recursion previously skipped them too).
+                            } else if (sub.outerClassName == null && sub.innerName != null
+                                    && sub.innerClassName != null && sub.innerClassName.startsWith(innerThisName + "$")) {
+                                innerConverter.loadAndAddInnerClass(loader, sub, innerResult);
                             }
+                            // END_CHANGE: BUG-2026-0097-4
                         }
                     }
                     // END_CHANGE: BUG-2026-0059-1
@@ -126,6 +161,162 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             }
         }
     }
+
+    // START_CHANGE: BUG-2026-0097-20260610-7 - Capture-name reconciliation. When a class is
+    // compiled without -g, enclosing locals get synthesized names (argN/varN) while the original
+    // source name of each captured variable survives in the anonymous class's val$ field. The
+    // writer renders `getfield val$x` as `x`, so the inlined body referenced a name that no
+    // longer exists ("cannot find symbol: n/captured/base"). This pass renames the enclosing
+    // local back to the val$ source name when that is unambiguous and collision-free.
+    private void reconcileAnonymousCaptureNames(JavaSyntaxResult root) {
+        Map<String, JavaSyntaxResult> anonIndex = new HashMap<String, JavaSyntaxResult>();
+        indexAnonymousResults(root, anonIndex);
+        if (anonIndex.isEmpty()) return;
+        reconcileCapturesIn(root, anonIndex);
+    }
+
+    private void indexAnonymousResults(JavaSyntaxResult result, Map<String, JavaSyntaxResult> index) {
+        List<JavaSyntaxResult> inners = result.getInnerClassResults();
+        if (inners == null) return;
+        for (JavaSyntaxResult inner : inners) {
+            String name = inner.getInternalName();
+            if (name != null && isAnonymousSimpleName(TypeNameUtil.simpleNameFromInternal(name))) {
+                index.put(name, inner);
+            }
+            indexAnonymousResults(inner, index);
+        }
+    }
+
+    private static boolean isAnonymousSimpleName(String simple) {
+        if (simple == null || simple.length() == 0) return false;
+        for (int i = 0; i < simple.length(); i++) {
+            if (!Character.isDigit(simple.charAt(i))) return false;
+        }
+        return true;
+    }
+
+    private void reconcileCapturesIn(JavaSyntaxResult result, Map<String, JavaSyntaxResult> anonIndex) {
+        if (result.getMethods() != null) {
+            for (JavaSyntaxResult.MethodDeclaration method : result.getMethods()) {
+                if (method.body != null && !method.body.isEmpty()) {
+                    reconcileMethodCaptures(method, anonIndex);
+                }
+            }
+        }
+        List<JavaSyntaxResult> inners = result.getInnerClassResults();
+        if (inners != null) {
+            for (JavaSyntaxResult inner : inners) {
+                reconcileCapturesIn(inner, anonIndex);
+            }
+        }
+    }
+
+    private void reconcileMethodCaptures(JavaSyntaxResult.MethodDeclaration method,
+                                         Map<String, JavaSyntaxResult> anonIndex) {
+        final Set<String> usedNames = new HashSet<String>(method.parameterNames);
+        final List<NewExpression> sites = new ArrayList<NewExpression>();
+        AstLocalRewriter finder = new AstLocalRewriter() {
+            protected Expression onLocal(LocalVariableExpression lv) {
+                usedNames.add(lv.getName());
+                return lv;
+            }
+            protected Expression rw(Expression e) {
+                if (e instanceof NewExpression) sites.add((NewExpression) e);
+                return super.rw(e);
+            }
+            public Statement rewrite(Statement s) {
+                if (s instanceof VariableDeclarationStatement) {
+                    usedNames.add(((VariableDeclarationStatement) s).getName());
+                } else if (s instanceof ForEachStatement) {
+                    usedNames.add(((ForEachStatement) s).getVariableName());
+                }
+                return super.rewrite(s);
+            }
+        };
+        for (Statement s : method.body) finder.rewrite(s);
+        if (sites.isEmpty()) return;
+
+        final Map<String, String> renames = new HashMap<String, String>();
+        for (NewExpression site : sites) {
+            JavaSyntaxResult anon = anonIndex.get(site.getInternalTypeName());
+            if (anon == null) continue;
+            JavaSyntaxResult.MethodDeclaration init = findFirstConstructor(anon);
+            if (init == null || init.body == null) continue;
+            List<Expression> args = site.getArguments();
+            if (args == null || args.isEmpty()) continue;
+            for (Statement stmt : init.body) {
+                // Match the capture store `this.val$x = <ctor param>` in the anon <init>.
+                if (!(stmt instanceof ExpressionStatement)) continue;
+                Expression e = ((ExpressionStatement) stmt).getExpression();
+                if (!(e instanceof AssignmentExpression)) continue;
+                AssignmentExpression ae = (AssignmentExpression) e;
+                if (!(ae.getLeft() instanceof FieldAccessExpression)) continue;
+                String fieldName = ((FieldAccessExpression) ae.getLeft()).getName();
+                if (fieldName == null || !fieldName.startsWith("val$") || fieldName.length() <= 4) continue;
+                if (!(ae.getRight() instanceof LocalVariableExpression)) continue;
+                int paramIndex = init.parameterNames.indexOf(((LocalVariableExpression) ae.getRight()).getName());
+                if (paramIndex < 0 || paramIndex >= args.size()) continue;
+                if (!(args.get(paramIndex) instanceof LocalVariableExpression)) continue;
+                String oldName = ((LocalVariableExpression) args.get(paramIndex)).getName();
+                String sourceName = fieldName.substring(4);
+                if (oldName == null || oldName.equals(sourceName)) continue;
+                if (!isSynthesizedLocalName(oldName)) continue;
+                if (renames.containsKey(oldName)) continue; // first decision wins
+                if (usedNames.contains(sourceName)) continue; // collision: writer map handles it
+                renames.put(oldName, sourceName);
+                usedNames.add(sourceName);
+            }
+        }
+        if (renames.isEmpty()) return;
+
+        AstLocalRewriter renamer = new AstLocalRewriter() {
+            protected Expression onLocal(LocalVariableExpression lv) {
+                String renamed = renames.get(lv.getName());
+                if (renamed == null) return lv;
+                return new LocalVariableExpression(lv.getLineNumber(), lv.getType(), renamed, lv.getIndex());
+            }
+            public Statement rewrite(Statement s) {
+                Statement r = super.rewrite(s);
+                if (r instanceof VariableDeclarationStatement) {
+                    VariableDeclarationStatement v = (VariableDeclarationStatement) r;
+                    String renamed = renames.get(v.getName());
+                    if (renamed != null) {
+                        VariableDeclarationStatement nv = new VariableDeclarationStatement(
+                            v.getLineNumber(), v.getType(), renamed,
+                            v.hasInitializer() ? v.getInitializer() : null, v.isFinal(), v.isVar());
+                        if (v.getGenericSignature() != null) nv.setGenericSignature(v.getGenericSignature());
+                        return nv;
+                    }
+                }
+                return r;
+            }
+        };
+        for (int i = 0; i < method.body.size(); i++) {
+            method.body.set(i, renamer.rewrite(method.body.get(i)));
+        }
+        for (int i = 0; i < method.parameterNames.size(); i++) {
+            String renamed = renames.get(method.parameterNames.get(i));
+            if (renamed != null) method.parameterNames.set(i, renamed);
+        }
+    }
+
+    private static JavaSyntaxResult.MethodDeclaration findFirstConstructor(JavaSyntaxResult result) {
+        if (result.getMethods() == null) return null;
+        for (JavaSyntaxResult.MethodDeclaration m : result.getMethods()) {
+            if (m.isConstructor()) return m;
+        }
+        return null;
+    }
+
+    private static boolean isSynthesizedLocalName(String name) {
+        if (name == null || name.length() < 4) return false;
+        if (!name.startsWith("arg") && !name.startsWith("var")) return false;
+        for (int i = 3; i < name.length(); i++) {
+            if (!Character.isDigit(name.charAt(i))) return false;
+        }
+        return true;
+    }
+    // END_CHANGE: BUG-2026-0097-7
 
     public JavaSyntaxResult convert(ClassFile classFile) {
         // START_CHANGE: ISS-2026-0010-20260323-2 - Store current class name for this() vs super()
@@ -316,7 +507,24 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
         // Fields
         for (FieldInfo field : classFile.getFields()) {
-            if (field.isSynthetic()) continue;
+            // START_CHANGE: BUG-2026-0097-20260610-5 - Synthetic fields: record the this$N
+            // outer-instance field (drives outer-parameter stripping in the writer) and KEEP
+            // val$ capture fields, renamed without the prefix, so emitted local classes
+            // declare the captured values their bodies reference (the writer renders
+            // `val$x` reads as `x`). Other synthetic fields stay suppressed.
+            if (field.isSynthetic()) {
+                String synthName = field.getName();
+                if (synthName != null && synthName.startsWith("this$")) {
+                    result.setHasOuterThisField(true);
+                } else if (synthName != null && synthName.startsWith("val$") && synthName.length() > 4) {
+                    JavaSyntaxResult.FieldDeclaration cap = convertField(field, classFile);
+                    result.addField(new JavaSyntaxResult.FieldDeclaration(
+                        cap.accessFlags, synthName.substring(4), cap.descriptor,
+                        cap.type, cap.initialValue, cap.signature, cap.annotations));
+                }
+                continue;
+            }
+            // END_CHANGE: BUG-2026-0097-5
             result.addField(convertField(field, classFile));
         }
 
@@ -2220,13 +2428,37 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             case 0x57: { // pop - discard top of stack
                 if (!stack.isEmpty()) {
                     Expression popped = stack.pop();
+                    // START_CHANGE: BUG-2026-0098-20260610-1 - javac compiles a BOUND method
+                    // reference (`receiver::method`) with an implicit receiver null check:
+                    // `getstatic/aload receiver; dup; invokestatic Objects.requireNonNull; pop`.
+                    // Materializing that popped call leaked a spurious
+                    // `Objects.requireNonNull(receiver);` statement before the method reference.
+                    // Skip it ONLY when it is exactly
+                    // java/util/Objects.requireNonNull:(Ljava/lang/Object;)Ljava/lang/Object;
+                    // with one argument REFERENCE-IDENTICAL to stack.peek() — the dup twin
+                    // (dup pushes the same Expression object). Identity + exact owner/descriptor
+                    // preserves user-written requireNonNull calls, which never leave their
+                    // argument aliased on the stack.
+                    boolean syntheticNullCheck = false;
+                    if (popped instanceof StaticMethodInvocationExpression && !stack.isEmpty()) {
+                        StaticMethodInvocationExpression rnn = (StaticMethodInvocationExpression) popped;
+                        if ("java/util/Objects".equals(rnn.getOwnerInternalName())
+                                && "requireNonNull".equals(rnn.getMethodName())
+                                && "(Ljava/lang/Object;)Ljava/lang/Object;".equals(rnn.getDescriptor())
+                                && rnn.getArguments() != null && rnn.getArguments().size() == 1
+                                && stack.peek() == rnn.getArguments().get(0)) {
+                            syntheticNullCheck = true;
+                        }
+                    }
                     // If the popped expression is a method call with side effects, emit it as a statement
-                    if (popped instanceof MethodInvocationExpression
+                    if (!syntheticNullCheck
+                        && (popped instanceof MethodInvocationExpression
                         || popped instanceof StaticMethodInvocationExpression
                         || popped instanceof NewExpression
-                        || popped instanceof AssignmentExpression) {
+                        || popped instanceof AssignmentExpression)) {
                         statements.add(new ExpressionStatement(popped));
                     }
+                    // END_CHANGE: BUG-2026-0098-1
                 }
                 break;
             }
@@ -2938,7 +3170,24 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                                             }
                                         }
                                         Statement body = new BlockStatement(line, lambdaBodyFinal);
-                                        Expression lambda = new LambdaExpression(line, retType, lambdaParamNames, lambdaParamTypes, body);
+                                        // START_CHANGE: BUG-2026-0069-20260610-9 - Erasure-generics
+                                        // Stage C: read the bootstrap's samMethodType (args[0]) and
+                                        // instantiatedMethodType (args[2]) and unify the SPECIALIZED
+                                        // types against the functional interface's SAM shape (built-in
+                                        // java.util.function table, or a non-JDK interface's class
+                                        // Signature when loadable). The parameterized signature rides
+                                        // on the LambdaExpression so storeLocal can type the
+                                        // declaration (`Function<Integer, Integer> f = n -> ...`);
+                                        // lambda parameters stay inferred — explicitly typing them
+                                        // against a raw target type does not compile.
+                                        LambdaExpression lambda = new LambdaExpression(line, retType, lambdaParamNames, lambdaParamTypes, body);
+                                        if ("java/lang/invoke/LambdaMetafactory".equals(bsmOwner)) {
+                                            String ifaceSig = inferLambdaInterfaceSignature(bsm, retDesc, methodName, pool);
+                                            if (ifaceSig != null) {
+                                                lambda.setInterfaceGenericSignature(ifaceSig);
+                                            }
+                                        }
+                                        // END_CHANGE: BUG-2026-0069-9
                                         stack.push(lambda);
                                         break;
                                     }
@@ -2964,10 +3213,22 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                                         if ((refKind == 5 || refKind == 7 || refKind == 9) && args.size() > 0) {
                                             boundReceiver = args.get(0);
                                         }
-                                        Expression methodRef = new MethodReferenceExpression(
+                                        MethodReferenceExpression methodRef = new MethodReferenceExpression(
                                             line, retType, boundReceiver,
                                             boundReceiver != null ? "" : ownerName, refMethodName, implDesc);
                                         // END_CHANGE: BUG-2026-0074-1
+                                        // START_CHANGE: BUG-2026-0069-20260610-15 - Erasure-generics
+                                        // Stage C: same instantiatedMethodType unification as for
+                                        // lambdas. A method reference against a RAW target often
+                                        // does not even compile (`Consumer c = list::add`), so the
+                                        // parameterized signature must reach the declaration.
+                                        if ("java/lang/invoke/LambdaMetafactory".equals(bsmOwner)) {
+                                            String mrIfaceSig = inferLambdaInterfaceSignature(bsm, retDesc, methodName, pool);
+                                            if (mrIfaceSig != null) {
+                                                methodRef.setInterfaceGenericSignature(mrIfaceSig);
+                                            }
+                                        }
+                                        // END_CHANGE: BUG-2026-0069-15
                                         stack.push(methodRef);
                                         break;
                                     }
@@ -3392,6 +3653,26 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 if (factorySig != null) vdsNew.setGenericSignature(factorySig);
             }
             // END_CHANGE: BUG-2026-0069-3
+            // START_CHANGE: BUG-2026-0069-20260610-10 - Erasure-generics Stage C: a local without
+            // LVTT info initialized with a decoded lambda (or method reference) gets the
+            // parameterized declaration unified from the indy bootstrap's instantiatedMethodType
+            // (carried on the LambdaExpression/MethodReferenceExpression). Only when the declared
+            // type IS the erased interface — the signature must describe the type actually being
+            // declared.
+            if (vdsNew.getGenericSignature() == null
+                    && type instanceof ObjectType && type.getDimension() == 0) {
+                String lambdaSig = null;
+                if (value instanceof LambdaExpression) {
+                    lambdaSig = ((LambdaExpression) value).getInterfaceGenericSignature();
+                } else if (value instanceof MethodReferenceExpression) {
+                    lambdaSig = ((MethodReferenceExpression) value).getInterfaceGenericSignature();
+                }
+                if (lambdaSig != null
+                        && lambdaSig.startsWith("L" + ((ObjectType) type).getInternalName() + "<")) {
+                    vdsNew.setGenericSignature(lambdaSig);
+                }
+            }
+            // END_CHANGE: BUG-2026-0069-10
             statements.add(vdsNew);
         } else {
             Expression var = new LocalVariableExpression(line, type, name, index);
@@ -3515,6 +3796,282 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         return "L" + internal + ";";
     }
     // END_CHANGE: BUG-2026-0069-4
+
+    // START_CHANGE: BUG-2026-0069-20260610-11 - Erasure-generics Stage C: unify a
+    // LambdaMetafactory bootstrap's instantiatedMethodType (bootstrapArguments[2] — the
+    // SPECIALIZED method type, already-boxed reference types for generic SAMs) against the
+    // functional interface's SAM shape to recover the parameterized interface type
+    // (e.g. "Ljava/util/function/Function<Ljava/lang/Integer;Ljava/lang/Integer;>;").
+    //
+    // Shape table entry format: "ifaceInternalName|typeParamCount|paramTokens|returnToken".
+    // Each token is a digit (index of the interface type parameter appearing at that position
+    // of the SAM's generic signature) or '.' (fixed/primitive position, ignored by unification —
+    // how primitive-specialized SAMs like IntFunction keep their raw int slot). Interfaces with
+    // no type parameters (Runnable, IntPredicate, ...) are intentionally absent: their raw form
+    // IS their exact type. Non-JDK interfaces are resolved from their class file's Signature
+    // attribute when the pipeline loader can load them (see inferCustomSamShape).
+    private static final String[] KNOWN_SAM_SHAPES = {
+        "java/util/function/Function|2|0|1",
+        "java/util/function/BiFunction|3|01|2",
+        "java/util/function/Supplier|1||0",
+        "java/util/function/Consumer|1|0|.",
+        "java/util/function/BiConsumer|2|01|.",
+        "java/util/function/Predicate|1|0|.",
+        "java/util/function/BiPredicate|2|01|.",
+        "java/util/function/UnaryOperator|1|0|0",
+        "java/util/function/BinaryOperator|1|00|0",
+        "java/util/concurrent/Callable|1||0",
+        "java/util/Comparator|1|00|.",
+        "java/util/function/IntFunction|1|.|0",
+        "java/util/function/LongFunction|1|.|0",
+        "java/util/function/DoubleFunction|1|.|0",
+        "java/util/function/ToIntFunction|1|0|.",
+        "java/util/function/ToLongFunction|1|0|.",
+        "java/util/function/ToDoubleFunction|1|0|.",
+        "java/util/function/ToIntBiFunction|2|01|.",
+        "java/util/function/ToLongBiFunction|2|01|.",
+        "java/util/function/ToDoubleBiFunction|2|01|.",
+        "java/util/function/ObjIntConsumer|1|0.|.",
+        "java/util/function/ObjLongConsumer|1|0.|.",
+        "java/util/function/ObjDoubleConsumer|1|0.|."
+    };
+
+    /** Loader used to read a non-JDK functional interface's class Signature (set by the pipeline). */
+    private Loader samSignatureLoader;
+    /** Cache of resolved non-JDK SAM shapes: iface -> {nTypeParams, paramTokens, retToken}; empty = negative. */
+    private Map<String, String[]> customSamShapeCache;
+
+    public void setSamSignatureLoader(Loader loader) {
+        this.samSignatureLoader = loader;
+    }
+
+    /**
+     * Parameterized field signature of a lambda call site's functional interface, or null when
+     * not derivable. `retDesc` is the indy descriptor's return type (the erased interface),
+     * `samName` the dynamic call-site name (the SAM's method name).
+     */
+    private String inferLambdaInterfaceSignature(BootstrapMethodsAttribute.BootstrapMethod bsm,
+                                                 String retDesc, String samName, ConstantPool pool) {
+        if (bsm == null || retDesc == null || !retDesc.startsWith("L") || !retDesc.endsWith(";")) return null;
+        if (bsm.bootstrapArguments.length < 3) return null;
+        String samDesc = methodTypeDescriptor(pool, bsm.bootstrapArguments[0]);
+        String instDesc = methodTypeDescriptor(pool, bsm.bootstrapArguments[2]);
+        if (samDesc == null || instDesc == null) return null;
+        String iface = retDesc.substring(1, retDesc.length() - 1);
+        for (int i = 0; i < KNOWN_SAM_SHAPES.length; i++) {
+            String[] parts = KNOWN_SAM_SHAPES[i].split("\\|", -1);
+            if (parts[0].equals(iface)) {
+                return unifySamShape(iface, Integer.parseInt(parts[1]), parts[2], parts[3], instDesc);
+            }
+        }
+        if (iface.startsWith("java/") || iface.startsWith("javax/")) return null;
+        String[] shape = inferCustomSamShape(iface, samName);
+        if (shape == null || shape.length != 3) return null;
+        return unifySamShape(iface, Integer.parseInt(shape[0]), shape[1], shape[2], instDesc);
+    }
+
+    /** Descriptor string of a CONSTANT_MethodType pool entry, else null. */
+    private static String methodTypeDescriptor(ConstantPool pool, int index) {
+        if (index <= 0 || index >= pool.getSize()) return null;
+        if (pool.getTag(index) != ConstantPool.CONSTANT_MethodType) return null;
+        Integer utf8Index = (Integer) pool.getValue(index);
+        return utf8Index != null ? pool.getUtf8(utf8Index.intValue()) : null;
+    }
+
+    /**
+     * Unify the instantiated (specialized) method type against the SAM shape tokens and build
+     * the parameterized interface signature. Conservative: every interface type parameter must
+     * bind to a reference type, conflicting bindings bail, and an all/partial-Object binding
+     * bails too (Object at a type-variable position usually means an ERASED enclosing type
+     * variable, where parameterizing would be wrong — raw stays, which always compiles).
+     */
+    private static String unifySamShape(String iface, int nTypeParams, String paramTokens,
+                                        String retToken, String instDesc) {
+        if (nTypeParams <= 0 || nTypeParams > 9) return null;
+        String[] instParams = TypeNameUtil.parseMethodParameterDescriptors(instDesc);
+        String instRet = TypeNameUtil.parseMethodReturnDescriptor(instDesc);
+        if (instParams.length != paramTokens.length()) return null;
+        String[] bind = new String[nTypeParams];
+        for (int i = 0; i < instParams.length; i++) {
+            char t = paramTokens.charAt(i);
+            if (t == '.') continue;
+            if (!bindSamTypeArg(bind, t - '0', instParams[i])) return null;
+        }
+        if (retToken.length() == 1 && retToken.charAt(0) != '.') {
+            if (!bindSamTypeArg(bind, retToken.charAt(0) - '0', instRet)) return null;
+        }
+        StringBuilder sb = new StringBuilder("L").append(iface).append('<');
+        for (int i = 0; i < nTypeParams; i++) {
+            if (bind[i] == null || "Ljava/lang/Object;".equals(bind[i])) return null;
+            sb.append(bind[i]);
+        }
+        return sb.append(">;").toString();
+    }
+
+    /** Bind interface type parameter `idx` to the reference-type descriptor `desc` (consistently). */
+    private static boolean bindSamTypeArg(String[] bind, int idx, String desc) {
+        if (idx < 0 || idx >= bind.length) return false;
+        if (desc == null || !(desc.startsWith("L") || desc.startsWith("["))) return false;
+        if (bind[idx] == null) {
+            bind[idx] = desc;
+            return true;
+        }
+        return bind[idx].equals(desc);
+    }
+
+    /**
+     * Resolve a non-JDK functional interface's SAM shape from its class file (loaded via the
+     * pipeline loader): {typeParamCount, paramTokens, retToken}, or null when the interface is
+     * not loadable / not generic / its SAM cannot be unified positionally (nested type-variable
+     * uses, method-level type parameters, overloaded abstract names).
+     */
+    private String[] inferCustomSamShape(String iface, String samName) {
+        if (samSignatureLoader == null || samName == null) return null;
+        if (customSamShapeCache == null) {
+            customSamShapeCache = new HashMap<String, String[]>();
+        }
+        String[] cached = customSamShapeCache.get(iface);
+        if (cached != null) return cached.length == 3 ? cached : null;
+        String[] shape = computeCustomSamShape(iface, samName);
+        customSamShapeCache.put(iface, shape != null ? shape : new String[0]);
+        return shape;
+    }
+
+    private String[] computeCustomSamShape(String iface, String samName) {
+        try {
+            if (!samSignatureLoader.canLoad(iface)) return null;
+            byte[] data = samSignatureLoader.load(iface);
+            if (data == null) return null;
+            ClassFile cf = new ClassFileDeserializer().deserialize(data);
+            if (cf == null || !cf.isInterface()) return null;
+            SignatureAttribute clsSig = cf.findAttribute("Signature");
+            if (clsSig == null) return null;
+            List<String> typeParams = parseSigTypeParamNames(clsSig.getSignature());
+            if (typeParams == null || typeParams.isEmpty() || typeParams.size() > 9) return null;
+            MethodInfo sam = null;
+            for (MethodInfo m : cf.getMethods()) {
+                if (m.isAbstract() && samName.equals(m.getName())) {
+                    if (sam != null) return null; // overloaded abstract name: ambiguous
+                    sam = m;
+                }
+            }
+            if (sam == null) return null;
+            SignatureAttribute mSig = sam.findAttribute("Signature");
+            if (mSig == null) return null; // SAM not generic in the interface type parameters
+            String[] retSig = new String[1];
+            List<String> paramSigs = splitMethodSigTopLevel(mSig.getSignature(), retSig);
+            if (paramSigs == null) return null;
+            StringBuilder paramTokens = new StringBuilder();
+            for (int i = 0; i < paramSigs.size(); i++) {
+                char t = samShapeToken(paramSigs.get(i), typeParams);
+                if (t == 0) return null;
+                paramTokens.append(t);
+            }
+            char retTok = samShapeToken(retSig[0], typeParams);
+            if (retTok == 0) return null;
+            return new String[]{String.valueOf(typeParams.size()),
+                paramTokens.toString(), String.valueOf(retTok)};
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Type-parameter names of a class Signature ("<T:...U:...>L...;"), or null. */
+    private static List<String> parseSigTypeParamNames(String sig) {
+        if (sig == null || !sig.startsWith("<")) return null;
+        List<String> names = new ArrayList<String>();
+        int i = 1;
+        while (i < sig.length() && sig.charAt(i) != '>') {
+            int colon = sig.indexOf(':', i);
+            if (colon < 0) return null;
+            names.add(sig.substring(i, colon));
+            i = colon;
+            while (i < sig.length() && sig.charAt(i) == ':') {
+                i++; // a bound follows; the class bound may be empty (next char is ':' again)
+                if (i < sig.length() && sig.charAt(i) != ':' && sig.charAt(i) != '>') {
+                    i = scanTypeSig(sig, i);
+                    if (i < 0) return null;
+                }
+            }
+        }
+        return names;
+    }
+
+    /** Top-level parameter type signatures of a method Signature; return type via retOut[0]. */
+    private static List<String> splitMethodSigTopLevel(String sig, String[] retOut) {
+        if (sig == null || sig.length() == 0) return null;
+        if (sig.charAt(0) == '<') return null; // method-level type parameters: not unifiable
+        if (sig.charAt(0) != '(') return null;
+        int i = 1;
+        List<String> out = new ArrayList<String>();
+        while (i < sig.length() && sig.charAt(i) != ')') {
+            int start = i;
+            i = scanTypeSig(sig, i);
+            if (i < 0) return null;
+            out.add(sig.substring(start, i));
+        }
+        if (i >= sig.length()) return null;
+        i++; // ')'
+        int end = scanTypeSig(sig, i);
+        if (end < 0) return null;
+        retOut[0] = sig.substring(i, end);
+        return out;
+    }
+
+    /** End index (exclusive) of one type signature starting at `i`, or -1. */
+    private static int scanTypeSig(String sig, int i) {
+        if (i >= sig.length()) return -1;
+        char c = sig.charAt(i);
+        switch (c) {
+            case 'B': case 'C': case 'D': case 'F': case 'I':
+            case 'J': case 'S': case 'Z': case 'V':
+                return i + 1;
+            case '[':
+                return scanTypeSig(sig, i + 1);
+            case 'T': {
+                int semi = sig.indexOf(';', i);
+                return semi < 0 ? -1 : semi + 1;
+            }
+            case 'L': {
+                int depth = 0;
+                i++;
+                while (i < sig.length()) {
+                    char ch = sig.charAt(i);
+                    if (ch == '<') depth++;
+                    else if (ch == '>') depth--;
+                    else if (ch == ';' && depth == 0) return i + 1;
+                    i++;
+                }
+                return -1;
+            }
+            case '*':
+                return i + 1;
+            case '+': case '-':
+                return scanTypeSig(sig, i + 1);
+            default:
+                return -1;
+        }
+    }
+
+    /**
+     * Shape token for one SAM position: digit = index of the interface type parameter used
+     * DIRECTLY at that position ("TT;"), '.' = type-variable-free position (ignored), 0 (NUL)
+     * = type-variable-dependent in a nested/array position — not unifiable from an erased
+     * MethodType, the caller bails.
+     */
+    private static char samShapeToken(String typeSig, List<String> typeParams) {
+        if (typeSig == null || typeSig.length() == 0) return 0;
+        if (typeSig.charAt(0) == 'T' && typeSig.endsWith(";")) {
+            int idx = typeParams.indexOf(typeSig.substring(1, typeSig.length() - 1));
+            return idx >= 0 && idx <= 9 ? (char) ('0' + idx) : (char) 0;
+        }
+        int d = 0;
+        while (d < typeSig.length() && typeSig.charAt(d) == '[') d++;
+        String s = typeSig.substring(d);
+        if (s.startsWith("T") || s.indexOf('<') >= 0) return 0;
+        return '.';
+    }
+    // END_CHANGE: BUG-2026-0069-11
 
     /**
      * BUG-2026-0077: promote the first bare `v = expr;` of a local that has NO declaration anywhere in the

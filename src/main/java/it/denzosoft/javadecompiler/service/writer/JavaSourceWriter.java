@@ -13,6 +13,9 @@ import it.denzosoft.javadecompiler.model.javasyntax.type.*;
 import it.denzosoft.javadecompiler.model.message.Message;
 import it.denzosoft.javadecompiler.model.processor.Processor;
 import it.denzosoft.javadecompiler.service.converter.JavaSyntaxResult;
+// START_CHANGE: BUG-2026-0097-20260610-14 - Rewriter used to map anon super-ctor args to new-site expressions
+import it.denzosoft.javadecompiler.service.converter.transform.AstLocalRewriter;
+// END_CHANGE: BUG-2026-0097-14
 import it.denzosoft.javadecompiler.util.IdentifierSanitizer;
 import it.denzosoft.javadecompiler.util.SignatureParser;
 import it.denzosoft.javadecompiler.util.StringConstants;
@@ -41,6 +44,12 @@ public class JavaSourceWriter implements Processor {
     // START_CHANGE: BUG-2026-0044-20260327-2 - Current result for anonymous class body inlining
     private JavaSyntaxResult currentResult;
     // END_CHANGE: BUG-2026-0044-2
+    // START_CHANGE: BUG-2026-0097-20260610-1 - Stack of capture substitution maps for inlined
+    // anonymous class bodies (innermost first; save/restore pattern as for currentResult).
+    // Maps the anon class's val$ capture field name to the argument expression supplied at
+    // the `new` site, so val$ reads inside the inlined body render the actual captured value.
+    private LinkedList<Map<String, Expression>> capturedArgSubstitutions = new LinkedList<Map<String, Expression>>();
+    // END_CHANGE: BUG-2026-0097-1
     /** Current method's bytecode instructions map (line -> instructions), null if not showing bytecode */
     private java.util.Map<Integer, java.util.List<String>> currentBytecodeInstructions;
     // END_CHANGE: IMP-LINES-7
@@ -848,6 +857,16 @@ public class JavaSourceWriter implements Processor {
             }
         }
 
+        // START_CHANGE: BUG-2026-0097-20260610-11 - A local class declared in a static context
+        // has no outer-instance field; emitted as a nested member class it must be static so
+        // instantiation from the (static) enclosing method still compiles.
+        if (inner.isLocalClass() && !inner.hasOuterThisField()
+                && (flags & StringConstants.ACC_STATIC) == 0) {
+            printer.printKeyword("static");
+            printer.printText(" ");
+        }
+        // END_CHANGE: BUG-2026-0097-11
+
         // START_CHANGE: BUG-2026-0071-20260610-5 - Restore sealed/non-sealed on nested types
         // (mirrors the top-level emission). `sealed` when the permitted hierarchy is visible
         // in this unit; `non-sealed` when the type is a permitted subclass of such a sealed
@@ -875,7 +894,14 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("class");
         }
         printer.printText(" ");
-        emitDecl(printer,Printer.TYPE, innerInternalName, simpleName, "");
+        // START_CHANGE: BUG-2026-0097-20260610-12 - Local class simple names are digit-leading
+        // (`1Local`); prefix '_' to produce a valid identifier matching emitRef's references.
+        String declaredSimpleName = simpleName;
+        if (declaredSimpleName.length() > 0 && Character.isDigit(declaredSimpleName.charAt(0))) {
+            declaredSimpleName = "_" + declaredSimpleName;
+        }
+        emitDecl(printer,Printer.TYPE, innerInternalName, declaredSimpleName, "");
+        // END_CHANGE: BUG-2026-0097-12
 
         // Type parameters from generic signature
         if (inner.getSignature() != null) {
@@ -2227,7 +2253,15 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             emitDecl(printer,Printer.METHOD, ownerInternalName, method.name, method.descriptor);
         } else {
-            emitDecl(printer,Printer.CONSTRUCTOR, ownerInternalName, simpleName, method.descriptor);
+            // START_CHANGE: BUG-2026-0097-20260610-8 - Local classes have digit-leading simple
+            // names (`1Local`); prefix '_' so the constructor name matches the sanitized class
+            // name emitted by writeInnerClass/emitRef.
+            String ctorName = simpleName;
+            if (ctorName.length() > 0 && Character.isDigit(ctorName.charAt(0))) {
+                ctorName = "_" + ctorName;
+            }
+            emitDecl(printer,Printer.CONSTRUCTOR, ownerInternalName, ctorName, method.descriptor);
+            // END_CHANGE: BUG-2026-0097-8
         }
 
         // Parameters
@@ -2237,6 +2271,14 @@ public class JavaSourceWriter implements Processor {
             paramStart = 2;
         }
         // END_CHANGE: ISS-2026-0012-3
+        // START_CHANGE: BUG-2026-0097-20260610-9 - Drop the synthetic outer-instance first
+        // parameter of non-static member/local class constructors. Call sites drop the matching
+        // leading argument in the NewExpression branch, keeping declaration and uses consistent.
+        boolean dropOuterParam = stripsOuterCtorParam(result, method);
+        if (dropOuterParam && paramStart == 0) {
+            paramStart = 1;
+        }
+        // END_CHANGE: BUG-2026-0097-9
         printer.printText("(");
         for (int i = paramStart; i < method.parameterTypes.size(); i++) {
             if (i > paramStart) printer.printText(", ");
@@ -2367,6 +2409,13 @@ public class JavaSourceWriter implements Processor {
                     continue;
                 }
                 // END_CHANGE: BUG-2026-0066-1
+                // START_CHANGE: BUG-2026-0097-20260610-10 - With the outer-instance parameter
+                // dropped, also drop the JDK18+ `Objects.requireNonNull(outerArg)` null-check
+                // javac emits for it: that parameter no longer exists in the emitted source.
+                if (dropOuterParam && isOuterRequireNonNull(stmt, method.parameterNames.get(0))) {
+                    continue;
+                }
+                // END_CHANGE: BUG-2026-0097-10
                 lineNumber = writeStatement(printer, stmt, ownerInternalName, lineNumber);
             }
 
@@ -2877,9 +2926,23 @@ public class JavaSourceWriter implements Processor {
                 }
                 printer.printKeyword("this");
             } else if (fieldName != null && fieldName.startsWith("val$")) {
-                // val$xxx is a captured variable from outer scope - write just the variable name
-                String capturedName = fieldName.substring(4);
-                printer.printText(sn(capturedName, "var"));
+                // START_CHANGE: BUG-2026-0097-20260610-2 - Inside an inlined anonymous class body,
+                // substitute the captured argument expression from the `new` site (built in the
+                // NewExpression branch). The substituted expression belongs to the ENCLOSING scope,
+                // so the innermost map is popped while writing it (restores correct resolution for
+                // anonymous-in-anonymous captures). Falls back to the stripped name otherwise.
+                Expression capturedArg = capturedArgSubstitutions.isEmpty()
+                    ? null : capturedArgSubstitutions.getFirst().get(fieldName);
+                if (capturedArg != null) {
+                    Map<String, Expression> innermost = capturedArgSubstitutions.removeFirst();
+                    writeExpression(printer, capturedArg, ownerInternalName);
+                    capturedArgSubstitutions.addFirst(innermost);
+                } else {
+                    // val$xxx is a captured variable from outer scope - write just the variable name
+                    String capturedName = fieldName.substring(4);
+                    printer.printText(sn(capturedName, "var"));
+                }
+                // END_CHANGE: BUG-2026-0097-2
             } else {
             // END_CHANGE: BUG-2026-0045-1
                 if (fae.getObject() != null) {
@@ -2996,28 +3059,99 @@ public class JavaSourceWriter implements Processor {
             } // close else from access$ check
         } else if (expr instanceof NewExpression) {
             NewExpression ne = (NewExpression) expr;
+            // START_CHANGE: BUG-2026-0097-20260610-3 - Member-inner/local-class call sites: when
+            // the target class declaration drops the synthetic outer-instance constructor
+            // parameter (see stripsOuterCtorParam), the call site must drop the matching leading
+            // argument. A plain `this` simply disappears; any other outer-instance expression
+            // becomes a qualified-new receiver (`outer.new Inner(...)`).
+            String displayName = anonymousClassDisplayNames.get(ne.getInternalTypeName());
+            List<Expression> neArgs = ne.getArguments();
+            boolean dropOuterArg = false;
+            if (displayName == null && neArgs != null && !neArgs.isEmpty()) {
+                JavaSyntaxResult newTarget = findInnerClassResult(currentResult, ne.getInternalTypeName());
+                if (newTarget != null && stripsOuterCtorParam(newTarget, findFirstConstructor(newTarget))) {
+                    dropOuterArg = true;
+                }
+            }
+            boolean qualifiedNew = dropOuterArg && !(neArgs.get(0) instanceof ThisExpression);
+            if (qualifiedNew) {
+                if (neArgs.get(0) instanceof CastExpression) {
+                    printer.printText("(");
+                    writeExpression(printer, neArgs.get(0), ownerInternalName);
+                    printer.printText(")");
+                } else {
+                    writeExpression(printer, neArgs.get(0), ownerInternalName);
+                }
+                printer.printText(".");
+            }
+            // END_CHANGE: BUG-2026-0097-3
             printer.printKeyword("new");
             printer.printText(" ");
             // START_CHANGE: BUG-2026-0029-20260325-4 - Display anonymous classes using interface/superclass name
-            String displayName = anonymousClassDisplayNames.get(ne.getInternalTypeName());
             if (displayName != null) {
                 emitRef(printer,Printer.TYPE, ne.getInternalTypeName(),
                     displayName, "", ownerInternalName);
-                // Suppress outer 'this' argument for anonymous classes
-                List<Expression> args = ne.getArguments();
-                List<Expression> filteredArgs = new ArrayList<Expression>();
-                if (args != null) {
-                    for (int ai = 0; ai < args.size(); ai++) {
-                        Expression arg = args.get(ai);
-                        if (arg instanceof ThisExpression) continue;
-                        filteredArgs.add(arg);
+                // START_CHANGE: BUG-2026-0097-20260610-4 - Build the capture substitution map
+                // (val$ field -> new-site argument expression) and recover the superclass
+                // constructor arguments from the anon <init> body. Previously the arguments were
+                // always discarded and printed as `()`, losing super-ctor args and the link
+                // between captured locals and val$ fields.
+                JavaSyntaxResult anonResult = findInnerClassResult(currentResult, ne.getInternalTypeName());
+                JavaSyntaxResult.MethodDeclaration anonInit = findFirstConstructor(anonResult);
+                Map<String, Expression> captureMap = new HashMap<String, Expression>();
+                List<Expression> superArgs = null;
+                if (anonInit != null && anonInit.body != null && neArgs != null) {
+                    final List<String> initParams = anonInit.parameterNames;
+                    final List<Expression> siteArgs = neArgs;
+                    for (Statement initStmt : anonInit.body) {
+                        if (!(initStmt instanceof ExpressionStatement)) continue;
+                        Expression ie = ((ExpressionStatement) initStmt).getExpression();
+                        if (ie instanceof AssignmentExpression) {
+                            AssignmentExpression iae = (AssignmentExpression) ie;
+                            if (iae.getLeft() instanceof FieldAccessExpression
+                                    && iae.getRight() instanceof LocalVariableExpression) {
+                                String capField = ((FieldAccessExpression) iae.getLeft()).getName();
+                                if (capField != null && capField.startsWith("val$")) {
+                                    int pIdx = initParams.indexOf(
+                                        ((LocalVariableExpression) iae.getRight()).getName());
+                                    if (pIdx >= 0 && pIdx < siteArgs.size()) {
+                                        captureMap.put(capField, siteArgs.get(pIdx));
+                                    }
+                                }
+                            }
+                        } else if (ie instanceof MethodInvocationExpression
+                                && "super".equals(((MethodInvocationExpression) ie).getMethodName())) {
+                            MethodInvocationExpression superCall = (MethodInvocationExpression) ie;
+                            if (superCall.getArguments() != null && !superCall.getArguments().isEmpty()) {
+                                // Map super(...) args (references to <init> params) back to the
+                                // expressions supplied at the new-site.
+                                AstLocalRewriter argMapper = new AstLocalRewriter() {
+                                    protected Expression onLocal(LocalVariableExpression lv) {
+                                        int pIdx = initParams.indexOf(lv.getName());
+                                        return (pIdx >= 0 && pIdx < siteArgs.size()) ? siteArgs.get(pIdx) : lv;
+                                    }
+                                };
+                                superArgs = new ArrayList<Expression>();
+                                for (Expression superArg : superCall.getArguments()) {
+                                    superArgs.add(((ExpressionStatement) argMapper.rewrite(
+                                        new ExpressionStatement(superArg))).getExpression());
+                                }
+                            }
+                        }
                     }
                 }
-                // For anonymous class implementing interface, always use empty args
-                printer.printText("()");
+                if (superArgs != null && !superArgs.isEmpty()) {
+                    writeArguments(printer, superArgs, ownerInternalName);
+                } else {
+                    printer.printText("()");
+                }
+                // END_CHANGE: BUG-2026-0097-4
                 // START_CHANGE: BUG-2026-0044-20260327-1 - Inline anonymous class body
-                JavaSyntaxResult anonResult = findInnerClassResult(currentResult, ne.getInternalTypeName());
                 if (anonResult != null && anonResult.getMethods() != null && !anonResult.getMethods().isEmpty()) {
+                    // START_CHANGE: BUG-2026-0097-20260610-5 - Scope the capture substitution map
+                    // to this inlined body (innermost-first stack; save/restore for nested anons).
+                    capturedArgSubstitutions.addFirst(captureMap);
+                    // END_CHANGE: BUG-2026-0097-5
                     printer.printText(" {");
                     printer.endLine();
                     printer.indent();
@@ -3033,6 +3167,9 @@ public class JavaSourceWriter implements Processor {
                     printer.unindent();
                     printer.startLine(anonLine);
                     printer.printText("}");
+                    // START_CHANGE: BUG-2026-0097-20260610-6 - Restore the enclosing capture scope
+                    capturedArgSubstitutions.removeFirst();
+                    // END_CHANGE: BUG-2026-0097-6
                 } else {
                     printer.printText(" { }");
                 }
@@ -3044,9 +3181,25 @@ public class JavaSourceWriter implements Processor {
                     newTypeName = "_" + newTypeName;
                 }
                 // END_CHANGE: BUG-2026-0055-1
-                emitRef(printer,Printer.TYPE, ne.getInternalTypeName(),
-                    newTypeName, "", ownerInternalName);
-                writeArguments(printer, ne.getArguments(), ownerInternalName);
+                // START_CHANGE: BUG-2026-0097-20260610-7 - Drop the leading outer-instance argument
+                // for classes whose constructor declaration drops the synthetic outer parameter.
+                // Qualified-new needs the UNQUALIFIED simple name (`o.new Inner(...)`).
+                if (dropOuterArg) {
+                    List<Expression> visibleArgs = new ArrayList<Expression>(neArgs.subList(1, neArgs.size()));
+                    if (qualifiedNew) {
+                        printer.printReference(Printer.TYPE, ne.getInternalTypeName(),
+                            sn(newTypeName, "cls"), "", ownerInternalName);
+                    } else {
+                        emitRef(printer,Printer.TYPE, ne.getInternalTypeName(),
+                            newTypeName, "", ownerInternalName);
+                    }
+                    writeArguments(printer, visibleArgs, ownerInternalName);
+                } else {
+                // END_CHANGE: BUG-2026-0097-7
+                    emitRef(printer,Printer.TYPE, ne.getInternalTypeName(),
+                        newTypeName, "", ownerInternalName);
+                    writeArguments(printer, ne.getArguments(), ownerInternalName);
+                }
             }
             // END_CHANGE: BUG-2026-0029-4
         } else if (expr instanceof NewArrayExpression) {
@@ -4009,6 +4162,58 @@ public class JavaSourceWriter implements Processor {
         return name != null && name.startsWith("this$");
     }
     // END_CHANGE: BUG-2026-0066-2
+
+    // START_CHANGE: BUG-2026-0097-20260610-13 - Helpers for synthetic outer-instance stripping.
+    /**
+     * True when the constructor's synthetic leading outer-instance parameter must be suppressed:
+     * the class is a non-static member/local inner class that carried a this$N field, and the
+     * constructor's first parameter is exactly the immediately-enclosing class.
+     */
+    private boolean stripsOuterCtorParam(JavaSyntaxResult result, JavaSyntaxResult.MethodDeclaration method) {
+        if (result == null || method == null || !method.isConstructor()) return false;
+        if (!result.isInnerClass() || !result.hasOuterThisField()) return false;
+        if ((result.getInnerClassAccessFlags() & StringConstants.ACC_STATIC) != 0) return false;
+        if (method.parameterTypes == null || method.parameterTypes.isEmpty()) return false;
+        String internal = result.getInternalName();
+        if (internal == null) return false;
+        int dollar = internal.lastIndexOf('$');
+        if (dollar <= 0) return false;
+        String outer = internal.substring(0, dollar);
+        Type first = method.parameterTypes.get(0);
+        return first instanceof ObjectType && outer.equals(((ObjectType) first).getInternalName());
+    }
+
+    private JavaSyntaxResult.MethodDeclaration findFirstConstructor(JavaSyntaxResult result) {
+        if (result == null || result.getMethods() == null) return null;
+        for (JavaSyntaxResult.MethodDeclaration m : result.getMethods()) {
+            if (m.isConstructor()) return m;
+        }
+        return null;
+    }
+
+    /** Matches the JDK18+ `Objects.requireNonNull(<outerParam>)` preamble javac emits in inner-class ctors. */
+    private boolean isOuterRequireNonNull(Statement stmt, String outerParamName) {
+        if (outerParamName == null || !(stmt instanceof ExpressionStatement)) return false;
+        Expression e = ((ExpressionStatement) stmt).getExpression();
+        List<Expression> args;
+        if (e instanceof StaticMethodInvocationExpression) {
+            StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) e;
+            if (!"requireNonNull".equals(smie.getMethodName())
+                || !"java/util/Objects".equals(smie.getOwnerInternalName())) return false;
+            args = smie.getArguments();
+        } else if (e instanceof MethodInvocationExpression) {
+            MethodInvocationExpression mie = (MethodInvocationExpression) e;
+            if (!"requireNonNull".equals(mie.getMethodName())
+                || !"java/util/Objects".equals(mie.getOwnerInternalName())) return false;
+            args = mie.getArguments();
+        } else {
+            return false;
+        }
+        if (args == null || args.size() != 1) return false;
+        return args.get(0) instanceof LocalVariableExpression
+            && outerParamName.equals(((LocalVariableExpression) args.get(0)).getName());
+    }
+    // END_CHANGE: BUG-2026-0097-13
 
     private boolean isImplicitSuperCall(Statement stmt, JavaSyntaxResult result) {
         if (!(stmt instanceof ExpressionStatement)) return false;
