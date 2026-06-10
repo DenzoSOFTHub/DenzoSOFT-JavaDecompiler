@@ -100,6 +100,27 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         message.setBody(result);
     }
 
+    // START_CHANGE: BUG-2026-0053-20260610-4 - Rebuild the left spine of a `+` chain so the
+    // string-context prefix lands on the leftmost LEAF: `"" + i + j` (correct, left-to-right
+    // string concat) instead of `"" + (i + j)` (int addition first).
+    private Expression forceStringContextOnLeftLeaf(int line, Expression concat) {
+        if (concat instanceof BinaryOperatorExpression
+                && "+".equals(((BinaryOperatorExpression) concat).getOperator())) {
+            BinaryOperatorExpression boe = (BinaryOperatorExpression) concat;
+            Expression newLeft = forceStringContextOnLeftLeaf(line, boe.getLeft());
+            if (newLeft == boe.getLeft()) {
+                return concat;
+            }
+            return new BinaryOperatorExpression(line, ObjectType.STRING, newLeft, "+", boe.getRight());
+        }
+        if (concat instanceof StringConstantExpression || ObjectType.STRING.equals(concat.getType())) {
+            return concat;
+        }
+        return new BinaryOperatorExpression(line, ObjectType.STRING,
+            new StringConstantExpression(line, ""), "+", concat);
+    }
+    // END_CHANGE: BUG-2026-0053-4
+
     private void loadAndAddInnerClass(Loader loader, InnerClassesAttribute.InnerClass ic, JavaSyntaxResult outerResult) {
         if (loader.canLoad(ic.innerClassName)) {
             try {
@@ -3043,6 +3064,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                             }
                         }
                         if (concat != null) {
+                            // START_CHANGE: BUG-2026-0053-20260610-3 - A recipe that STARTS with a
+                            // placeholder (javac folds the leading "" of `"" + i + j` away) makes the
+                            // emitted source evaluate its leftmost operands as primitive arithmetic.
+                            // If the leftmost leaf of the `+` chain is not a String, prefix `"" +` at
+                            // the LEAF (not the root: `"" + (i + j)` would still sum ints first),
+                            // mirroring the constant-free fallback below.
+                            concat = forceStringContextOnLeftLeaf(line, concat);
+                            // END_CHANGE: BUG-2026-0053-3
                             stack.push(concat);
                             break;
                         }
