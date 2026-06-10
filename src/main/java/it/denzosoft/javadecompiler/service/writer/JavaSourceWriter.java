@@ -692,6 +692,12 @@ public class JavaSourceWriter implements Processor {
         }
 
         // Methods
+        // START_CHANGE: IMP-2026-0001-20260610-2 - Inner classes ordered by source-line anchor,
+        // interleaved with the outer methods so each lands near its original line position.
+        List<PendingInnerClass> pendingInners =
+            orderInnerClassesByAnchor(result.getInnerClassResults(), true);
+        int[] nextPendingInner = new int[]{0};
+        // END_CHANGE: IMP-2026-0001-2
         // START_CHANGE: ISS-2026-0012-20260324-2 - Suppress synthetic enum methods (values, valueOf, $values)
         boolean firstVisibleMethod = true;
         for (int m = 0; m < result.getMethods().size(); m++) {
@@ -740,6 +746,20 @@ public class JavaSourceWriter implements Processor {
                     continue; // Suppress empty clinit
                 }
             }
+            // START_CHANGE: IMP-2026-0001-20260610-3 - Emit inner classes anchored on earlier
+            // source lines than this method. Clearing firstVisibleMethod keeps the separator
+            // blank-line logic consistent (exactly one blank before the method that follows
+            // an emitted inner class).
+            int methodAnchor = methodAnchorLine(method);
+            if (methodAnchor > 0 && nextPendingInner[0] < pendingInners.size()) {
+                int beforeFlush = nextPendingInner[0];
+                lineNumber = flushPendingInnerClasses(printer, pendingInners, nextPendingInner,
+                    methodAnchor, lineNumber, internalName);
+                if (nextPendingInner[0] > beforeFlush) {
+                    firstVisibleMethod = false;
+                }
+            }
+            // END_CHANGE: IMP-2026-0001-3
             if (firstVisibleMethod && !result.getFields().isEmpty()) {
                 printer.startLine(lineNumber++);
                 printer.endLine();
@@ -761,35 +781,141 @@ public class JavaSourceWriter implements Processor {
         }
 
         // Inner classes
-        List<JavaSyntaxResult> innerResults = result.getInnerClassResults();
-        if (innerResults != null && !innerResults.isEmpty()) {
-            for (JavaSyntaxResult inner : innerResults) {
-                // START_CHANGE: BUG-2026-0038-20260327-1 - Skip anonymous inner classes (check after last $)
-                String innerName = inner.getInternalName() != null ? inner.getInternalName() : "";
-                String innerSimple = TypeNameUtil.simpleNameFromInternal(innerName);
-                // Check the part after the last $ for numeric-only (anonymous class indicator)
-                int lastDollar = innerSimple.lastIndexOf('$');
-                String anonPart = lastDollar >= 0 ? innerSimple.substring(lastDollar + 1) : innerSimple;
-                boolean innerIsAnon = anonPart.length() > 0;
-                for (int ci = 0; ci < anonPart.length(); ci++) {
-                    if (!Character.isDigit(anonPart.charAt(ci))) {
-                        innerIsAnon = false;
-                        break;
-                    }
-                }
-                if (innerIsAnon) continue;
-                // END_CHANGE: BUG-2026-0038-1
-                printer.startLine(lineNumber++);
-                printer.endLine();
-                lineNumber = writeInnerClass(printer, inner, lineNumber, internalName);
-            }
-        }
+        // START_CHANGE: IMP-2026-0001-20260610-4 - Remaining inner classes: no line info, or
+        // anchored after the last method. Anonymous classes were already excluded from the
+        // queue (BUG-2026-0038: skipped before the separator blank line); the prior relative
+        // order is preserved for everything without a line anchor.
+        lineNumber = flushPendingInnerClasses(printer, pendingInners, nextPendingInner, 0,
+            lineNumber, internalName);
+        // END_CHANGE: IMP-2026-0001-4
 
         printer.unindent();
         printer.startLine(lineNumber);
         printer.printText("}");
         printer.endLine();
     }
+
+    // START_CHANGE: IMP-2026-0001-20260610-1 - Position inner classes at their original line
+    // location. Line-aligned printers pad forward only, so a nested type emitted after a
+    // method whose statements sit on later source lines can never reach its own original
+    // lines. These helpers compute a source-line anchor (minimum LineNumberTable line across
+    // a type's methods, recursively) used to interleave inner-class emission with the outer
+    // methods in ascending source order. Types without line info (e.g. -g:none) keep their
+    // current relative order and are emitted after the methods, so output is unchanged when
+    // no line signal exists.
+    /** Inner class queued for emission with its source-line anchor (0 = no line info). */
+    private static class PendingInnerClass {
+        final JavaSyntaxResult inner;
+        final int anchorLine;
+        PendingInnerClass(JavaSyntaxResult inner, int anchorLine) {
+            this.inner = inner;
+            this.anchorLine = anchorLine;
+        }
+    }
+
+    /** Minimum positive source line of a statement (recursing into blocks); 0 = unknown. */
+    private int statementAnchorLine(Statement stmt) {
+        if (stmt instanceof BlockStatement) {
+            int min = 0;
+            List<Statement> stmts = ((BlockStatement) stmt).getStatements();
+            for (int i = 0; i < stmts.size(); i++) {
+                int ln = statementAnchorLine(stmts.get(i));
+                if (ln > 0 && (min == 0 || ln < min)) min = ln;
+            }
+            return min;
+        }
+        return stmt.getLineNumber();
+    }
+
+    /** Minimum positive source line across a method body's statements; 0 = no line info. */
+    private int methodAnchorLine(JavaSyntaxResult.MethodDeclaration method) {
+        int min = 0;
+        if (method.body != null) {
+            for (int i = 0; i < method.body.size(); i++) {
+                int ln = statementAnchorLine(method.body.get(i));
+                if (ln > 0 && (min == 0 || ln < min)) min = ln;
+            }
+        }
+        return min;
+    }
+
+    /** Minimum positive source line across a type's methods and nested types; 0 = no line info. */
+    private int innerClassAnchorLine(JavaSyntaxResult inner) {
+        int min = 0;
+        for (int i = 0; i < inner.getMethods().size(); i++) {
+            int ln = methodAnchorLine(inner.getMethods().get(i));
+            if (ln > 0 && (min == 0 || ln < min)) min = ln;
+        }
+        List<JavaSyntaxResult> nested = inner.getInnerClassResults();
+        if (nested != null) {
+            for (int i = 0; i < nested.size(); i++) {
+                int ln = innerClassAnchorLine(nested.get(i));
+                if (ln > 0 && (min == 0 || ln < min)) min = ln;
+            }
+        }
+        return min;
+    }
+
+    /** True when the result is an anonymous class: numeric simple name (after the last $). */
+    private boolean isAnonymousInnerResult(JavaSyntaxResult inner) {
+        String name = inner.getInternalName() != null ? inner.getInternalName() : "";
+        String simple = TypeNameUtil.simpleNameFromInternal(name);
+        if (simple.length() == 0) return false;
+        for (int ci = 0; ci < simple.length(); ci++) {
+            if (!Character.isDigit(simple.charAt(ci))) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Queue inner classes for emission ordered by source-line anchor. Collections.sort is
+     * stable: types without line info keep their relative order and sort last (today's
+     * position). Anonymous classes (inlined at their use sites, BUG-2026-0038/BUG-2026-0029)
+     * are either excluded entirely (top-level loop skips them before the separator blank
+     * line) or kept with anchor 0 so their emission position - and writeInnerClass's early
+     * return for them - is unchanged.
+     */
+    private List<PendingInnerClass> orderInnerClassesByAnchor(List<JavaSyntaxResult> inners,
+                                                              boolean excludeAnonymous) {
+        List<PendingInnerClass> ordered = new ArrayList<PendingInnerClass>();
+        if (inners == null) return ordered;
+        for (int i = 0; i < inners.size(); i++) {
+            JavaSyntaxResult inner = inners.get(i);
+            boolean anon = isAnonymousInnerResult(inner);
+            if (anon && excludeAnonymous) continue;
+            ordered.add(new PendingInnerClass(inner, anon ? 0 : innerClassAnchorLine(inner)));
+        }
+        Collections.sort(ordered, new Comparator<PendingInnerClass>() {
+            public int compare(PendingInnerClass a, PendingInnerClass b) {
+                int ka = a.anchorLine > 0 ? a.anchorLine : Integer.MAX_VALUE;
+                int kb = b.anchorLine > 0 ? b.anchorLine : Integer.MAX_VALUE;
+                return ka < kb ? -1 : (ka > kb ? 1 : 0);
+            }
+        });
+        return ordered;
+    }
+
+    /**
+     * Emit queued inner classes whose anchor precedes {@code beforeLine} (0 = emit all
+     * remaining), each preceded by a separator blank line. {@code fromIndex[0]} is the queue
+     * cursor, updated in place. Returns the updated running line number.
+     */
+    private int flushPendingInnerClasses(Printer printer, List<PendingInnerClass> pending,
+                                         int[] fromIndex, int beforeLine, int lineNumber,
+                                         String outerInternalName) {
+        int i = fromIndex[0];
+        while (i < pending.size()) {
+            PendingInnerClass p = pending.get(i);
+            if (beforeLine > 0 && (p.anchorLine <= 0 || p.anchorLine >= beforeLine)) break;
+            printer.startLine(lineNumber++);
+            printer.endLine();
+            lineNumber = writeInnerClass(printer, p.inner, lineNumber, outerInternalName);
+            i++;
+        }
+        fromIndex[0] = i;
+        return lineNumber;
+    }
+    // END_CHANGE: IMP-2026-0001-1
 
     private int writeInnerClass(Printer printer, JavaSyntaxResult inner, int lineNumber,
                                  String outerInternalName) {
@@ -1112,6 +1238,13 @@ public class JavaSourceWriter implements Processor {
         }
 
         // Methods
+        // START_CHANGE: IMP-2026-0001-20260610-5 - Nested inner classes ordered by line anchor,
+        // interleaved with this class's methods (anonymous results keep anchor 0: they stay at
+        // the end where writeInnerClass's early return preserves the prior output).
+        List<PendingInnerClass> pendingNested =
+            orderInnerClassesByAnchor(inner.getInnerClassResults(), false);
+        int[] nextPendingNested = new int[]{0};
+        // END_CHANGE: IMP-2026-0001-5
         // START_CHANGE: ISS-2026-0012-20260324-7 - Suppress synthetic enum members in inner classes
         boolean innerFirstMethod = true;
         for (int m = 0; m < inner.getMethods().size(); m++) {
@@ -1155,6 +1288,18 @@ public class JavaSourceWriter implements Processor {
                 if (allInlined) continue;
             }
             // END_CHANGE: BUG-2026-0047-2
+            // START_CHANGE: IMP-2026-0001-20260610-6 - Emit nested classes anchored on earlier
+            // source lines than this method (same separator handling as the top-level loop).
+            int methodAnchor = methodAnchorLine(method);
+            if (methodAnchor > 0 && nextPendingNested[0] < pendingNested.size()) {
+                int beforeFlush = nextPendingNested[0];
+                lineNumber = flushPendingInnerClasses(printer, pendingNested, nextPendingNested,
+                    methodAnchor, lineNumber, innerInternalName);
+                if (nextPendingNested[0] > beforeFlush) {
+                    innerFirstMethod = false;
+                }
+            }
+            // END_CHANGE: IMP-2026-0001-6
             if (innerFirstMethod && !inner.getFields().isEmpty()) {
                 printer.startLine(lineNumber++);
                 printer.endLine();
@@ -1177,14 +1322,12 @@ public class JavaSourceWriter implements Processor {
         // END_CHANGE: ISS-2026-0012-7
 
         // Nested inner classes (recursive)
-        List<JavaSyntaxResult> nestedInners = inner.getInnerClassResults();
-        if (nestedInners != null && !nestedInners.isEmpty()) {
-            for (JavaSyntaxResult nested : nestedInners) {
-                printer.startLine(lineNumber++);
-                printer.endLine();
-                lineNumber = writeInnerClass(printer, nested, lineNumber, innerInternalName);
-            }
-        }
+        // START_CHANGE: IMP-2026-0001-20260610-7 - Remaining nested classes: no line info,
+        // anonymous (writeInnerClass returns early for them, as before), or anchored after
+        // the last method. Prior relative order preserved.
+        lineNumber = flushPendingInnerClasses(printer, pendingNested, nextPendingNested, 0,
+            lineNumber, innerInternalName);
+        // END_CHANGE: IMP-2026-0001-7
 
         printer.unindent();
         printer.startLine(lineNumber);

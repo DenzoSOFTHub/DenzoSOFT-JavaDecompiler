@@ -1574,6 +1574,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 // Post-process: wrap statements in try-catch using exception table
                 TryCatchReconstructor tryCatchReconstructor = new TryCatchReconstructor(
                     cfg, pcToLine, localVarNames, currentBytecode, pool, handlerVarNames);
+                // START_CHANGE: BUG-2026-0056-20260610-14 - Let the reconstructor structure
+                // handler bodies that contain internal control flow (if/else, switch) instead
+                // of walking their blocks linearly, which dropped conditions and else-branches.
+                tryCatchReconstructor.setFlowBuilder(builder);
+                // END_CHANGE: BUG-2026-0056-14
                 result = tryCatchReconstructor.reconstruct(result, codeAttr.getExceptionTable());
                 // BUG-2026-0068: collapse the Java 9+ try-with-resources desugar into `try (res) {...}`.
                 result = it.denzosoft.javadecompiler.service.converter.transform.ModernTwrReconstructor.reconstruct(result);
@@ -1625,6 +1630,10 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 // END_CHANGE: LIM-0005-4
                 // BUG-2026-0080: hoist a var declared in a switch case but used in another case / after.
                 result = it.denzosoft.javadecompiler.service.converter.transform.SwitchVarHoister.reconstruct(result);
+                // START_CHANGE: BUG-2026-0069-20260610-17 - Hoist a var declared inside an if-branch
+                // but assigned in the other branch / read after the if (residual (a)).
+                result = it.denzosoft.javadecompiler.service.converter.transform.BranchVarHoister.reconstruct(result);
+                // END_CHANGE: BUG-2026-0069-17
                 // Prepend variable pre-declarations (for vars used across if/else branches)
                 if (!preDeclarations.isEmpty()) {
                     List<Statement> withDecls = new ArrayList<Statement>();
@@ -4205,8 +4214,105 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             else if (s instanceof WhileStatement && ((WhileStatement) s).getBody() instanceof BlockStatement) promoteFirst(((BlockStatement) ((WhileStatement) s).getBody()).getStatements(), undeclared);
             else if (s instanceof ForStatement && ((ForStatement) s).getBody() instanceof BlockStatement) promoteFirst(((BlockStatement) ((ForStatement) s).getBody()).getStatements(), undeclared);
             else if (s instanceof ForEachStatement && ((ForEachStatement) s).getBody() instanceof BlockStatement) promoteFirst(((BlockStatement) ((ForEachStatement) s).getBody()).getStatements(), undeclared);
+            // START_CHANGE: BUG-2026-0056-20260610-15 - An undeclared variable whose first
+            // assignment lives inside a try statement (try body, catch clause or finally) must
+            // NOT be promoted in place: the assignment's scope would not cover the uses in the
+            // other clauses or after the try (e.g. `r = call();` in the try, `r = fallback;` in
+            // the catch, `return r;` after - the slot's first store was consumed by the catch's
+            // exception-store elision, so no declaration survived). Insert a bare declaration
+            // immediately BEFORE the try instead; both clauses assign it, so definite
+            // assignment holds at the after-try uses.
+            else if (s instanceof TryCatchStatement) {
+                java.util.List<String> hoisted = null;
+                for (String un : undeclared) {
+                    Type unType = findAssignedVarType(s, un);
+                    if (unType != null) {
+                        stmts.add(i, new VariableDeclarationStatement(
+                            s.getLineNumber(), unType, un, null, false, false));
+                        i++;
+                        if (hoisted == null) hoisted = new java.util.ArrayList<String>();
+                        hoisted.add(un);
+                    }
+                }
+                if (hoisted != null) undeclared.removeAll(hoisted);
+            }
+            // END_CHANGE: BUG-2026-0056-15
         }
     }
+
+    // START_CHANGE: BUG-2026-0056-20260610-16 - Find the declared type for a variable assigned
+    // somewhere inside a statement tree: the type of the first plain assignment's RHS when it is
+    // a concrete reference type, otherwise the LHS slot type. Returns null when no assignment
+    // to the variable exists inside the tree.
+    private Type findAssignedVarType(Statement s, String name) {
+        if (s == null) return null;
+        if (s instanceof ExpressionStatement) {
+            Expression e = ((ExpressionStatement) s).getExpression();
+            if (e instanceof AssignmentExpression && "=".equals(((AssignmentExpression) e).getOperator())
+                    && ((AssignmentExpression) e).getLeft() instanceof LocalVariableExpression) {
+                LocalVariableExpression lv = (LocalVariableExpression) ((AssignmentExpression) e).getLeft();
+                if (name.equals(lv.getName())) {
+                    Expression rhs = ((AssignmentExpression) e).getRight();
+                    Type rhsType = rhs == null ? null : rhs.getType();
+                    if (rhsType instanceof ObjectType && !(rhs instanceof NullExpression)) {
+                        return rhsType;
+                    }
+                    if (lv.getType() != null) return lv.getType();
+                    return ObjectType.OBJECT;
+                }
+            }
+            return null;
+        }
+        if (s instanceof BlockStatement) {
+            for (Statement c : ((BlockStatement) s).getStatements()) {
+                Type t = findAssignedVarType(c, name);
+                if (t != null) return t;
+            }
+            return null;
+        }
+        if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            Type r = findAssignedVarType(t.getTryBody(), name);
+            if (r != null) return r;
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) {
+                r = findAssignedVarType(cc.body, name);
+                if (r != null) return r;
+            }
+            return findAssignedVarType(t.getFinallyBody(), name);
+        }
+        if (s instanceof IfStatement) {
+            return findAssignedVarType(((IfStatement) s).getThenBody(), name);
+        }
+        if (s instanceof IfElseStatement) {
+            Type r = findAssignedVarType(((IfElseStatement) s).getThenBody(), name);
+            if (r != null) return r;
+            return findAssignedVarType(((IfElseStatement) s).getElseBody(), name);
+        }
+        if (s instanceof WhileStatement) {
+            return findAssignedVarType(((WhileStatement) s).getBody(), name);
+        }
+        if (s instanceof DoWhileStatement) {
+            return findAssignedVarType(((DoWhileStatement) s).getBody(), name);
+        }
+        if (s instanceof ForStatement) {
+            Type r = findAssignedVarType(((ForStatement) s).getInit(), name);
+            if (r != null) return r;
+            return findAssignedVarType(((ForStatement) s).getBody(), name);
+        }
+        if (s instanceof SynchronizedStatement) {
+            return findAssignedVarType(((SynchronizedStatement) s).getBody(), name);
+        }
+        if (s instanceof SwitchStatement) {
+            for (SwitchStatement.SwitchCase sc : ((SwitchStatement) s).getCases()) {
+                for (Statement c : sc.getStatements()) {
+                    Type t = findAssignedVarType(c, name);
+                    if (t != null) return t;
+                }
+            }
+        }
+        return null;
+    }
+    // END_CHANGE: BUG-2026-0056-16
 
     /**
      * Merge consecutive declaration (no initializer) + assignment into a single declaration with initializer.
