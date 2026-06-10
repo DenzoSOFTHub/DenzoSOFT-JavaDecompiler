@@ -66,6 +66,30 @@ public class TryCatchReconstructor {
             return statements;
         }
 
+        // START_CHANGE: BUG-2026-0068-20260610-1 - Coalesce compiler-generated handler-protection
+        // entries before grouping. The try-with-resources desugar re-protects the synthetic
+        // Throwable close-and-rethrow handler region with the SAME user handler, e.g.
+        // readOrDefault: [20,38)->38 IOException alongside [0,18)->38 IOException, where 20 is
+        // the handlerPc of [9,14)->20 Throwable. Grouping such an entry by its own
+        // (startPc, endPc) used to build a spurious inner try around the resource declaration,
+        // pushing the resource variable out of scope. An entry is dropped ONLY when
+        // (a) its startPc is exactly the handlerPc of another entry (it starts AT a handler),
+        // and (b) another entry routes to the identical (handlerPc, catchType) - i.e. it merely
+        // extends an existing handler's protected range over compiler-generated handler code.
+        // Genuine nested user try regions never satisfy both conditions at once.
+        List<CodeAttribute.ExceptionEntry> coalesced =
+            new ArrayList<CodeAttribute.ExceptionEntry>();
+        for (int i = 0; i < exceptionTable.length; i++) {
+            if (!isHandlerProtectionEntry(exceptionTable[i], exceptionTable)) {
+                coalesced.add(exceptionTable[i]);
+            }
+        }
+        if (coalesced.size() < exceptionTable.length) {
+            exceptionTable = coalesced.toArray(
+                new CodeAttribute.ExceptionEntry[coalesced.size()]);
+        }
+        // END_CHANGE: BUG-2026-0068-1
+
         // Group exception entries by (startPc, endPc) - same try region
         Map<String, List<CodeAttribute.ExceptionEntry>> groups =
             new LinkedHashMap<String, List<CodeAttribute.ExceptionEntry>>();
@@ -385,6 +409,34 @@ public class TryCatchReconstructor {
 
         return statements;
     }
+
+    // START_CHANGE: BUG-2026-0068-20260610-2 - Detect a compiler-generated handler-protection
+    // entry: it starts exactly at another entry's handlerPc AND a different entry already
+    // routes to the identical (handlerPc, catchType). Both conditions are required so that
+    // genuine nested user try regions (which start at user code, not at a handler, or which
+    // have their own distinct handler) are never merged away.
+    private static boolean isHandlerProtectionEntry(CodeAttribute.ExceptionEntry entry,
+                                                     CodeAttribute.ExceptionEntry[] table) {
+        boolean startsAtHandler = false;
+        for (int i = 0; i < table.length; i++) {
+            CodeAttribute.ExceptionEntry other = table[i];
+            if (other != entry && other.handlerPc == entry.startPc) {
+                startsAtHandler = true;
+                break;
+            }
+        }
+        if (!startsAtHandler) return false;
+        for (int i = 0; i < table.length; i++) {
+            CodeAttribute.ExceptionEntry other = table[i];
+            if (other != entry && other.handlerPc == entry.handlerPc
+                    && other.catchType == entry.catchType
+                    && other.startPc != entry.startPc) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // END_CHANGE: BUG-2026-0068-2
 
     /**
      * Check if the try body is trivial (empty or only variable declarations/assignments).

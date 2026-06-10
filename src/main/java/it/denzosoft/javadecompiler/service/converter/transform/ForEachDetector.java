@@ -37,6 +37,14 @@ public final class ForEachDetector {
 
                 ForEachMatch match = matchCollectionForEach(iterStmt, nextStmt);
                 if (match != null) {
+                    // START_CHANGE: BUG-2026-0069-20260610-1 - Erasure-generics Stage A: the cast
+                    // inside the desugared loop (`String s = (String) it.next()`) reveals the
+                    // element type of the iterated collection. When the iterable is a raw JDK
+                    // collection local declared earlier in the same scope, back-propagate the
+                    // element type onto its declaration through the generic-signature channel
+                    // (BUG-2026-0065) so `List l = Arrays.asList(...)` renders as `List<String> l`.
+                    backPropagateElementType(match.forEachStatement, result);
+                    // END_CHANGE: BUG-2026-0069-1
                     result.add(match.forEachStatement);
                     i += 2;
                     continue;
@@ -94,6 +102,52 @@ public final class ForEachDetector {
         }
         return stmt;
     }
+
+    // START_CHANGE: BUG-2026-0069-20260610-2 - Erasure-generics Stage A helpers: JDK iterables
+    // with exactly ONE type parameter, safe to parameterize from the loop's element type.
+    // User types implementing Iterable are excluded (their type-parameter arity is unknown).
+    private static final java.util.Set<String> SINGLE_PARAM_ITERABLES =
+        new java.util.HashSet<String>(java.util.Arrays.asList(new String[] {
+            "java/lang/Iterable", "java/util/Collection", "java/util/List",
+            "java/util/ArrayList", "java/util/LinkedList", "java/util/Vector",
+            "java/util/Stack", "java/util/Set", "java/util/HashSet",
+            "java/util/LinkedHashSet", "java/util/TreeSet", "java/util/SortedSet",
+            "java/util/NavigableSet", "java/util/Queue", "java/util/Deque",
+            "java/util/ArrayDeque", "java/util/PriorityQueue"
+        }));
+
+    /**
+     * When a detected for-each iterates a raw single-type-parameter JDK collection local with a
+     * known non-Object element type, set the parameterized signature on the collection's
+     * declaration (found among the already-emitted same-scope statements). Conservative: first
+     * loop wins, existing signatures are never overwritten, unknown/raw element types are skipped.
+     */
+    private static void backPropagateElementType(ForEachStatement fes, List<Statement> emitted) {
+        if (!(fes.getIterable() instanceof LocalVariableExpression)) return;
+        Type elemType = fes.getVariableType();
+        if (!(elemType instanceof it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType)
+            || elemType.getDimension() != 0) return;
+        String elemInternal =
+            ((it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType) elemType).getInternalName();
+        if (elemInternal == null || "java/lang/Object".equals(elemInternal)) return;
+        String iterName = ((LocalVariableExpression) fes.getIterable()).getName();
+        for (int k = emitted.size() - 1; k >= 0; k--) {
+            Statement s = emitted.get(k);
+            if (!(s instanceof VariableDeclarationStatement)) continue;
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) s;
+            if (!iterName.equals(vds.getName())) continue;
+            if (vds.getGenericSignature() != null) return;
+            Type dt = vds.getType();
+            if (!(dt instanceof it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType)
+                || dt.getDimension() != 0) return;
+            String rawInternal =
+                ((it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType) dt).getInternalName();
+            if (!SINGLE_PARAM_ITERABLES.contains(rawInternal)) return;
+            vds.setGenericSignature("L" + rawInternal + "<L" + elemInternal + ";>;");
+            return;
+        }
+    }
+    // END_CHANGE: BUG-2026-0069-2
 
     // --- Pattern matching ---
 
