@@ -2,6 +2,40 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.10.0] - 2026-06-10
+
+### Highlights
+- **Construct matrix 57/57 clean** (Java 1.0–25, strict decompile→recompile; was 37/57) — first full sweep.
+- **All 11 verified silent miscompilations eliminated** (wrong code that recompiled cleanly), including
+  `super.m()`→`this.m()` infinite recursion, `return a++` wrong value, deleted ternary branches, switch
+  fall-through cascades, double-evaluated `(b = in.read())` reads, deleted record-constructor validation.
+- **Breadth on 1,674 real JDK 25 classes: 0 crashes, 99.7% marker-clean** (was 93.3%).
+- Java 25: JEP 513 flexible constructor bodies, JEP 512 compact source files, `module-info`
+  `requires transitive`/`static`.
+
+### Added
+- Switch-expression reconstruction: enum-ordinal MatchException defaults, `yield`-block arms, throwing arms,
+  nested switch-expressions, in-place merge substitution (BUG-2026-0066).
+- Pattern-switch folding: guarded `when` arms, synthetic-default skip, tail-case reclaim, unnamed
+  `case Type _` synthesis (BUG-2026-0067).
+- Erasure-bound generic locals without `-g`: for-each element back-prop, generic-factory table,
+  invokedynamic `instantiatedMethodType` SAM unification → `Function<Integer, Integer> f = x -> ...`
+  (BUG-2026-0069 stages A/B/C).
+- Local classes loaded and emitted; anonymous-class `val$` captures substituted with call-site
+  expressions; member-inner synthetic outer parameter stripped (BUG-2026-0097).
+- sealed/permits/non-sealed on nested types with subtype-modifier inference (BUG-2026-0071);
+  class-header and record-component generic signatures (BUG-2026-0094).
+- `wide` opcode decode (BUG-2026-0084); module-info requires flags (BUG-2026-0099);
+  annotation @Retention/@Target/AnnotationDefault emission (BUG-2026-0090).
+
+### Fixed
+- 25 tracked items closed: BUG-2026-0053, 0066, 0067, 0068, 0071, 0080, 0081–0099
+  (full details in `docs/releases/v1.10.0/release-notes.md`).
+- Structural finally dedup (count-based truncation deleted real `return`s); nested synchronized
+  balanced pairing + `static synchronized`; modern TWR handler-protection coalescing and nested
+  collapse; cast-operand precedence; `&&`/`||` merge statement preservation; text-block `\s`
+  trailing-whitespace escapes; dup-store aliasing; record compact-constructor body preservation.
+
 ## [1.9.0] - 2026-06-10
 
 ### Added

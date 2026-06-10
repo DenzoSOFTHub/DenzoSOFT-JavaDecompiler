@@ -294,9 +294,17 @@ public final class BooleanSimplifier {
                     return cond;
                 }
             }
-            if (cond != te.getCondition()) {
-                return new TernaryExpression(te.getLineNumber(), te.getType(), cond, te.getTrueExpression(), te.getFalseExpression());
+            // START_CHANGE: BUG-2026-0053-20260610-1 - Recurse into ternary ARMS in value
+            // context: a nested ternary arm keeps its (possibly int-constant) values, but its
+            // own condition must still be boolean-simplified (`x.equals(y) != 0` → `x.equals(y)`).
+            // Using simplifyBooleanExpr directly on the arms would wrongly reduce an int-valued
+            // `c ? 1 : 0` arm to a bare boolean.
+            Expression trueArm = simplifyTernaryValueArm(te.getTrueExpression());
+            Expression falseArm = simplifyTernaryValueArm(te.getFalseExpression());
+            if (cond != te.getCondition() || trueArm != te.getTrueExpression() || falseArm != te.getFalseExpression()) {
+                return new TernaryExpression(te.getLineNumber(), te.getType(), cond, trueArm, falseArm);
             }
+            // END_CHANGE: BUG-2026-0053-1
             return expr;
         }
         // END_CHANGE: BUG-2026-0047-1
@@ -395,6 +403,24 @@ public final class BooleanSimplifier {
     }
 
     // BUG-2026-0080: simplify each argument; return the original list if nothing changed.
+    // START_CHANGE: BUG-2026-0053-20260610-2 - Value-context recursion for ternary arms:
+    // only descends into nested ternaries (rebuilding their conditions via simplifyBooleanExpr
+    // and their arms via this same helper); every non-ternary arm is returned untouched so
+    // int-valued constants survive in int contexts.
+    private static Expression simplifyTernaryValueArm(Expression expr) {
+        if (expr instanceof TernaryExpression) {
+            TernaryExpression te = (TernaryExpression) expr;
+            Expression cond = simplifyBooleanExpr(te.getCondition());
+            Expression trueArm = simplifyTernaryValueArm(te.getTrueExpression());
+            Expression falseArm = simplifyTernaryValueArm(te.getFalseExpression());
+            if (cond != te.getCondition() || trueArm != te.getTrueExpression() || falseArm != te.getFalseExpression()) {
+                return new TernaryExpression(te.getLineNumber(), te.getType(), cond, trueArm, falseArm);
+            }
+        }
+        return expr;
+    }
+    // END_CHANGE: BUG-2026-0053-2
+
     private static java.util.List<Expression> simplifyArgList(java.util.List<Expression> args) {
         if (args == null || args.isEmpty()) return args;
         java.util.List<Expression> out = null;
