@@ -43,6 +43,18 @@ public class JavaSyntaxResult {
     public void setEncryptedStringMethods(java.util.Set<String> s) { encryptedStringMethods = s; }
     // END_CHANGE: IMP-2026-0009-3
     private int innerClassAccessFlags;
+    // START_CHANGE: BUG-2026-0097-20260610-1 - Metadata for local classes and outer-instance
+    // detection. `isLocalClass` marks classes declared inside a method (InnerClasses entry with
+    // outer_class_info == null but a non-null inner_name); `hasOuterThisField` records that the
+    // class file carried a synthetic this$N field (dropped from the field list), i.e. the class
+    // holds an outer-instance reference and its constructors take a synthetic outer parameter.
+    private boolean isLocalClass;
+    private boolean hasOuterThisField;
+    public boolean isLocalClass() { return isLocalClass; }
+    public void setLocalClass(boolean isLocalClass) { this.isLocalClass = isLocalClass; }
+    public boolean hasOuterThisField() { return hasOuterThisField; }
+    public void setHasOuterThisField(boolean hasOuterThisField) { this.hasOuterThisField = hasOuterThisField; }
+    // END_CHANGE: BUG-2026-0097-1
     // START_CHANGE: IMP-2026-0002-20260420-12 - Class-level decompilation diagnostics.
     // Captures issues that don't belong to any single method: skipped inner classes,
     // signature parse failures, pipeline stage fallbacks. Emitted as a banner at the top

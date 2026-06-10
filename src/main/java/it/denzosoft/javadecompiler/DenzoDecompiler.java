@@ -104,6 +104,11 @@ public class DenzoDecompiler implements Decompiler {
 
         // Create a new converter per call for thread safety (mutable state in instance fields)
         ClassFileToJavaSyntaxConverter converter = new ClassFileToJavaSyntaxConverter();
+        // START_CHANGE: BUG-2026-0069-20260610-12 - Erasure-generics Stage C: hand the pipeline
+        // loader to the converter so a NON-JDK functional interface's class Signature can be
+        // read when typing lambda locals (built-in java.util.function shapes need no loading).
+        converter.setSamSignatureLoader(loader);
+        // END_CHANGE: BUG-2026-0069-12
         try {
             trace.log("converter", "Converting bytecode to Java syntax AST");
             converter.process(message);

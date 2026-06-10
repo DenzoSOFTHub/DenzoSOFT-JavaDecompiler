@@ -183,9 +183,16 @@ public abstract class AstLocalRewriter {
         }
         if (e instanceof MethodReferenceExpression) {
             MethodReferenceExpression m = (MethodReferenceExpression) e;
-            return new MethodReferenceExpression(m.getLineNumber(), m.getType(),
+            // START_CHANGE: BUG-2026-0069-20260610-13 - Stage C: preserve the inferred
+            // functional-interface signature when the method reference is rebuilt.
+            MethodReferenceExpression nm = new MethodReferenceExpression(m.getLineNumber(), m.getType(),
                 m.getObject() != null ? rw(m.getObject()) : null,
                 m.getOwnerInternalName(), m.getMethodName(), m.getDescriptor());
+            if (m.getInterfaceGenericSignature() != null) {
+                nm.setInterfaceGenericSignature(m.getInterfaceGenericSignature());
+            }
+            return nm;
+            // END_CHANGE: BUG-2026-0069-13
         }
         if (e instanceof NewExpression) {
             NewExpression n = (NewExpression) e;
@@ -203,8 +210,15 @@ public abstract class AstLocalRewriter {
         }
         if (e instanceof LambdaExpression) {
             LambdaExpression l = (LambdaExpression) e;
-            return new LambdaExpression(l.getLineNumber(), l.getType(),
+            // START_CHANGE: BUG-2026-0069-20260610-13 - Stage C: preserve the inferred
+            // functional-interface signature when the lambda is rebuilt.
+            LambdaExpression nl = new LambdaExpression(l.getLineNumber(), l.getType(),
                 l.getParameterNames(), l.getParameterTypes(), rewrite(l.getBody()));
+            if (l.getInterfaceGenericSignature() != null) {
+                nl.setInterfaceGenericSignature(l.getInterfaceGenericSignature());
+            }
+            return nl;
+            // END_CHANGE: BUG-2026-0069-13
         }
         if (e instanceof SwitchExpression) {
             SwitchExpression sw = (SwitchExpression) e;
