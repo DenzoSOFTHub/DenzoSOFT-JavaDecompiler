@@ -253,6 +253,63 @@ public class JavaSourceWriter implements Processor {
     }
     // END_CHANGE: BUG-2026-0044-3
 
+    // START_CHANGE: BUG-2026-0071-20260610-1 - Restore sealed/permits/non-sealed on nested types.
+    // Index of every type in the current compilation unit (top-level + nested, recursively),
+    // keyed by internal name. `sealed ... permits` is only emitted when the FULL permitted
+    // hierarchy is visible in this unit, because each permitted subclass must then carry a
+    // valid final/sealed/non-sealed modifier; when a permitted subclass lives in another
+    // compilation unit we cannot guarantee that, so the sealed-ness is dropped entirely
+    // (raw but compilable output).
+    private Map<String, JavaSyntaxResult> unitTypeIndex = new HashMap<String, JavaSyntaxResult>();
+
+    private void indexUnitTypes(JavaSyntaxResult result) {
+        if (result.getInternalName() != null) {
+            unitTypeIndex.put(result.getInternalName(), result);
+        }
+        List<JavaSyntaxResult> inners = result.getInnerClassResults();
+        if (inners != null) {
+            for (JavaSyntaxResult inner : inners) {
+                indexUnitTypes(inner);
+            }
+        }
+    }
+
+    /**
+     * True when the type must be written as `sealed`: it carries a PermittedSubclasses
+     * attribute AND every permitted subclass is written in this compilation unit.
+     * Enums and records never emit sealed/permits (see BUG-2026-0075).
+     */
+    private boolean emitsSealed(JavaSyntaxResult result) {
+        if (!result.isSealed() || result.isEnum() || result.isRecord()) return false;
+        for (int i = 0; i < result.getPermittedSubclasses().size(); i++) {
+            if (!unitTypeIndex.containsKey(result.getPermittedSubclasses().get(i))) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Returns "sealed", "non-sealed" or null for a nested type. Every permitted subclass of
+     * a sealed type emitted in the same unit needs final, sealed or non-sealed: records and
+     * enums are implicitly final (no modifier), ACC_FINAL types already print `final`, a
+     * subclass whose own permitted hierarchy is fully visible prints `sealed`, anything
+     * else prints `non-sealed`.
+     */
+    private String sealedSubtypeKeyword(JavaSyntaxResult inner, boolean printsFinal) {
+        if (inner.isAnnotation()) return null;
+        if (emitsSealed(inner)) return "sealed";
+        if (inner.isEnum() || inner.isRecord() || printsFinal) return null;
+        String name = inner.getInternalName();
+        if (name == null) return null;
+        for (JavaSyntaxResult candidate : unitTypeIndex.values()) {
+            if (candidate != inner && emitsSealed(candidate)
+                    && candidate.getPermittedSubclasses().contains(name)) {
+                return "non-sealed";
+            }
+        }
+        return null;
+    }
+    // END_CHANGE: BUG-2026-0071-1
+
     private int computeMaxLine(JavaSyntaxResult result) {
         int max = 0;
         for (JavaSyntaxResult.MethodDeclaration m : result.getMethods()) {
@@ -294,6 +351,11 @@ public class JavaSourceWriter implements Processor {
         anonymousClassDisplayNames.clear();
         buildAnonymousClassMap(result);
         // END_CHANGE: BUG-2026-0029-2
+
+        // START_CHANGE: BUG-2026-0071-20260610-2 - Index all unit types for sealed/permits emission
+        unitTypeIndex.clear();
+        indexUnitTypes(result);
+        // END_CHANGE: BUG-2026-0071-2
 
         // Module declaration
         if (result.isModule() || (result.getAccessFlags() & 0x8000) != 0) {
@@ -385,18 +447,27 @@ public class JavaSourceWriter implements Processor {
             printer.printText("@");
             printer.printKeyword("interface");
         } else if (result.isInterface()) {
+            // START_CHANGE: BUG-2026-0071-20260610-3 - `sealed` was only emitted on the class
+            // branch; a sealed interface lost it (leaving an illegal bare `permits`). Both
+            // branches now gate on emitsSealed(): the keyword is only restored when the full
+            // permitted hierarchy is visible in this compilation unit.
+            if (emitsSealed(result)) {
+                printer.printKeyword("sealed");
+                printer.printText(" ");
+            }
             printer.printKeyword("interface");
         } else if (result.isEnum()) {
             printer.printKeyword("enum");
         } else if (result.isRecord()) {
             printer.printKeyword("record");
         } else {
-            if (result.isSealed()) {
+            if (emitsSealed(result)) {
                 printer.printKeyword("sealed");
                 printer.printText(" ");
             }
             printer.printKeyword("class");
         }
+        // END_CHANGE: BUG-2026-0071-3
         printer.printText(" ");
         emitDecl(printer,Printer.TYPE, internalName, simpleName, "");
 
@@ -480,7 +551,11 @@ public class JavaSourceWriter implements Processor {
         // Permits (sealed). BUG-2026-0075: an enum with constant bodies carries a PermittedSubclasses
         // attribute (its `Enum$N` constant classes), but `enum ... permits ...` is illegal — never emit
         // permits/sealed for enums or records.
-        if (result.isSealed() && !result.isEnum() && !result.isRecord()) {
+        // START_CHANGE: BUG-2026-0071-20260610-4 - Gate on emitsSealed() (covers the enum/record
+        // guard and additionally requires the whole permitted hierarchy to be in this unit, so
+        // the clause always matches the emitted `sealed` keyword).
+        if (emitsSealed(result)) {
+        // END_CHANGE: BUG-2026-0071-4
             printer.printText(" ");
             printer.printKeyword("permits");
             printer.printText(" ");
@@ -773,6 +848,19 @@ public class JavaSourceWriter implements Processor {
             }
         }
 
+        // START_CHANGE: BUG-2026-0071-20260610-5 - Restore sealed/non-sealed on nested types
+        // (mirrors the top-level emission). `sealed` when the permitted hierarchy is visible
+        // in this unit; `non-sealed` when the type is a permitted subclass of such a sealed
+        // type and carries no implicit/explicit `final` of its own.
+        boolean innerPrintsFinal = (flags & StringConstants.ACC_FINAL) != 0
+            && (flags & 0x4000) == 0; // matches the `final` emission above
+        String sealedKeyword = sealedSubtypeKeyword(inner, innerPrintsFinal);
+        if (sealedKeyword != null) {
+            printer.printKeyword(sealedKeyword);
+            printer.printText(" ");
+        }
+        // END_CHANGE: BUG-2026-0071-5
+
         // Write class/interface/enum keyword + name
         if (inner.isAnnotation()) {
             printer.printText("@");
@@ -865,6 +953,21 @@ public class JavaSourceWriter implements Processor {
             }
             // END_CHANGE: BUG-2026-0094-7
         }
+
+        // START_CHANGE: BUG-2026-0071-20260610-6 - Permits clause for nested sealed types
+        // (mirrors the top-level emission; sealedKeyword is "sealed" only when emitsSealed()
+        // already validated the hierarchy and excluded enums/records).
+        if ("sealed".equals(sealedKeyword)) {
+            printer.printText(" ");
+            printer.printKeyword("permits");
+            printer.printText(" ");
+            for (int i = 0; i < inner.getPermittedSubclasses().size(); i++) {
+                if (i > 0) printer.printText(", ");
+                String sub = inner.getPermittedSubclasses().get(i);
+                emitRef(printer, Printer.TYPE, sub, TypeNameUtil.simpleNameFromInternal(sub), "", null);
+            }
+        }
+        // END_CHANGE: BUG-2026-0071-6
 
         printer.printText(" {");
         printer.endLine();

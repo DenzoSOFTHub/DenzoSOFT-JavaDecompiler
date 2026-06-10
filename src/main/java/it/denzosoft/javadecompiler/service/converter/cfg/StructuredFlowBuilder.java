@@ -684,18 +684,42 @@ public class StructuredFlowBuilder {
                 if (secondCond.trueSuccessor != null &&
                     falseTarget.startPc == secondCond.trueSuccessor.startPc) {
                     Expression cond2 = secondCond.condition;
+                    // START_CHANGE: BUG-2026-0095-20260610-1 - The && merge used to take ONLY
+                    // secondCond.condition and silently DROP secondCond.statements (code guarded
+                    // by the left conjunct): instanceof pattern-binding casts and record-pattern
+                    // component stores vanished while the body still referenced them
+                    // (C_InstanceofPattern.bothNonEmpty, C_RecordPattern.isDiagonal). Merge as
+                    // before only when the block carries no statements. When its single statement
+                    // is the pattern-binding cast of the rightmost conjunct's unbound instanceof
+                    // (javac's lowering of `a instanceof T v && ...`), fold it back into a bound
+                    // `a instanceof T v` and merge. Otherwise REFUSE the merge: the block stays a
+                    // nested if with its statements intact (always semantically correct).
                     if (cond2 != null) {
-                        condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
-                            condition, "&&", cond2);
-                        visited.add(secondCond.startPc);
-                        trueTarget = secondCond.falseSuccessor;
-                        compoundFound = true; // try again for next &&
+                        Expression left095 = condition;
+                        if (secondCond.statements != null && !secondCond.statements.isEmpty()) {
+                            left095 = bindPatternCastIntoRightmostConjunct(condition,
+                                secondCond.statements);
+                        }
+                        if (left095 != null) {
+                            condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
+                                left095, "&&", cond2);
+                            visited.add(secondCond.startPc);
+                            trueTarget = secondCond.falseSuccessor;
+                            compoundFound = true; // try again for next &&
+                        }
                     }
+                    // END_CHANGE: BUG-2026-0095-1
                 } else if (secondCond.falseSuccessor != null &&
                            falseTarget.startPc == secondCond.falseSuccessor.startPc) {
                     // OR pattern: first cond false -> target, second cond fall-through -> same target
                     Expression cond2 = secondCond.condition;
-                    if (cond2 != null) {
+                    // START_CHANGE: BUG-2026-0095-20260610-2 - Same statement-drop guard for the
+                    // || merge. An || operand evaluates only when the left one is FALSE, so it can
+                    // never carry a definitely-assigned pattern binding: require an empty statement
+                    // list, otherwise refuse the merge (nested if keeps the statements).
+                    if (cond2 != null
+                            && (secondCond.statements == null || secondCond.statements.isEmpty())) {
+                    // END_CHANGE: BUG-2026-0095-2
                         condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                             negateCondition(condition, line), "||", cond2);
                         visited.add(secondCond.startPc);
@@ -720,7 +744,13 @@ public class StructuredFlowBuilder {
                 if (secondCond.trueSuccessor != null && secondCond.falseSuccessor != null &&
                     trueTarget.startPc == secondCond.falseSuccessor.startPc) {
                     Expression cond2 = secondCond.condition;
-                    if (cond2 != null) {
+                    // START_CHANGE: BUG-2026-0095-20260610-3 - Statement-drop guard for the
+                    // false-target || chain: merging used to discard secondCond.statements (code
+                    // that runs only when the first condition is false). Require an empty
+                    // statement list, otherwise refuse the merge.
+                    if (cond2 != null
+                            && (secondCond.statements == null || secondCond.statements.isEmpty())) {
+                    // END_CHANGE: BUG-2026-0095-3
                         condition = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN,
                             condition, "||", cond2);
                         visited.add(secondCond.startPc);
@@ -1036,6 +1066,20 @@ public class StructuredFlowBuilder {
                 List<Statement> elseBody = new ArrayList<Statement>();
                 buildFromBlock(falseTarget, elseBody, visited, mergePoint);
 
+                // START_CHANGE: BUG-2026-0095-20260610-5 - Shared constant-return false path:
+                // several conditionals can share one `iconst_x; ireturn` exit (javac's boolean
+                // short-circuit lowering). Once a ternary/other branch consumed it, the else
+                // build hit the visited guard and produced an EMPTY else, losing `return false;`
+                // for every other path (C_RecordPattern.isDiagonal). Re-materialize the constant
+                // return: tail-duplicating a `return <const>` is always sound.
+                if (elseBody.isEmpty() && visited.contains(Integer.valueOf(falseTarget.startPc))) {
+                    Statement rematerialized095 = materializeSharedConstantReturn(falseTarget, line);
+                    if (rematerialized095 != null) {
+                        elseBody.add(rematerialized095);
+                    }
+                }
+                // END_CHANGE: BUG-2026-0095-5
+
                 IfElseStatement ifs = new IfElseStatement(line, condition,
                     new BlockStatement(line, thenBody),
                     new BlockStatement(line, elseBody));
@@ -1077,6 +1121,137 @@ public class StructuredFlowBuilder {
 
         return null;
     }
+
+    // START_CHANGE: BUG-2026-0095-20260610-6 - Helpers for the &&/|| statement-drop fix.
+    /**
+     * BUG-2026-0095: javac lowers {@code a instanceof T v && <rest>} to
+     * {@code [a instanceof T; ifeq] -> [checkcast T; astore v; <rest cond>]}, so the second
+     * condition block carries exactly one statement: the pattern-binding cast
+     * {@code T v = (T) a;}. When that cast's operand and type match the rightmost {@code &&}
+     * conjunct's unbound {@code instanceof} (still wrapped in the {@code != 0} scaffold that
+     * extractBranchCondition adds for ifeq; BooleanSimplifier strips it later), fold the
+     * binding back into a bound {@code a instanceof T v} so the merge preserves it.
+     *
+     * @return the rewritten left-hand condition to merge with, or {@code null} to REFUSE the
+     *         merge (the caller then leaves the block as a nested if, which is always correct).
+     */
+    private Expression bindPatternCastIntoRightmostConjunct(Expression condition,
+                                                            List<Statement> stmts) {
+        if (stmts == null || stmts.size() != 1) return null;
+
+        // Recognize the binding cast: `T v = (T) opnd;` or `v = (T) opnd;`.
+        String varName = null;
+        CastExpression cast = null;
+        Statement s = stmts.get(0);
+        if (s instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) s;
+            if (vds.hasInitializer() && vds.getInitializer() instanceof CastExpression) {
+                varName = vds.getName();
+                cast = (CastExpression) vds.getInitializer();
+            }
+        } else if (s instanceof ExpressionStatement
+                && ((ExpressionStatement) s).getExpression() instanceof AssignmentExpression) {
+            AssignmentExpression ae = (AssignmentExpression) ((ExpressionStatement) s).getExpression();
+            if (ae.getLeft() instanceof LocalVariableExpression && "=".equals(ae.getOperator())
+                    && ae.getRight() instanceof CastExpression) {
+                varName = ((LocalVariableExpression) ae.getLeft()).getName();
+                cast = (CastExpression) ae.getRight();
+            }
+        }
+        if (varName == null || cast == null) return null;
+
+        // Rightmost conjunct of the accumulated && chain.
+        Expression rightmost = condition;
+        while (rightmost instanceof BinaryOperatorExpression
+                && "&&".equals(((BinaryOperatorExpression) rightmost).getOperator())) {
+            rightmost = ((BinaryOperatorExpression) rightmost).getRight();
+        }
+        // Unwrap the `!= 0` ifeq scaffold.
+        Expression candidate = rightmost;
+        BinaryOperatorExpression zeroWrapper = null;
+        if (candidate instanceof BinaryOperatorExpression) {
+            BinaryOperatorExpression b = (BinaryOperatorExpression) candidate;
+            if ("!=".equals(b.getOperator()) && isZeroConst(b.getRight())) {
+                zeroWrapper = b;
+                candidate = b.getLeft();
+            }
+        }
+        if (!(candidate instanceof InstanceOfExpression)) return null;
+        InstanceOfExpression io = (InstanceOfExpression) candidate;
+        if (io.hasPatternVariable() || io.hasRecordPattern()) return null;
+
+        // Same type + same operand as the cast (cf. InstanceOfPatternReconstructor).
+        Type castType = cast.getType();
+        if (castType == null || io.getCheckType() == null) return null;
+        if (castType.getDescriptor() == null
+                || !castType.getDescriptor().equals(io.getCheckType().getDescriptor())) return null;
+        if (!sameInstanceOfOperand(cast.getExpression(), io.getExpression())) return null;
+
+        Expression bound = new InstanceOfExpression(io.getLineNumber(), io.getExpression(),
+            io.getCheckType(), varName);
+        if (zeroWrapper != null) {
+            bound = new BinaryOperatorExpression(zeroWrapper.getLineNumber(), PrimitiveType.BOOLEAN,
+                bound, "!=", zeroWrapper.getRight());
+        }
+        return replaceRightmostConjunct(condition, bound);
+    }
+
+    /** Replace the rightmost {@code &&} conjunct of {@code cond} with {@code repl}. */
+    private Expression replaceRightmostConjunct(Expression cond, Expression repl) {
+        if (cond instanceof BinaryOperatorExpression
+                && "&&".equals(((BinaryOperatorExpression) cond).getOperator())) {
+            BinaryOperatorExpression b = (BinaryOperatorExpression) cond;
+            return new BinaryOperatorExpression(b.getLineNumber(), PrimitiveType.BOOLEAN,
+                b.getLeft(), "&&", replaceRightmostConjunct(b.getRight(), repl));
+        }
+        return repl;
+    }
+
+    /** Operand identity for the binding-cast fold: same local slot or same rendered text. */
+    private boolean sameInstanceOfOperand(Expression a, Expression b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        if (a instanceof LocalVariableExpression && b instanceof LocalVariableExpression) {
+            return ((LocalVariableExpression) a).getIndex() == ((LocalVariableExpression) b).getIndex();
+        }
+        return a.toString().equals(b.toString());
+    }
+
+    /**
+     * BUG-2026-0095: re-materialize a shared constant-return exit that was already consumed by
+     * another branch. Two shapes: a bare constant-push value block ({@code iconst_x}) flowing
+     * into a value return, or the {@code iconst_x; ireturn} block itself. Returns a fresh
+     * {@code return <const>;} statement, or {@code null} when the block is anything else.
+     */
+    private Statement materializeSharedConstantReturn(BasicBlock block, int line) {
+        if (block == null) return null;
+        // Shape A: statement-free constant value block falling/jumping into a bare return.
+        if ((block.statements == null || block.statements.isEmpty())
+                && block.stackTopExpression instanceof IntegerConstantExpression) {
+            BasicBlock next = null;
+            if (block.isGoto()) {
+                next = cfg.getBlockAtPc(block.branchTargetPc);
+            } else if (block.type == BasicBlock.FALL_THROUGH || block.type == BasicBlock.NORMAL) {
+                next = block.trueSuccessor;
+            }
+            if (next != null && next.isReturn()
+                    && (next.statements == null || next.statements.isEmpty()
+                        || (next.statements.size() == 1
+                            && next.statements.get(0) instanceof ReturnStatement))) {
+                return new ReturnStatement(line, block.stackTopExpression);
+            }
+        }
+        // Shape B: the block IS the constant return.
+        if (block.isReturn() && block.statements != null && block.statements.size() == 1
+                && block.statements.get(0) instanceof ReturnStatement) {
+            Expression e = ((ReturnStatement) block.statements.get(0)).getExpression();
+            if (e instanceof IntegerConstantExpression) {
+                return new ReturnStatement(line, e);
+            }
+        }
+        return null;
+    }
+    // END_CHANGE: BUG-2026-0095-6
 
     /**
      * Compute merge point for pre-computation cache (delegates to full computation).
@@ -1845,6 +2020,14 @@ public class StructuredFlowBuilder {
         if (visited.contains(condBlock.startPc)) return false;
         // Cycle within the probe (loop, not a ternary).
         if (!probing.add(condBlock.startPc)) return false;
+
+        // START_CHANGE: BUG-2026-0095-20260610-4 - A conditional block that carries statements
+        // cannot be folded into a ternary EXPRESSION: buildTernaryExpression emits only the
+        // condition and the two arm values, so the statements would be silently dropped
+        // (C_RecordPattern.isDiagonal lost the `var2 = var5;` component store this way once the
+        // unsound && merge was refused). Let it be built as a nested if instead.
+        if (condBlock.statements != null && !condBlock.statements.isEmpty()) return false;
+        // END_CHANGE: BUG-2026-0095-4
 
         BasicBlock tTrue = condBlock.falseSuccessor;  // fall-through = true
         BasicBlock tFalse = condBlock.trueSuccessor;   // branch = false
