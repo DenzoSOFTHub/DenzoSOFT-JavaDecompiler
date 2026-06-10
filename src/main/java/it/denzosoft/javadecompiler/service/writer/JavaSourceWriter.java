@@ -666,6 +666,19 @@ public class JavaSourceWriter implements Processor {
         }
         // END_CHANGE: BUG-2026-0029-5
 
+        // START_CHANGE: BUG-2026-0090-20260610-4 - Emit class-level annotations on inner classes
+        // (mirrors the top-level emission in writeClassDeclaration). Restores @Retention/@Target
+        // on nested annotation types, which were silently dropped.
+        if (inner.getClassAnnotations() != null) {
+            for (AnnotationInfo ann : inner.getClassAnnotations()) {
+                printer.startLine(lineNumber);
+                writeAnnotation(printer, ann, innerInternalName);
+                printer.endLine();
+                lineNumber++;
+            }
+        }
+        // END_CHANGE: BUG-2026-0090-4
+
         // Write access flags from inner class attribute (static, private, etc.)
         printer.startLine(lineNumber);
         int flags = inner.getInnerClassAccessFlags();
@@ -986,9 +999,32 @@ public class JavaSourceWriter implements Processor {
         if (result.getModuleRequires() != null) {
             for (int i = 0; i < result.getModuleRequires().size(); i++) {
                 String[] req = result.getModuleRequires().get(i);
+                // START_CHANGE: BUG-2026-0099-20260610-3 - Honor requires_flags (JVMS 4.7.25):
+                // skip the compiler-mandated implicit `requires java.base` (ACC_MANDATED) and
+                // emit the `transitive` (ACC_TRANSITIVE) / `static` (ACC_STATIC_PHASE) modifiers.
+                int reqFlags = 0;
+                if (req.length > 2 && req[2] != null) {
+                    try {
+                        reqFlags = Integer.parseInt(req[2]);
+                    } catch (NumberFormatException nfe) {
+                        reqFlags = 0;
+                    }
+                }
+                if ((reqFlags & 0x8000) != 0 && "java.base".equals(req[0].replace('/', '.'))) {
+                    continue; // implicit requires, declaring it explicitly is just noise
+                }
                 printer.startLine(lineNumber++);
                 printer.printKeyword("requires");
                 printer.printText(" ");
+                if ((reqFlags & 0x0020) != 0) { // ACC_TRANSITIVE
+                    printer.printKeyword("transitive");
+                    printer.printText(" ");
+                }
+                if ((reqFlags & 0x0040) != 0) { // ACC_STATIC_PHASE
+                    printer.printKeyword("static");
+                    printer.printText(" ");
+                }
+                // END_CHANGE: BUG-2026-0099-3
                 printer.printText(req[0].replace('/', '.'));
                 printer.printText(";");
                 printer.endLine();
@@ -1101,6 +1137,14 @@ public class JavaSourceWriter implements Processor {
             collectSignatureImports(imports, result.getSignature(), thisPackage);
         }
 
+        // START_CHANGE: BUG-2026-0090-20260610-6 - Collect imports from emitted annotations
+        // (class-level, field, method, parameter) and their element values (enum constants,
+        // class literals, nested annotations). Annotations were rendered with simple names
+        // but their types were never imported, breaking recompilation of e.g.
+        // @Retention(RetentionPolicy.RUNTIME).
+        collectAnnotationImports(imports, result.getClassAnnotations(), thisPackage);
+        // END_CHANGE: BUG-2026-0090-6
+
         // Collect from fields
         for (JavaSyntaxResult.FieldDeclaration field : result.getFields()) {
             addTypeImport(imports, field.type, thisPackage);
@@ -1109,6 +1153,9 @@ public class JavaSourceWriter implements Processor {
                 collectSignatureImports(imports, field.signature, thisPackage);
             }
             // END_CHANGE: BUG-2026-0040-1
+            // START_CHANGE: BUG-2026-0090-20260610-7 - Field annotation imports
+            collectAnnotationImports(imports, field.annotations, thisPackage);
+            // END_CHANGE: BUG-2026-0090-7
         }
 
         // Collect from methods
@@ -1127,6 +1174,19 @@ public class JavaSourceWriter implements Processor {
             if (method.signature != null) {
                 collectSignatureImports(imports, method.signature, thisPackage);
             }
+            // START_CHANGE: BUG-2026-0090-20260610-8 - Method/parameter annotation imports
+            // and the AnnotationDefault element value (enum constants, class literals).
+            collectAnnotationImports(imports, method.annotations, thisPackage);
+            collectAnnotationImports(imports, method.returnTypeAnnotations, thisPackage);
+            if (method.parameterAnnotations != null) {
+                for (List<AnnotationInfo> pAnns : method.parameterAnnotations) {
+                    collectAnnotationImports(imports, pAnns, thisPackage);
+                }
+            }
+            if (method.annotationDefault != null) {
+                collectElementValueImports(imports, method.annotationDefault, thisPackage);
+            }
+            // END_CHANGE: BUG-2026-0090-8
             // Walk body statements for types used in expressions
             if (method.body != null) {
                 for (Statement stmt : method.body) {
@@ -1156,6 +1216,57 @@ public class JavaSourceWriter implements Processor {
             addTypeImport(imports, elem, thisPackage);
         }
     }
+
+    // START_CHANGE: BUG-2026-0090-20260610-9 - Import collection for annotations and their
+    // element values, mirroring what writeAnnotation/writeElementValue render as simple names.
+    private void collectAnnotationImports(Set<String> imports, List<AnnotationInfo> annotations,
+                                          String thisPackage) {
+        if (annotations == null) return;
+        for (AnnotationInfo ann : annotations) {
+            collectAnnotationImport(imports, ann, thisPackage);
+        }
+    }
+
+    private void collectAnnotationImport(Set<String> imports, AnnotationInfo ann, String thisPackage) {
+        if (ann == null) return;
+        addDescriptorImport(imports, ann.getTypeDescriptor(), thisPackage);
+        if (ann.getElementValuePairs() != null) {
+            for (AnnotationInfo.ElementValuePair pair : ann.getElementValuePairs()) {
+                collectElementValueImports(imports, pair.getValue(), thisPackage);
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void collectElementValueImports(Set<String> imports, AnnotationInfo.ElementValue ev,
+                                            String thisPackage) {
+        if (ev == null) return;
+        char tag = ev.getTag();
+        Object value = ev.getValue();
+        if (tag == 'e') {
+            addDescriptorImport(imports, ((String[]) value)[0], thisPackage);
+        } else if (tag == 'c') {
+            addDescriptorImport(imports, (String) value, thisPackage);
+        } else if (tag == '@') {
+            collectAnnotationImport(imports, (AnnotationInfo) value, thisPackage);
+        } else if (tag == '[') {
+            List<AnnotationInfo.ElementValue> elements = (List<AnnotationInfo.ElementValue>) value;
+            for (int i = 0; i < elements.size(); i++) {
+                collectElementValueImports(imports, elements.get(i), thisPackage);
+            }
+        }
+    }
+
+    /** Adds an import for a field descriptor like {@code Ljava/lang/annotation/Retention;} (array dims allowed). */
+    private void addDescriptorImport(Set<String> imports, String descriptor, String thisPackage) {
+        if (descriptor == null) return;
+        int idx = 0;
+        while (idx < descriptor.length() && descriptor.charAt(idx) == '[') idx++;
+        if (idx < descriptor.length() - 1 && descriptor.charAt(idx) == 'L' && descriptor.endsWith(";")) {
+            addImport(imports, descriptor.substring(idx + 1, descriptor.length() - 1), thisPackage);
+        }
+    }
+    // END_CHANGE: BUG-2026-0090-9
 
     private void collectStatementImports(Set<String> imports, Statement stmt, String thisPackage) {
         if (stmt instanceof VariableDeclarationStatement) {
@@ -1974,6 +2085,16 @@ public class JavaSourceWriter implements Processor {
 
         // Body
         if (method.isAbstract() || method.isNative()) {
+            // START_CHANGE: BUG-2026-0090-20260610-5 - Emit `default <value>` for annotation
+            // type elements carrying an AnnotationDefault attribute, reusing the annotation
+            // element-value rendering.
+            if (method.annotationDefault != null && result != null && result.isAnnotation()) {
+                printer.printText(" ");
+                printer.printKeyword("default");
+                printer.printText(" ");
+                writeElementValue(printer, method.annotationDefault, ownerInternalName);
+            }
+            // END_CHANGE: BUG-2026-0090-5
             printer.printText(";");
             // START_CHANGE: IMP-LINES-20260326-9 - JNI comments only when showNativeInfo is enabled
             if (method.isNative() && showNativeInfo) {

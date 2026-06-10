@@ -54,7 +54,11 @@ public class JavaSyntaxResult {
     private String moduleName;
     private int moduleFlags;
     private String moduleVersion;
-    private List<String[]> moduleRequires;  // [name, version]
+    // START_CHANGE: BUG-2026-0099-20260610-1 - Requires rows carry the requires_flags
+    // (JVMS 4.7.25: ACC_TRANSITIVE=0x0020, ACC_STATIC_PHASE=0x0040, ACC_MANDATED=0x8000)
+    // as a decimal string in slot 2 so the writer can emit `transitive`/`static` modifiers.
+    private List<String[]> moduleRequires;  // [name, version, flags]
+    // END_CHANGE: BUG-2026-0099-1
     private List<String[]> moduleExports;   // [name, to...]
     private List<String[]> moduleOpens;     // [name, to...]
     private List<String> moduleUses;
@@ -189,6 +193,10 @@ public class JavaSyntaxResult {
         // which parts of the method were not reconstructed cleanly.
         public java.util.List<String> decompilationNotes;
         // END_CHANGE: IMP-2026-0002-1
+        // START_CHANGE: BUG-2026-0090-20260610-1 - AnnotationDefault attribute value for
+        // annotation type elements; rendered as `default <value>` after the method signature.
+        public AnnotationInfo.ElementValue annotationDefault;
+        // END_CHANGE: BUG-2026-0090-1
 
         public MethodDeclaration(int accessFlags, String name, String descriptor,
                                    Type returnType, List<Type> parameterTypes,
