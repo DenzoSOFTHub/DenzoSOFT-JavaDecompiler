@@ -39,9 +39,9 @@ Index shows ONLY open items.
 |---|---|---|---|
 | BUG-2026-0053 | HIGH | Ternary in lambda body (→ consolidated in BUG-2026-0083) | [BUG-2026-0053](items/BUG-2026-0053.md) |
 | BUG-2026-0056 | HIGH | Try-catch-finally: catch-conditional body still dropped (post-try part FIXED) | [BUG-2026-0056](items/BUG-2026-0056.md) |
-| BUG-2026-0067 | HIGH | Pattern switch: transform folding DONE (exhaustive tail reclaim, `_` components); guarded/unnamed statement-form leak = flow-level (see item residuals 1–2) | [BUG-2026-0067](items/BUG-2026-0067.md) |
+| BUG-2026-0067 | HIGH | Pattern switch: RESOLVED 2026-06-10 (all residuals closed — guarded arms via 0066-18, unnamed type-pattern arms `case Integer _` synthesized from typeSwitch bootstrap labels, sideEffect via 0096; C_Unnamed 2→0, matrix 57/57, runtime-identical) | [BUG-2026-0067](items/BUG-2026-0067.md) |
 | BUG-2026-0068 | HIGH | Modern TWR: RESOLVED 2026-06-10 (single/multi-resource, nested, TWR+catch/finally, single effectively-final all collapse; C_Java7TryResources 3→0). Residuals: multi-resource effectively-final, same-line multi-resource header, parameter resource (see item) | [BUG-2026-0068](items/BUG-2026-0068.md) |
 | BUG-2026-0069 | HIGH | Local decl/type loss: erasure Stages A+B+C DONE 2026-06-10 (foreach back-prop, factory table, aaload component type, indy instantiatedMethodType SAM unification — C_VarInference/C_Optional/C_StreamsAdvanced/C_FunctionalInterfaces/C_VarLambdaParams cleared); remaining: (a) branch-scoped declaration hoisting (see item) | [BUG-2026-0069](items/BUG-2026-0069.md) |
-| BUG-2026-0080 | HIGH | Construct-matrix umbrella (56/57 clean after wave 6: erasure Stage C + 0098 requireNonNull + cluster-22 inner classes; remaining C_Unnamed = 0067; full plan in report-construct-matrix-gap-analysis.md) | [BUG-2026-0080](items/BUG-2026-0080.md) |
+| BUG-2026-0080 | HIGH | Construct-matrix umbrella: **57/57 CLEAN** 2026-06-10 (wave 7: C_Unnamed cleared via 0067 unnamed type-pattern arms; 0 crashes; full plan in report-construct-matrix-gap-analysis.md) | [BUG-2026-0080](items/BUG-2026-0080.md) |
 
 Closed 2026-06-10 (verified fixed in v1.9.0, files in docs/releases/v1.9.0/): BUG-2026-0052, BUG-2026-0054, BUG-2026-0055.

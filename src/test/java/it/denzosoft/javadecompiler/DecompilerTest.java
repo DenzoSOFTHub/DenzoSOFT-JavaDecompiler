@@ -68,6 +68,9 @@ public class DecompilerTest {
         testExhaustiveSwitchRecordPattern(); // BUG-2026-0067: no-default record switch (tail-arm reclaim)
         testUnnamedPatternComponent();       // BUG-2026-0067: dead component folds to `Type _`
         // END_CHANGE: BUG-2026-0067-49
+        // START_CHANGE: BUG-2026-0067-20260610-57 - Unnamed type-pattern switch arms.
+        testUnnamedTypePatternArm(); // BUG-2026-0067: `case Integer _ ->` (no cast-bind in arm)
+        // END_CHANGE: BUG-2026-0067-57
         testInstanceofAmpersand();  // BUG-2026-0067: `o instanceof X v && v.m()` binding
         testUndeclaredAssignPromotion(); // BUG-2026-0077: reused slot gets a declaration
         testWhileTrueBreak();       // BUG-2026-0078: break out of while(true)
@@ -534,6 +537,25 @@ public class DecompilerTest {
             new String[]{"MatchException", "catch (Throwable"});
     }
     // END_CHANGE: BUG-2026-0067-50
+
+    // START_CHANGE: BUG-2026-0067-20260610-57 - Unnamed type-pattern switch arm: the binding is
+    // dead so javac emits NO cast-bind statement in the arm block; the pattern type must be
+    // synthesized from the typeSwitch bootstrap labels (`case Integer _ -> "int"`).
+    private static void testUnnamedTypePatternArm() {
+        runTestFull("UnArm",
+            "public class UnArm {\n" +
+            "    String kind(Object o) {\n" +
+            "        return switch (o) {\n" +
+            "            case Integer _ -> \"int\";\n" +
+            "            case String _ -> \"string\";\n" +
+            "            default -> \"other\";\n" +
+            "        };\n" +
+            "    }\n" +
+            "}\n",
+            new String[]{"switch", "case Integer _", "case String _", "default", "->"},
+            new String[]{"SwitchBootstraps", "typeSwitch"});
+    }
+    // END_CHANGE: BUG-2026-0067-57
 
     // BUG-2026-0067: a pattern binding used in the `&&` tail is recovered: `o instanceof X v && v.m()`.
     private static void testInstanceofAmpersand() {
