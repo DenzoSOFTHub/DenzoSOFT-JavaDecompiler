@@ -113,15 +113,42 @@ public class DecompilerTest {
     }
 
     private static void testSealedClass() {
-        // Create multiple files for sealed class hierarchy
-        runTest("SealedBase",
-            "public abstract sealed class SealedBase permits SealedSub {\n" +
-            "    abstract int compute();\n" +
-            "}\n" +
-            "final class SealedSub extends SealedBase {\n" +
-            "    int compute() { return 42; }\n" +
+        // START_CHANGE: BUG-2026-0071-20260610-7 - sealed/permits/non-sealed round-trip.
+        // `sealed ... permits` is only emitted when the full permitted hierarchy is visible in
+        // the same compilation unit (nested types), because every permitted subclass must then
+        // carry a valid final/sealed/non-sealed modifier. The multi-class loader serves the
+        // nested class files.
+        runTestNested("SealedBase",
+            "public class SealedBase {\n" +
+            "    public sealed interface Expr permits Fixed, Open {\n" +
+            "    }\n" +
+            "    public static final class Fixed implements Expr {\n" +
+            "    }\n" +
+            "    public static non-sealed class Open implements Expr {\n" +
+            "    }\n" +
+            "    public sealed static abstract class Shape permits Square {\n" +
+            "        abstract int compute();\n" +
+            "    }\n" +
+            "    public static final class Square extends Shape {\n" +
+            "        int compute() { return 42; }\n" +
+            "    }\n" +
             "}",
-            new String[]{"sealed class SealedBase", "permits SealedSub", "abstract"});
+            new String[]{"sealed interface Expr permits SealedBase.Fixed, SealedBase.Open",
+                         "non-sealed class Open",
+                         "sealed class Shape permits SealedBase.Square"});
+        // Isolated parent: the permitted subclass is NOT visible in this compilation unit
+        // (single-class loader), so sealed/permits must be omitted entirely — emitting them
+        // would require modifiers on subclasses decompiled elsewhere (uncompilable batch
+        // output). Raw but compilable.
+        runTestFull("SealedIso",
+            "public sealed class SealedIso permits SealedIsoSub {\n" +
+            "    int compute() { return 1; }\n" +
+            "}\n" +
+            "final class SealedIsoSub extends SealedIso {\n" +
+            "}",
+            new String[]{"class SealedIso"},
+            new String[]{"sealed", "permits"});
+        // END_CHANGE: BUG-2026-0071-7
     }
 
     private static void testStaticInit() {
@@ -568,6 +595,81 @@ public class DecompilerTest {
             failed++;
         }
     }
+
+    // START_CHANGE: BUG-2026-0071-20260610-8 - Variant of runTestFull whose loader serves every
+    // class file produced in the temp dir, so nested/inner classes are decompiled too (the
+    // single-class loader of runTest/runTestFull cannot exercise nested-type emission such as
+    // sealed hierarchies).
+    private static void runTestNested(String className, String sourceCode, String[] mustContain) {
+        total++;
+        try {
+            final java.io.File tmpDir = new java.io.File(System.getProperty("java.io.tmpdir"), "decompiler-test");
+            tmpDir.mkdirs();
+            java.io.File srcFile = new java.io.File(tmpDir, className + ".java");
+            java.io.FileWriter fw = new java.io.FileWriter(srcFile);
+            fw.write(sourceCode);
+            fw.close();
+
+            ProcessBuilder pb = new ProcessBuilder(javacPath, "-d", tmpDir.getAbsolutePath(), srcFile.getAbsolutePath());
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            if (p.waitFor() != 0) {
+                System.out.println("[SKIP] " + className + " - compilation failed");
+                return;
+            }
+
+            DenzoDecompiler decompiler = new DenzoDecompiler();
+            StringPrinter printer = new StringPrinter();
+            Loader loader = new Loader() {
+                public boolean canLoad(String internalName) {
+                    return new java.io.File(tmpDir, internalName + ".class").exists();
+                }
+                public byte[] load(String internalName) throws Exception {
+                    java.io.FileInputStream fis = new java.io.FileInputStream(
+                        new java.io.File(tmpDir, internalName + ".class"));
+                    java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                    byte[] buffer = new byte[4096];
+                    int n;
+                    while ((n = fis.read(buffer)) != -1) baos.write(buffer, 0, n);
+                    fis.close();
+                    return baos.toByteArray();
+                }
+            };
+            decompiler.decompile(loader, printer, className);
+            String result = printer.getResult();
+
+            StringBuilder problems = new StringBuilder();
+            for (int i = 0; i < mustContain.length; i++) {
+                if (!result.contains(mustContain[i])) {
+                    if (problems.length() > 0) problems.append(", ");
+                    problems.append("missing \"").append(mustContain[i]).append("\"");
+                }
+            }
+            if (problems.length() == 0) {
+                System.out.println("[PASS] " + className);
+                passed++;
+            } else {
+                System.out.println("[FAIL] " + className + " - " + problems);
+                System.out.println("       Output: " + result.replace("\n", "\\n"));
+                failed++;
+            }
+            srcFile.delete();
+            java.io.File[] produced = tmpDir.listFiles();
+            if (produced != null) {
+                for (int i = 0; i < produced.length; i++) {
+                    String fname = produced[i].getName();
+                    if (fname.endsWith(".class")
+                            && (fname.equals(className + ".class") || fname.startsWith(className + "$"))) {
+                        produced[i].delete();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[FAIL] " + className + " - " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            failed++;
+        }
+    }
+    // END_CHANGE: BUG-2026-0071-8
 
     private static void runTest(String className, String sourceCode, String[] expectedContains) {
         total++;

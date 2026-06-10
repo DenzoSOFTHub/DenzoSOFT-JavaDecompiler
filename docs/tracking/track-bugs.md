@@ -28,7 +28,6 @@ Index shows ONLY open items.
 | BUG-2026-0091 | HIGH | Count-based finally dedup deletes trailing returns | [BUG-2026-0091](items/BUG-2026-0091.md) |
 | BUG-2026-0092 | HIGH | Nested synchronized flattened; `static synchronized` modifier dropped | [BUG-2026-0092](items/BUG-2026-0092.md) |
 | BUG-2026-0093 | HIGH | Cast operand printed without precedence parens (`(T) a >= 0 ? x : y`) | [BUG-2026-0093](items/BUG-2026-0093.md) |
-| BUG-2026-0095 | HIGH | `&&`/`||` merge discards second condition block's statements | [BUG-2026-0095](items/BUG-2026-0095.md) |
 | BUG-2026-0096 | MEDIUM | No-LVT slot typing: boolean as int; incompatible slot reuse shares one var | [BUG-2026-0096](items/BUG-2026-0096.md) |
 | BUG-2026-0097 | HIGH | Local classes never loaded; anonymous `val$` captures unmapped; outer param leaks | [BUG-2026-0097](items/BUG-2026-0097.md) |
 | BUG-2026-0098 | COSMETIC | Synthetic `Objects.requireNonNull(receiver)` leaks as statement | [BUG-2026-0098](items/BUG-2026-0098.md) |
@@ -44,7 +43,6 @@ Index shows ONLY open items.
 | BUG-2026-0067 | HIGH | Pattern switch: MatchException default + empty tail case still bail folding | [BUG-2026-0067](items/BUG-2026-0067.md) |
 | BUG-2026-0068 | HIGH | Modern TWR: nested/multi-resource/effectively-final shapes still uncollapsed | [BUG-2026-0068](items/BUG-2026-0068.md) |
 | BUG-2026-0069 | HIGH | Local decl/type loss (ternary part → 0083; slot part → 0096; generics → erasure plan) | [BUG-2026-0069](items/BUG-2026-0069.md) |
-| BUG-2026-0071 | LOW | sealed/permits/non-sealed dropped on nested types (prereq for 0067) | [BUG-2026-0071](items/BUG-2026-0071.md) |
 | BUG-2026-0080 | HIGH | Construct-matrix umbrella (37/57 clean; full plan in report-construct-matrix-gap-analysis.md) | [BUG-2026-0080](items/BUG-2026-0080.md) |
 
 Closed 2026-06-10 (verified fixed in v1.9.0, files in docs/releases/v1.9.0/): BUG-2026-0052, BUG-2026-0054, BUG-2026-0055.
