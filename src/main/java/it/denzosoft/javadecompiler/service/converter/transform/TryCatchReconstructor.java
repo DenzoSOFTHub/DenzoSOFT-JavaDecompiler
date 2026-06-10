@@ -13,6 +13,9 @@ import it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType;
 import it.denzosoft.javadecompiler.model.javasyntax.type.Type;
 import it.denzosoft.javadecompiler.service.converter.cfg.BasicBlock;
 import it.denzosoft.javadecompiler.service.converter.cfg.ControlFlowGraph;
+// START_CHANGE: BUG-2026-0056-20260610-2 - Structured handler-body decoding
+import it.denzosoft.javadecompiler.service.converter.cfg.StructuredFlowBuilder;
+// END_CHANGE: BUG-2026-0056-2
 
 import java.util.*;
 
@@ -30,6 +33,15 @@ public class TryCatchReconstructor {
     // START_CHANGE: ISS-2026-0005-20260324-6 - Handler PC to exception variable name map
     private final Map<Integer, String> handlerVarNames;
     // END_CHANGE: ISS-2026-0005-6
+    // START_CHANGE: BUG-2026-0056-20260610-3 - Optional structured flow builder used to decode
+    // handler bodies that contain internal control flow (conditionals/switches). When unset, the
+    // legacy linear walk is used for all handlers.
+    private StructuredFlowBuilder flowBuilder;
+
+    public void setFlowBuilder(StructuredFlowBuilder flowBuilder) {
+        this.flowBuilder = flowBuilder;
+    }
+    // END_CHANGE: BUG-2026-0056-3
 
     public TryCatchReconstructor(ControlFlowGraph cfg,
                                   Map<Integer, Integer> pcToLine,
@@ -118,8 +130,47 @@ public class TryCatchReconstructor {
             }
         });
 
+        // START_CHANGE: BUG-2026-0056-20260610-20 - The per-group wrapping is factored out into
+        // applyGroup so it can recurse into structured statement bodies (a try region inside a
+        // loop built by the flow builder) and into decoded handler bodies (a nested try inside a
+        // catch). Groups that found no statements anywhere are kept as pending candidates: when
+        // an OUTER group later decodes its handler body, the pending groups are offered that
+        // body (the nested try's statements only exist there).
+        pendingNestedGroups = new ArrayList<List<CodeAttribute.ExceptionEntry>>();
         for (String key : groupKeys) {
             List<CodeAttribute.ExceptionEntry> groupEntries = groups.get(key);
+            nestedGroupCandidate = false;
+            List<Statement> replaced = applyGroup(statements, groupEntries, sortedPcs);
+            if (replaced != null) {
+                statements = replaced;
+            } else if (nestedGroupCandidate) {
+                pendingNestedGroups.add(groupEntries);
+            }
+        }
+
+        // START_CHANGE: BUG-2026-0056-20260610-12 - Retype `Object v = null` declarations whose
+        // every subsequent assignment has one single concrete reference type (e.g. the variable
+        // assigned inside the try from a String-returning call and returned after the
+        // try-catch-finally). The decoder types a slot initialised by aconst_null as Object;
+        // without retyping, `return v;` in a non-Object method does not recompile.
+        retypeNullObjectDeclarations(statements);
+        // END_CHANGE: BUG-2026-0056-12
+
+        return statements;
+    }
+
+    /** Groups that found no statements at any level yet (likely nested inside a handler). */
+    private List<List<CodeAttribute.ExceptionEntry>> pendingNestedGroups;
+    /** Set by applyGroup when the group failed ONLY because no statements were found. */
+    private boolean nestedGroupCandidate;
+
+    /**
+     * Apply one exception-table group to a statement list. Returns the new statement list, or
+     * null when the group's try region does not match any statements in the list.
+     */
+    private List<Statement> applyGroup(List<Statement> statements,
+                                        List<CodeAttribute.ExceptionEntry> groupEntries,
+                                        List<Integer> sortedPcs) {
             CodeAttribute.ExceptionEntry firstEntry = groupEntries.get(0);
             int tryStartPc = firstEntry.startPc;
             int tryEndPc = firstEntry.endPc;
@@ -127,7 +178,7 @@ public class TryCatchReconstructor {
             int tryStartLine = findLineForPc(tryStartPc, sortedPcs);
             int tryEndLine = findLineBeforePc(tryEndPc, sortedPcs);
 
-            if (tryStartLine < 0) continue;
+            if (tryStartLine < 0) return null;
 
             List<Statement> tryBody = new ArrayList<Statement>();
             List<Statement> beforeTry = new ArrayList<Statement>();
@@ -180,7 +231,18 @@ public class TryCatchReconstructor {
                 }
             }
 
-            if (tryBody.isEmpty()) continue;
+            // START_CHANGE: BUG-2026-0056-20260610-21 - No top-level statement falls in the try
+            // region: the region may live inside a structured statement the flow builder already
+            // built (try-catch inside a loop / if branch). Recurse into compound bodies before
+            // giving up; if that fails too, mark the group as a nested-handler candidate.
+            if (tryBody.isEmpty()) {
+                List<Statement> nested = applyGroupInsideCompound(
+                    statements, groupEntries, sortedPcs, tryStartLine);
+                if (nested != null) return nested;
+                nestedGroupCandidate = true;
+                return null;
+            }
+            // END_CHANGE: BUG-2026-0056-21
 
             List<TryCatchStatement.CatchClause> catchClauses =
                 new ArrayList<TryCatchStatement.CatchClause>();
@@ -256,6 +318,13 @@ public class TryCatchReconstructor {
                 boolean exceptionStoreRemoved = handlerBody.size() < handlerSizeBeforeStoreStrip;
                 // END_CHANGE: BUG-2026-0091-1
 
+                // START_CHANGE: BUG-2026-0056-20260610-24 - A nested try-catch reconstructed
+                // INSIDE this handler body may use the same exception variable name (both
+                // default to "e" when no LVT is present). Rename the nested clause and its
+                // body so the inner declaration does not collide with the outer catch's.
+                handlerBody = disambiguateNestedCatchVars(handlerBody, varName);
+                // END_CHANGE: BUG-2026-0056-24
+
                 int handlerLine = findLineForPc(handlerPc, sortedPcs);
                 if (handlerLine < 0) handlerLine = tryStartLine;
 
@@ -297,7 +366,7 @@ public class TryCatchReconstructor {
                 }
             }
 
-            if (catchClauses.isEmpty() && finallyBody == null) continue;
+            if (catchClauses.isEmpty() && finallyBody == null) return null;
 
             if (finallyBody != null && finallyBody instanceof BlockStatement) {
                 // START_CHANGE: BUG-2026-0091-20260610-3 - Pass the actual finally statements
@@ -346,7 +415,7 @@ public class TryCatchReconstructor {
             // complex nested try-catch for resource management but the actual body is lost
             // during decompilation. Emitting the original linear statements is more compilable.
             if (isTryBodyTrivial(tryBody) && isTryWithResourcesPattern(catchClauses, finallyBody)) {
-                continue; // skip this exception group - emit original statements unchanged
+                return null; // skip this exception group - emit original statements unchanged
             }
 
             // START_CHANGE: LIM-0008-20260326-1 - Try-with-resources resource extraction
@@ -393,6 +462,61 @@ public class TryCatchReconstructor {
             }
             // END_CHANGE: LIM-0008-1
 
+            // START_CHANGE: BUG-2026-0056-20260610-11 - Hoist a variable that is DECLARED inside
+            // the try body but referenced in a catch clause, the finally body or the code after
+            // the try (e.g. `String r = call();` in the try, `r = fallback;` in the catch,
+            // `return r;` after). Leaving the declaration inside the try makes the recompiled
+            // catch/after-try references unresolvable. The declaration is demoted to an
+            // assignment and a definite-assignment-safe declaration (null / zero initialised)
+            // is prepended before the try. Names redeclared in any other region (slot-reuse
+            // scopes) are left untouched.
+            for (int ti = 0; ti < tryBody.size(); ti++) {
+                Statement ts = tryBody.get(ti);
+                if (!(ts instanceof VariableDeclarationStatement)) continue;
+                VariableDeclarationStatement vds = (VariableDeclarationStatement) ts;
+                if (!vds.hasInitializer()) continue;
+                String hoistName = vds.getName();
+                boolean referencedOutside = statementsReferenceVar(afterTry, hoistName);
+                if (!referencedOutside) {
+                    for (TryCatchStatement.CatchClause cc : catchClauses) {
+                        if (cc.body != null && statementReferencesVar(cc.body, hoistName)) {
+                            referencedOutside = true;
+                            break;
+                        }
+                    }
+                }
+                if (!referencedOutside && finallyBody != null
+                        && statementReferencesVar(finallyBody, hoistName)) {
+                    referencedOutside = true;
+                }
+                if (!referencedOutside) continue;
+                boolean redeclared = statementsDeclareVar(beforeTry, hoistName)
+                    || statementsDeclareVar(afterTry, hoistName);
+                if (!redeclared) {
+                    for (TryCatchStatement.CatchClause cc : catchClauses) {
+                        if (hoistName.equals(cc.variableName)
+                                || (cc.body != null && statementDeclaresVar(cc.body, hoistName))) {
+                            redeclared = true;
+                            break;
+                        }
+                    }
+                }
+                if (!redeclared && finallyBody != null
+                        && statementDeclaresVar(finallyBody, hoistName)) {
+                    redeclared = true;
+                }
+                if (redeclared) continue;
+                Expression defaultInit = defaultInitializerFor(vds.getType(), vds.getLineNumber());
+                if (defaultInit == null) continue; // cannot build a DA-safe initializer
+                beforeTry.add(new VariableDeclarationStatement(vds.getLineNumber(),
+                    vds.getType(), hoistName, defaultInit, false, false));
+                tryBody.set(ti, new ExpressionStatement(new AssignmentExpression(
+                    vds.getLineNumber(), vds.getType(),
+                    new LocalVariableExpression(vds.getLineNumber(), vds.getType(), hoistName, -1),
+                    "=", vds.getInitializer())));
+            }
+            // END_CHANGE: BUG-2026-0056-11
+
             TryCatchStatement tcs = new TryCatchStatement(
                 tryStartLine,
                 new BlockStatement(tryStartLine, tryBody),
@@ -404,11 +528,501 @@ public class TryCatchReconstructor {
             newStatements.addAll(beforeTry);
             newStatements.add(tcs);
             newStatements.addAll(afterTry);
-            statements = newStatements;
-        }
-
-        return statements;
+            return newStatements;
     }
+
+    /**
+     * Try to apply the group inside the body of a top-level compound statement whose body's
+     * line span contains the try region's start line (try-catch inside a loop, an if branch,
+     * a synchronized block...). Returns the rebuilt statement list or null.
+     */
+    private List<Statement> applyGroupInsideCompound(List<Statement> statements,
+                                                      List<CodeAttribute.ExceptionEntry> groupEntries,
+                                                      List<Integer> sortedPcs,
+                                                      int tryStartLine) {
+        for (int i = 0; i < statements.size(); i++) {
+            Statement s = statements.get(i);
+            List<List<Statement>> bodies = compoundBodies(s);
+            if (bodies == null) continue;
+            for (int bi = 0; bi < bodies.size(); bi++) {
+                List<Statement> innerStmts = bodies.get(bi);
+                int[] span = lineSpan(innerStmts);
+                if (span == null || tryStartLine < span[0] || tryStartLine > span[1]) continue;
+                List<Statement> rebuilt = applyGroup(
+                    new ArrayList<Statement>(innerStmts), groupEntries, sortedPcs);
+                if (rebuilt == null) continue;
+                Statement newCompound = rebuildCompound(s, bi, rebuilt);
+                if (newCompound == null) continue;
+                List<Statement> out = new ArrayList<Statement>(statements);
+                out.set(i, newCompound);
+                return out;
+            }
+        }
+        return null;
+    }
+
+    /** The block bodies of a compound statement (or null when not a supported compound). */
+    private static List<List<Statement>> compoundBodies(Statement s) {
+        List<List<Statement>> bodies = null;
+        Statement[] parts = compoundParts(s);
+        if (parts == null) return null;
+        for (int i = 0; i < parts.length; i++) {
+            if (!(parts[i] instanceof BlockStatement)) return null;
+            if (bodies == null) bodies = new ArrayList<List<Statement>>();
+            bodies.add(((BlockStatement) parts[i]).getStatements());
+        }
+        return bodies;
+    }
+
+    private static Statement[] compoundParts(Statement s) {
+        if (s instanceof WhileStatement) {
+            return new Statement[] { ((WhileStatement) s).getBody() };
+        }
+        if (s instanceof DoWhileStatement) {
+            return new Statement[] { ((DoWhileStatement) s).getBody() };
+        }
+        if (s instanceof ForStatement) {
+            return new Statement[] { ((ForStatement) s).getBody() };
+        }
+        if (s instanceof ForEachStatement) {
+            return new Statement[] { ((ForEachStatement) s).getBody() };
+        }
+        if (s instanceof SynchronizedStatement) {
+            return new Statement[] { ((SynchronizedStatement) s).getBody() };
+        }
+        if (s instanceof LabelStatement) {
+            return new Statement[] { ((LabelStatement) s).getBody() };
+        }
+        if (s instanceof IfStatement) {
+            return new Statement[] { ((IfStatement) s).getThenBody() };
+        }
+        if (s instanceof IfElseStatement) {
+            return new Statement[] { ((IfElseStatement) s).getThenBody(),
+                                     ((IfElseStatement) s).getElseBody() };
+        }
+        return null;
+    }
+
+    /** Rebuild the compound statement with body index {@code bi} replaced. */
+    private static Statement rebuildCompound(Statement s, int bi, List<Statement> newBody) {
+        Statement[] parts = compoundParts(s);
+        if (parts == null || bi >= parts.length) return null;
+        BlockStatement nb = new BlockStatement(parts[bi].getLineNumber(), newBody);
+        if (s instanceof WhileStatement) {
+            WhileStatement ws = (WhileStatement) s;
+            return new WhileStatement(ws.getLineNumber(), ws.getCondition(), nb);
+        }
+        if (s instanceof DoWhileStatement) {
+            DoWhileStatement dws = (DoWhileStatement) s;
+            return new DoWhileStatement(dws.getLineNumber(), dws.getCondition(), nb);
+        }
+        if (s instanceof ForStatement) {
+            ForStatement fs = (ForStatement) s;
+            return new ForStatement(fs.getLineNumber(), fs.getInit(), fs.getCondition(),
+                fs.getUpdate(), nb);
+        }
+        if (s instanceof ForEachStatement) {
+            ForEachStatement fes = (ForEachStatement) s;
+            return new ForEachStatement(fes.getLineNumber(), fes.getVariableType(),
+                fes.getVariableName(), fes.getIterable(), nb);
+        }
+        if (s instanceof SynchronizedStatement) {
+            SynchronizedStatement ss = (SynchronizedStatement) s;
+            return new SynchronizedStatement(ss.getLineNumber(), ss.getMonitor(), nb);
+        }
+        if (s instanceof LabelStatement) {
+            LabelStatement ls = (LabelStatement) s;
+            return new LabelStatement(ls.getLineNumber(), ls.getLabel(), nb);
+        }
+        if (s instanceof IfStatement) {
+            IfStatement is = (IfStatement) s;
+            return new IfStatement(is.getLineNumber(), is.getCondition(), nb);
+        }
+        if (s instanceof IfElseStatement) {
+            IfElseStatement ies = (IfElseStatement) s;
+            return bi == 0
+                ? new IfElseStatement(ies.getLineNumber(), ies.getCondition(), nb, ies.getElseBody())
+                : new IfElseStatement(ies.getLineNumber(), ies.getCondition(), ies.getThenBody(), nb);
+        }
+        return null;
+    }
+
+    /** Min/max source line over a statement list (recursive), or null when no line is known. */
+    private static int[] lineSpan(List<Statement> stmts) {
+        int[] span = new int[] { Integer.MAX_VALUE, -1 };
+        collectLineSpan(stmts, span);
+        if (span[1] < 0) return null;
+        return span;
+    }
+
+    private static void collectLineSpan(List<Statement> stmts, int[] span) {
+        if (stmts == null) return;
+        for (Statement s : stmts) {
+            collectLineSpan(s, span);
+        }
+    }
+
+    private static void collectLineSpan(Statement s, int[] span) {
+        if (s == null) return;
+        int line = s.getLineNumber();
+        if (line > 0) {
+            if (line < span[0]) span[0] = line;
+            if (line > span[1]) span[1] = line;
+        }
+        if (s instanceof BlockStatement) {
+            collectLineSpan(((BlockStatement) s).getStatements(), span);
+        } else if (s instanceof IfStatement) {
+            collectLineSpan(((IfStatement) s).getThenBody(), span);
+        } else if (s instanceof IfElseStatement) {
+            collectLineSpan(((IfElseStatement) s).getThenBody(), span);
+            collectLineSpan(((IfElseStatement) s).getElseBody(), span);
+        } else if (s instanceof WhileStatement) {
+            collectLineSpan(((WhileStatement) s).getBody(), span);
+        } else if (s instanceof DoWhileStatement) {
+            collectLineSpan(((DoWhileStatement) s).getBody(), span);
+        } else if (s instanceof ForStatement) {
+            collectLineSpan(((ForStatement) s).getInit(), span);
+            collectLineSpan(((ForStatement) s).getBody(), span);
+        } else if (s instanceof ForEachStatement) {
+            collectLineSpan(((ForEachStatement) s).getBody(), span);
+        } else if (s instanceof SynchronizedStatement) {
+            collectLineSpan(((SynchronizedStatement) s).getBody(), span);
+        } else if (s instanceof LabelStatement) {
+            collectLineSpan(((LabelStatement) s).getBody(), span);
+        } else if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            collectLineSpan(t.getTryBody(), span);
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) {
+                collectLineSpan(cc.body, span);
+            }
+            collectLineSpan(t.getFinallyBody(), span);
+        } else if (s instanceof SwitchStatement) {
+            for (SwitchStatement.SwitchCase sc : ((SwitchStatement) s).getCases()) {
+                collectLineSpan(sc.getStatements(), span);
+            }
+        }
+    }
+    // END_CHANGE: BUG-2026-0056-20
+
+    // START_CHANGE: BUG-2026-0056-20260610-25 - Rename nested catch clauses that collide with
+    // the enclosing handler's exception variable name.
+    private static List<Statement> disambiguateNestedCatchVars(List<Statement> stmts,
+                                                                String outerName) {
+        List<Statement> out = new ArrayList<Statement>(stmts.size());
+        boolean changed = false;
+        for (Statement s : stmts) {
+            Statement r = disambiguateNestedCatchVars(s, outerName);
+            if (r != s) changed = true;
+            out.add(r);
+        }
+        return changed ? out : stmts;
+    }
+
+    private static Statement disambiguateNestedCatchVars(Statement s, String outerName) {
+        if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            boolean changed = false;
+            Statement tryB = t.getTryBody();
+            if (tryB instanceof BlockStatement) {
+                List<Statement> nb = disambiguateNestedCatchVars(
+                    ((BlockStatement) tryB).getStatements(), outerName);
+                if (nb != ((BlockStatement) tryB).getStatements()) {
+                    tryB = new BlockStatement(tryB.getLineNumber(), nb);
+                    changed = true;
+                }
+            }
+            List<TryCatchStatement.CatchClause> ccs =
+                new ArrayList<TryCatchStatement.CatchClause>();
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) {
+                Statement body = cc.body;
+                if (body instanceof BlockStatement) {
+                    List<Statement> nb = disambiguateNestedCatchVars(
+                        ((BlockStatement) body).getStatements(), outerName);
+                    if (nb != ((BlockStatement) body).getStatements()) {
+                        body = new BlockStatement(body.getLineNumber(), nb);
+                    }
+                }
+                String vn = cc.variableName;
+                if (outerName != null && outerName.equals(vn)) {
+                    int suffix = 2;
+                    String fresh = vn + suffix;
+                    while (statementReferencesVar(body, fresh)) {
+                        suffix++;
+                        fresh = vn + suffix;
+                    }
+                    body = renameVarInStatement(body, vn, fresh);
+                    vn = fresh;
+                }
+                if (body != cc.body || vn != cc.variableName) {
+                    changed = true;
+                    ccs.add(new TryCatchStatement.CatchClause(cc.exceptionTypes, vn, body));
+                } else {
+                    ccs.add(cc);
+                }
+            }
+            Statement fin = t.getFinallyBody();
+            if (fin instanceof BlockStatement) {
+                List<Statement> nb = disambiguateNestedCatchVars(
+                    ((BlockStatement) fin).getStatements(), outerName);
+                if (nb != ((BlockStatement) fin).getStatements()) {
+                    fin = new BlockStatement(fin.getLineNumber(), nb);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                return new TryCatchStatement(t.getLineNumber(), tryB, ccs, fin, t.getResources());
+            }
+            return s;
+        }
+        if (s instanceof BlockStatement) {
+            BlockStatement bs = (BlockStatement) s;
+            List<Statement> nb = disambiguateNestedCatchVars(bs.getStatements(), outerName);
+            if (nb != bs.getStatements()) {
+                return new BlockStatement(bs.getLineNumber(), nb);
+            }
+            return s;
+        }
+        if (s instanceof IfStatement) {
+            IfStatement is = (IfStatement) s;
+            Statement then = disambiguateNestedCatchVars(is.getThenBody(), outerName);
+            if (then != is.getThenBody()) {
+                return new IfStatement(is.getLineNumber(), is.getCondition(), then);
+            }
+            return s;
+        }
+        if (s instanceof IfElseStatement) {
+            IfElseStatement ies = (IfElseStatement) s;
+            Statement then = disambiguateNestedCatchVars(ies.getThenBody(), outerName);
+            Statement els = disambiguateNestedCatchVars(ies.getElseBody(), outerName);
+            if (then != ies.getThenBody() || els != ies.getElseBody()) {
+                return new IfElseStatement(ies.getLineNumber(), ies.getCondition(), then, els);
+            }
+            return s;
+        }
+        if (s instanceof WhileStatement) {
+            WhileStatement ws = (WhileStatement) s;
+            Statement body = disambiguateNestedCatchVars(ws.getBody(), outerName);
+            if (body != ws.getBody()) {
+                return new WhileStatement(ws.getLineNumber(), ws.getCondition(), body);
+            }
+            return s;
+        }
+        if (s instanceof DoWhileStatement) {
+            DoWhileStatement dws = (DoWhileStatement) s;
+            Statement body = disambiguateNestedCatchVars(dws.getBody(), outerName);
+            if (body != dws.getBody()) {
+                return new DoWhileStatement(dws.getLineNumber(), dws.getCondition(), body);
+            }
+            return s;
+        }
+        if (s instanceof SynchronizedStatement) {
+            SynchronizedStatement ss = (SynchronizedStatement) s;
+            Statement body = disambiguateNestedCatchVars(ss.getBody(), outerName);
+            if (body != ss.getBody()) {
+                return new SynchronizedStatement(ss.getLineNumber(), ss.getMonitor(), body);
+            }
+            return s;
+        }
+        return s;
+    }
+    // END_CHANGE: BUG-2026-0056-25
+
+    // START_CHANGE: BUG-2026-0056-20260610-13 - Helpers for hoisting try-declared variables and
+    // retyping null-initialised Object declarations.
+
+    /** True when any statement of the list references (reads, writes or declares) the variable. */
+    private static boolean statementsReferenceVar(List<Statement> stmts, String name) {
+        if (stmts == null) return false;
+        for (Statement s : stmts) {
+            if (statementReferencesVar(s, name)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * True when the statement references the variable. Reuses the rename walker: renaming the
+     * variable to itself returns a NEW node exactly when at least one reference was found.
+     */
+    private static boolean statementReferencesVar(Statement s, String name) {
+        if (s == null) return false;
+        return renameVarInStatement(s, name, name) != s;
+    }
+
+    /** True when any statement of the list declares the variable (at any nesting depth). */
+    private static boolean statementsDeclareVar(List<Statement> stmts, String name) {
+        if (stmts == null) return false;
+        for (Statement s : stmts) {
+            if (statementDeclaresVar(s, name)) return true;
+        }
+        return false;
+    }
+
+    private static boolean statementDeclaresVar(Statement s, String name) {
+        if (s == null) return false;
+        if (s instanceof VariableDeclarationStatement) {
+            return name.equals(((VariableDeclarationStatement) s).getName());
+        }
+        if (s instanceof BlockStatement) {
+            return statementsDeclareVar(((BlockStatement) s).getStatements(), name);
+        }
+        if (s instanceof IfStatement) {
+            return statementDeclaresVar(((IfStatement) s).getThenBody(), name);
+        }
+        if (s instanceof IfElseStatement) {
+            IfElseStatement ies = (IfElseStatement) s;
+            return statementDeclaresVar(ies.getThenBody(), name)
+                || statementDeclaresVar(ies.getElseBody(), name);
+        }
+        if (s instanceof WhileStatement) {
+            return statementDeclaresVar(((WhileStatement) s).getBody(), name);
+        }
+        if (s instanceof DoWhileStatement) {
+            return statementDeclaresVar(((DoWhileStatement) s).getBody(), name);
+        }
+        if (s instanceof ForStatement) {
+            ForStatement fs = (ForStatement) s;
+            return statementDeclaresVar(fs.getInit(), name)
+                || statementDeclaresVar(fs.getBody(), name);
+        }
+        if (s instanceof SynchronizedStatement) {
+            return statementDeclaresVar(((SynchronizedStatement) s).getBody(), name);
+        }
+        if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            if (statementDeclaresVar(t.getTryBody(), name)) return true;
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) {
+                if (name.equals(cc.variableName) || statementDeclaresVar(cc.body, name)) {
+                    return true;
+                }
+            }
+            return statementDeclaresVar(t.getFinallyBody(), name);
+        }
+        if (s instanceof SwitchStatement) {
+            for (SwitchStatement.SwitchCase sc : ((SwitchStatement) s).getCases()) {
+                if (statementsDeclareVar(sc.getStatements(), name)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Definite-assignment-safe default initializer for a hoisted declaration:
+     * null for reference types, zero/false for primitives, null (= skip) when unknown.
+     */
+    private static Expression defaultInitializerFor(Type type, int line) {
+        if (type instanceof it.denzosoft.javadecompiler.model.javasyntax.type.PrimitiveType) {
+            String desc = type.getDescriptor();
+            if ("Z".equals(desc)) return new BooleanExpression(line, false);
+            if ("J".equals(desc)) return new LongConstantExpression(line, 0L);
+            if ("F".equals(desc)) return new FloatConstantExpression(line, 0.0f);
+            if ("D".equals(desc)) return new DoubleConstantExpression(line, 0.0);
+            return new IntegerConstantExpression(line, 0);
+        }
+        if (type instanceof it.denzosoft.javadecompiler.model.javasyntax.type.VoidType) {
+            return null;
+        }
+        if (type != null) {
+            return new NullExpression(type);
+        }
+        return null;
+    }
+
+    /**
+     * Retype top-level `Object v = null` declarations when every assignment to v in the method
+     * targets one single concrete reference type.
+     */
+    private static void retypeNullObjectDeclarations(List<Statement> statements) {
+        for (int i = 0; i < statements.size(); i++) {
+            Statement s = statements.get(i);
+            if (!(s instanceof VariableDeclarationStatement)) continue;
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) s;
+            if (!vds.hasInitializer() || !(vds.getInitializer() instanceof NullExpression)) continue;
+            if (!(vds.getType() instanceof ObjectType)) continue;
+            if (!"java/lang/Object".equals(((ObjectType) vds.getType()).getInternalName())) continue;
+            Set<String> assignedTypes = new HashSet<String>();
+            boolean[] unknown = new boolean[1];
+            for (Statement other : statements) {
+                if (other == s) continue;
+                collectAssignedTypes(other, vds.getName(), assignedTypes, unknown);
+            }
+            if (unknown[0] || assignedTypes.size() != 1) continue;
+            String internalName = assignedTypes.iterator().next();
+            if ("java/lang/Object".equals(internalName)) continue;
+            statements.set(i, new VariableDeclarationStatement(vds.getLineNumber(),
+                new ObjectType(internalName), vds.getName(), vds.getInitializer(),
+                vds.isFinal(), vds.isVar()));
+        }
+    }
+
+    private static void collectAssignedTypes(Statement s, String name,
+                                              Set<String> out, boolean[] unknown) {
+        if (s == null || unknown[0]) return;
+        if (s instanceof ExpressionStatement) {
+            Expression e = ((ExpressionStatement) s).getExpression();
+            if (e instanceof AssignmentExpression) {
+                AssignmentExpression ae = (AssignmentExpression) e;
+                if (ae.getLeft() instanceof LocalVariableExpression
+                        && name.equals(((LocalVariableExpression) ae.getLeft()).getName())) {
+                    if (!"=".equals(ae.getOperator())) {
+                        unknown[0] = true;
+                        return;
+                    }
+                    Expression rhs = ae.getRight();
+                    if (rhs instanceof NullExpression) {
+                        return; // null is compatible with any reference type
+                    }
+                    Type rhsType = rhs.getType();
+                    if (rhsType instanceof ObjectType
+                            && ((ObjectType) rhsType).getDimension() == 0) {
+                        out.add(((ObjectType) rhsType).getInternalName());
+                    } else {
+                        unknown[0] = true;
+                    }
+                }
+            }
+        } else if (s instanceof VariableDeclarationStatement) {
+            // a redeclaration of the same name means separate scopes - do not retype
+            if (name.equals(((VariableDeclarationStatement) s).getName())) {
+                unknown[0] = true;
+            }
+        } else if (s instanceof BlockStatement) {
+            for (Statement c : ((BlockStatement) s).getStatements()) {
+                collectAssignedTypes(c, name, out, unknown);
+            }
+        } else if (s instanceof IfStatement) {
+            collectAssignedTypes(((IfStatement) s).getThenBody(), name, out, unknown);
+        } else if (s instanceof IfElseStatement) {
+            collectAssignedTypes(((IfElseStatement) s).getThenBody(), name, out, unknown);
+            collectAssignedTypes(((IfElseStatement) s).getElseBody(), name, out, unknown);
+        } else if (s instanceof WhileStatement) {
+            collectAssignedTypes(((WhileStatement) s).getBody(), name, out, unknown);
+        } else if (s instanceof DoWhileStatement) {
+            collectAssignedTypes(((DoWhileStatement) s).getBody(), name, out, unknown);
+        } else if (s instanceof ForStatement) {
+            collectAssignedTypes(((ForStatement) s).getInit(), name, out, unknown);
+            collectAssignedTypes(((ForStatement) s).getBody(), name, out, unknown);
+        } else if (s instanceof ForEachStatement) {
+            collectAssignedTypes(((ForEachStatement) s).getBody(), name, out, unknown);
+        } else if (s instanceof SynchronizedStatement) {
+            collectAssignedTypes(((SynchronizedStatement) s).getBody(), name, out, unknown);
+        } else if (s instanceof LabelStatement) {
+            collectAssignedTypes(((LabelStatement) s).getBody(), name, out, unknown);
+        } else if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            collectAssignedTypes(t.getTryBody(), name, out, unknown);
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) {
+                collectAssignedTypes(cc.body, name, out, unknown);
+            }
+            collectAssignedTypes(t.getFinallyBody(), name, out, unknown);
+        } else if (s instanceof SwitchStatement) {
+            for (SwitchStatement.SwitchCase sc : ((SwitchStatement) s).getCases()) {
+                for (Statement c : sc.getStatements()) {
+                    collectAssignedTypes(c, name, out, unknown);
+                }
+            }
+        }
+    }
+    // END_CHANGE: BUG-2026-0056-13
 
     // START_CHANGE: BUG-2026-0068-20260610-2 - Detect a compiler-generated handler-protection
     // entry: it starts exactly at another entry's handlerPc AND a different entry already
@@ -517,11 +1131,110 @@ public class TryCatchReconstructor {
             stopPcs.add(mergePc);
         }
 
+        // START_CHANGE: BUG-2026-0056-20260610-4 - When the handler body contains internal
+        // control flow (a conditional or a switch), the legacy linear walk cannot represent it:
+        // it followed the fall-through edge only, emitting the then-branch unconditionally and
+        // silently dropping the condition and the else-branch (catch composing an exception
+        // message via if/else lost both). Delegate such handlers to the StructuredFlowBuilder,
+        // which structures if/else, short-circuit conditions, switches and loops. The stop PC is
+        // the try-catch merge point (the handler's terminator goto targets it); when no merge
+        // point is known, fall back to the closest stop PC past the handler.
+        if (flowBuilder != null && handlerRegionHasControlFlow(handlerBlock, stopPcs)) {
+            int delegStopPc = (mergePc > handlerPc) ? mergePc : -1;
+            if (delegStopPc < 0) {
+                for (Integer sp : stopPcs) {
+                    int spv = sp.intValue();
+                    if (spv > handlerPc && (delegStopPc < 0 || spv < delegStopPc)) {
+                        delegStopPc = spv;
+                    }
+                }
+            }
+            List<Statement> structured = flowBuilder.buildHandlerBody(handlerBlock, delegStopPc);
+            if (structured != null && !structured.isEmpty()) {
+                return structured;
+            }
+        }
+        // END_CHANGE: BUG-2026-0056-4
+
         Set<Integer> visited = new HashSet<Integer>();
         collectHandlerStatements(handlerBlock, result, visited, stopPcs);
 
+        // START_CHANGE: BUG-2026-0056-20260610-22 - A nested try-catch INSIDE this handler
+        // (e.g. an inner try in a catch body) only materialises here: its statements are not in
+        // the main statement list, so its group found no home earlier and was queued. Offer the
+        // pending groups this handler body. A group is popped before the attempt so the
+        // recursive handler decode cannot re-enter it.
+        result = applyPendingGroups(result);
+        // END_CHANGE: BUG-2026-0056-22
+
         return result;
     }
+
+    // START_CHANGE: BUG-2026-0056-20260610-23 - Apply pending (nested) exception groups to a
+    // freshly decoded handler body.
+    private List<Statement> applyPendingGroups(List<Statement> handlerBody) {
+        if (pendingNestedGroups == null || pendingNestedGroups.isEmpty()
+                || handlerBody.isEmpty()) {
+            return handlerBody;
+        }
+        List<Integer> sortedPcs = new ArrayList<Integer>(pcToLine.keySet());
+        Collections.sort(sortedPcs);
+        // Reverse startPc order: inner-most groups first, like the main loop.
+        List<List<CodeAttribute.ExceptionEntry>> candidates =
+            new ArrayList<List<CodeAttribute.ExceptionEntry>>(pendingNestedGroups);
+        Collections.sort(candidates, new Comparator<List<CodeAttribute.ExceptionEntry>>() {
+            public int compare(List<CodeAttribute.ExceptionEntry> a,
+                               List<CodeAttribute.ExceptionEntry> b) {
+                return b.get(0).startPc - a.get(0).startPc;
+            }
+        });
+        for (List<CodeAttribute.ExceptionEntry> group : candidates) {
+            pendingNestedGroups.remove(group);
+            List<Statement> replaced = applyGroup(handlerBody, group, sortedPcs);
+            if (replaced != null) {
+                handlerBody = replaced;
+            } else {
+                pendingNestedGroups.add(group);
+            }
+        }
+        return handlerBody;
+    }
+    // END_CHANGE: BUG-2026-0056-23
+
+    // START_CHANGE: BUG-2026-0056-20260610-5 - Dry-run of the legacy linear handler walk that
+    // reports whether a conditional or switch block is reachable inside the handler region.
+    // Mirrors collectHandlerStatements' traversal so delegation triggers exactly for the
+    // handlers the linear walk would mis-decode.
+    private boolean handlerRegionHasControlFlow(BasicBlock start, Set<Integer> stopPcs) {
+        Set<Integer> visited = new HashSet<Integer>();
+        BasicBlock block = start;
+        while (block != null) {
+            if (visited.contains(block.startPc)) return false;
+            if (stopPcs.contains(block.startPc)) return false;
+            visited.add(block.startPc);
+
+            if (block.type == BasicBlock.CONDITIONAL || block.type == BasicBlock.SWITCH) {
+                return true;
+            }
+            if (block.isReturn() || block.isThrow()) {
+                return false;
+            } else if (block.isGoto()) {
+                BasicBlock target = block.trueSuccessor;
+                if (target != null && target.startPc > block.startPc
+                    && !stopPcs.contains(target.startPc)) {
+                    block = target;
+                } else {
+                    return false;
+                }
+            } else if (block.type == BasicBlock.FALL_THROUGH || block.type == BasicBlock.NORMAL) {
+                block = block.trueSuccessor;
+            } else {
+                return false;
+            }
+        }
+        return false;
+    }
+    // END_CHANGE: BUG-2026-0056-5
 
     private int findTryCatchMergePc(int tryEndPc) {
         BasicBlock gotoBlock = cfg.getBlockAtPc(tryEndPc);
@@ -777,8 +1490,115 @@ public class TryCatchReconstructor {
             }
         } else if (s instanceof BlockStatement) {
             BlockStatement bs = (BlockStatement) s;
-            return new BlockStatement(bs.getLineNumber(), renameVarInStatements(bs.getStatements(), oldName, newName));
+            // START_CHANGE: BUG-2026-0056-20260610-26 - Preserve identity when nothing changed:
+            // statementReferencesVar relies on `renamed != original` to detect references, and
+            // the unconditional copy made every block look like it referenced every name
+            // (spinning the fresh-name search in disambiguateNestedCatchVars forever).
+            List<Statement> renamed = renameVarInStatements(bs.getStatements(), oldName, newName);
+            boolean blockChanged = false;
+            for (int i = 0; i < renamed.size(); i++) {
+                if (renamed.get(i) != bs.getStatements().get(i)) {
+                    blockChanged = true;
+                    break;
+                }
+            }
+            if (blockChanged) {
+                return new BlockStatement(bs.getLineNumber(), renamed);
+            }
+            // END_CHANGE: BUG-2026-0056-26
+        // START_CHANGE: BUG-2026-0056-20260610-6 - Recurse into structured statements. Handler
+        // bodies are now decoded by the StructuredFlowBuilder and may contain if/else, loops,
+        // switches and synchronized blocks whose conditions/bodies reference the exception slot
+        // under its synthetic name; without this recursion the rename missed them and the
+        // recompiled catch referenced an undeclared variable.
+        } else if (s instanceof IfStatement) {
+            IfStatement is = (IfStatement) s;
+            Expression cond = renameVarInExpression(is.getCondition(), oldName, newName);
+            Statement then = renameVarInStatement(is.getThenBody(), oldName, newName);
+            if (cond != is.getCondition() || then != is.getThenBody()) {
+                return new IfStatement(is.getLineNumber(), cond, then);
+            }
+        } else if (s instanceof IfElseStatement) {
+            IfElseStatement ies = (IfElseStatement) s;
+            Expression cond = renameVarInExpression(ies.getCondition(), oldName, newName);
+            Statement then = renameVarInStatement(ies.getThenBody(), oldName, newName);
+            Statement els = renameVarInStatement(ies.getElseBody(), oldName, newName);
+            if (cond != ies.getCondition() || then != ies.getThenBody() || els != ies.getElseBody()) {
+                return new IfElseStatement(ies.getLineNumber(), cond, then, els);
+            }
+        } else if (s instanceof WhileStatement) {
+            WhileStatement ws = (WhileStatement) s;
+            Expression cond = renameVarInExpression(ws.getCondition(), oldName, newName);
+            Statement body = renameVarInStatement(ws.getBody(), oldName, newName);
+            if (cond != ws.getCondition() || body != ws.getBody()) {
+                return new WhileStatement(ws.getLineNumber(), cond, body);
+            }
+        } else if (s instanceof DoWhileStatement) {
+            DoWhileStatement dws = (DoWhileStatement) s;
+            Expression cond = renameVarInExpression(dws.getCondition(), oldName, newName);
+            Statement body = renameVarInStatement(dws.getBody(), oldName, newName);
+            if (cond != dws.getCondition() || body != dws.getBody()) {
+                return new DoWhileStatement(dws.getLineNumber(), cond, body);
+            }
+        } else if (s instanceof SynchronizedStatement) {
+            SynchronizedStatement ss = (SynchronizedStatement) s;
+            Expression mon = renameVarInExpression(ss.getMonitor(), oldName, newName);
+            Statement body = renameVarInStatement(ss.getBody(), oldName, newName);
+            if (mon != ss.getMonitor() || body != ss.getBody()) {
+                return new SynchronizedStatement(ss.getLineNumber(), mon, body);
+            }
+        } else if (s instanceof SwitchStatement) {
+            SwitchStatement sw = (SwitchStatement) s;
+            Expression sel = renameVarInExpression(sw.getSelector(), oldName, newName);
+            boolean changed = sel != sw.getSelector();
+            List<SwitchStatement.SwitchCase> cases =
+                new ArrayList<SwitchStatement.SwitchCase>();
+            for (SwitchStatement.SwitchCase sc : sw.getCases()) {
+                List<Statement> renamedStmts = renameVarInStatements(sc.getStatements(), oldName, newName);
+                boolean caseChanged = false;
+                for (int ci = 0; ci < renamedStmts.size(); ci++) {
+                    if (renamedStmts.get(ci) != sc.getStatements().get(ci)) {
+                        caseChanged = true;
+                        break;
+                    }
+                }
+                if (caseChanged) {
+                    changed = true;
+                    cases.add(new SwitchStatement.SwitchCase(sc.getLabels(), renamedStmts));
+                } else {
+                    cases.add(sc);
+                }
+            }
+            if (changed) {
+                return new SwitchStatement(sw.getLineNumber(), sel, cases, sw.isArrowStyle());
+            }
+        } else if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            Statement tryB = renameVarInStatement(t.getTryBody(), oldName, newName);
+            boolean changed = tryB != t.getTryBody();
+            List<TryCatchStatement.CatchClause> ccs =
+                new ArrayList<TryCatchStatement.CatchClause>();
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) {
+                if (oldName.equals(cc.variableName)) {
+                    ccs.add(cc); // shadowed inside this clause
+                    continue;
+                }
+                Statement b = renameVarInStatement(cc.body, oldName, newName);
+                if (b != cc.body) {
+                    changed = true;
+                    ccs.add(new TryCatchStatement.CatchClause(cc.exceptionTypes, cc.variableName, b));
+                } else {
+                    ccs.add(cc);
+                }
+            }
+            Statement fin = t.getFinallyBody() == null
+                ? null : renameVarInStatement(t.getFinallyBody(), oldName, newName);
+            if (fin != t.getFinallyBody()) changed = true;
+            if (changed) {
+                return new TryCatchStatement(t.getLineNumber(), tryB, ccs, fin, t.getResources());
+            }
         }
+        // END_CHANGE: BUG-2026-0056-6
         return s;
     }
 
@@ -851,7 +1671,24 @@ public class TryCatchReconstructor {
                 return new FieldAccessExpression(fae.getLineNumber(), fae.getType(), obj,
                     fae.getOwnerInternalName(), fae.getName(), fae.getDescriptor());
             }
+        // START_CHANGE: BUG-2026-0056-20260610-7 - Recurse into instanceof and array access:
+        // structured catch bodies routinely test `e instanceof SomeException` in conditions.
+        } else if (expr instanceof InstanceOfExpression) {
+            InstanceOfExpression ioe = (InstanceOfExpression) expr;
+            Expression inner = renameVarInExpression(ioe.getExpression(), oldName, newName);
+            if (inner != ioe.getExpression()) {
+                return new InstanceOfExpression(ioe.getLineNumber(), inner, ioe.getCheckType(),
+                    ioe.getPatternVariableName());
+            }
+        } else if (expr instanceof ArrayAccessExpression) {
+            ArrayAccessExpression aae = (ArrayAccessExpression) expr;
+            Expression arr = renameVarInExpression(aae.getArray(), oldName, newName);
+            Expression idx = renameVarInExpression(aae.getIndex(), oldName, newName);
+            if (arr != aae.getArray() || idx != aae.getIndex()) {
+                return new ArrayAccessExpression(aae.getLineNumber(), aae.getType(), arr, idx);
+            }
         }
+        // END_CHANGE: BUG-2026-0056-7
         return expr;
     }
 
@@ -1004,11 +1841,15 @@ public class TryCatchReconstructor {
             }
         }
 
-        // Case 3 (fallback, old count-based behavior minus the ReturnStatement whitelist):
-        // remove the trailing N statements when they are ALL plain ExpressionStatements.
-        // Inlined finally copies often render differently from the decoded handler body
-        // (e.g. different synthetic variable names), so the structural match can miss them;
-        // an expression-only tail can never swallow a trailing `return`/`throw`.
+        // START_CHANGE: BUG-2026-0056-20260610-8 - Tighten the Case 3 fallback. The old fallback
+        // removed the trailing N statements by COUNT whenever they were all plain
+        // ExpressionStatements, which deleted REAL trailing try-body statements that merely had
+        // the same count as the finally body (e.g. `sb.append("ok;")` after an if/else inside
+        // try+finally was swallowed because finally had one statement too). The tail is now
+        // removed only when it also structurally matches the finally body with local variable
+        // names normalized - this still dedups genuine inlined finally copies whose synthetic
+        // variable names differ from the decoded handler body, but can no longer swallow
+        // unrelated statements (different constants/targets/methods never match).
         boolean allPlainExpressions = true;
         for (int i = tailStart; i < catchBody.size(); i++) {
             if (!(catchBody.get(i) instanceof ExpressionStatement)) {
@@ -1016,13 +1857,15 @@ public class TryCatchReconstructor {
                 break;
             }
         }
-        if (allPlainExpressions) {
+        if (allPlainExpressions
+                && statementsMatchFinally(catchBody, tailStart, finallyStmts, true)) {
             List<Statement> filtered = new ArrayList<Statement>();
             for (int i = 0; i < tailStart; i++) {
                 filtered.add(catchBody.get(i));
             }
             return filtered;
         }
+        // END_CHANGE: BUG-2026-0056-8
 
         return catchBody; // conservative: no match, remove nothing
     }
@@ -1045,13 +1888,21 @@ public class TryCatchReconstructor {
 
     private static boolean statementsMatchFinally(List<Statement> body, int offset,
                                                    List<Statement> finallyStmts) {
+        // START_CHANGE: BUG-2026-0056-20260610-9 - Delegate to the parameterised variant
+        return statementsMatchFinally(body, offset, finallyStmts, false);
+    }
+
+    private static boolean statementsMatchFinally(List<Statement> body, int offset,
+                                                   List<Statement> finallyStmts,
+                                                   boolean normalizeLocals) {
         for (int i = 0; i < finallyStmts.size(); i++) {
-            if (!sameStatementShape(body.get(offset + i), finallyStmts.get(i))) {
+            if (!sameStatementShape(body.get(offset + i), finallyStmts.get(i), normalizeLocals)) {
                 return false;
             }
         }
         return true;
     }
+    // END_CHANGE: BUG-2026-0056-9
 
     /**
      * Two statements have the same shape when they are of the same class and their
@@ -1059,11 +1910,12 @@ public class TryCatchReconstructor {
      * Compound statements (if/loops/blocks) are never considered equal: their content
      * cannot be compared reliably, so dedup conservatively keeps them.
      */
-    private static boolean sameStatementShape(Statement a, Statement b) {
+    private static boolean sameStatementShape(Statement a, Statement b,
+                                               boolean normalizeLocals) {
         if (a == null || b == null) return false;
         if (!a.getClass().equals(b.getClass())) return false;
-        String sigA = statementSignature(a);
-        String sigB = statementSignature(b);
+        String sigA = statementSignature(a, normalizeLocals);
+        String sigB = statementSignature(b, normalizeLocals);
         if (sigA == null || sigB == null) return false;
         return sigA.equals(sigB);
     }
@@ -1072,20 +1924,20 @@ public class TryCatchReconstructor {
      * Line-independent signature of a simple statement, or null for statement types
      * that cannot be compared reliably.
      */
-    private static String statementSignature(Statement s) {
+    private static String statementSignature(Statement s, boolean normalizeLocals) {
         if (s instanceof ExpressionStatement) {
-            return "expr:" + expressionSignature(((ExpressionStatement) s).getExpression());
+            return "expr:" + expressionSignature(((ExpressionStatement) s).getExpression(), normalizeLocals);
         }
         if (s instanceof ReturnStatement) {
-            return "return:" + expressionSignature(((ReturnStatement) s).getExpression());
+            return "return:" + expressionSignature(((ReturnStatement) s).getExpression(), normalizeLocals);
         }
         if (s instanceof ThrowStatement) {
-            return "throw:" + expressionSignature(((ThrowStatement) s).getExpression());
+            return "throw:" + expressionSignature(((ThrowStatement) s).getExpression(), normalizeLocals);
         }
         if (s instanceof VariableDeclarationStatement) {
             VariableDeclarationStatement vds = (VariableDeclarationStatement) s;
-            return "decl:" + vds.getName() + "="
-                + expressionSignature(vds.getInitializer());
+            return "decl:" + (normalizeLocals ? "$v" : vds.getName()) + "="
+                + expressionSignature(vds.getInitializer(), normalizeLocals);
         }
         return null; // compound/unknown statement: never matches
     }
@@ -1093,26 +1945,97 @@ public class TryCatchReconstructor {
     /**
      * Render an expression for structural comparison. Method invocations include their
      * arguments (the plain toString elides them as "(...)").
+     * START_CHANGE: BUG-2026-0056-20260610-10 - Recurse into the expression node types that
+     * have no value-based toString (assignments, casts, unary/static calls, news...): they
+     * previously fell back to the identity toString, so two structurally identical statements
+     * decoded from different blocks could NEVER match and Case 1/2 dedup silently failed.
+     * With normalizeLocals, local variable reads/writes render as "$v" so an inlined finally
+     * copy that only differs by synthetic variable names still matches.
      */
-    private static String expressionSignature(Expression e) {
+    private static String expressionSignature(Expression e, boolean normalizeLocals) {
         if (e == null) return "null";
+        if (e instanceof LocalVariableExpression) {
+            return normalizeLocals ? "$v" : ((LocalVariableExpression) e).getName();
+        }
         if (e instanceof MethodInvocationExpression) {
             MethodInvocationExpression mie = (MethodInvocationExpression) e;
             StringBuilder sb = new StringBuilder();
-            sb.append(expressionSignature(mie.getObject()));
+            sb.append(expressionSignature(mie.getObject(), normalizeLocals));
             sb.append('.').append(mie.getMethodName()).append('(');
             List<Expression> args = mie.getArguments();
             if (args != null) {
                 for (int i = 0; i < args.size(); i++) {
                     if (i > 0) sb.append(',');
-                    sb.append(expressionSignature(args.get(i)));
+                    sb.append(expressionSignature(args.get(i), normalizeLocals));
                 }
             }
             sb.append(')');
             return sb.toString();
         }
+        if (e instanceof StaticMethodInvocationExpression) {
+            StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) e;
+            StringBuilder sb = new StringBuilder();
+            sb.append(smie.getOwnerInternalName()).append('.')
+              .append(smie.getMethodName()).append('(');
+            List<Expression> args = smie.getArguments();
+            if (args != null) {
+                for (int i = 0; i < args.size(); i++) {
+                    if (i > 0) sb.append(',');
+                    sb.append(expressionSignature(args.get(i), normalizeLocals));
+                }
+            }
+            sb.append(')');
+            return sb.toString();
+        }
+        if (e instanceof AssignmentExpression) {
+            AssignmentExpression ae = (AssignmentExpression) e;
+            return expressionSignature(ae.getLeft(), normalizeLocals) + ae.getOperator()
+                + expressionSignature(ae.getRight(), normalizeLocals);
+        }
+        if (e instanceof BinaryOperatorExpression) {
+            BinaryOperatorExpression boe = (BinaryOperatorExpression) e;
+            return "(" + expressionSignature(boe.getLeft(), normalizeLocals)
+                + boe.getOperator()
+                + expressionSignature(boe.getRight(), normalizeLocals) + ")";
+        }
+        if (e instanceof UnaryOperatorExpression) {
+            UnaryOperatorExpression uoe = (UnaryOperatorExpression) e;
+            return uoe.isPrefix()
+                ? uoe.getOperator() + expressionSignature(uoe.getExpression(), normalizeLocals)
+                : expressionSignature(uoe.getExpression(), normalizeLocals) + uoe.getOperator();
+        }
+        if (e instanceof CastExpression) {
+            CastExpression ce = (CastExpression) e;
+            return "cast(" + String.valueOf(ce.getType()) + ")"
+                + expressionSignature(ce.getExpression(), normalizeLocals);
+        }
+        if (e instanceof NewExpression) {
+            NewExpression ne = (NewExpression) e;
+            StringBuilder sb = new StringBuilder();
+            sb.append("new ").append(ne.getInternalTypeName()).append('(');
+            List<Expression> args = ne.getArguments();
+            if (args != null) {
+                for (int i = 0; i < args.size(); i++) {
+                    if (i > 0) sb.append(',');
+                    sb.append(expressionSignature(args.get(i), normalizeLocals));
+                }
+            }
+            sb.append(')');
+            return sb.toString();
+        }
+        if (e instanceof FieldAccessExpression) {
+            FieldAccessExpression fae = (FieldAccessExpression) e;
+            return expressionSignature(fae.getObject(), normalizeLocals)
+                + "." + fae.getName();
+        }
+        if (e instanceof ArrayAccessExpression) {
+            ArrayAccessExpression aae = (ArrayAccessExpression) e;
+            return expressionSignature(aae.getArray(), normalizeLocals)
+                + "[" + expressionSignature(aae.getIndex(), normalizeLocals) + "]";
+        }
         return String.valueOf(e);
     }
+    // END_CHANGE: BUG-2026-0056-10
     // END_CHANGE: BUG-2026-0091-5
 
     // START_CHANGE: LIM-0008-20260326-2 - Helpers for try-with-resources resource extraction

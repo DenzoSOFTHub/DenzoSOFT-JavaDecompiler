@@ -170,6 +170,72 @@ public class StructuredFlowBuilder {
         return result;
     }
 
+    // START_CHANGE: BUG-2026-0056-20260610-19 - Count unlabeled `continue` statements bound to
+    // the CURRENT loop: recurse into non-loop compound statements, but not into nested loops
+    // (their continues bind to the inner loop).
+    private static int countLoopContinues(List<Statement> stmts) {
+        int n = 0;
+        for (int i = 0; i < stmts.size(); i++) {
+            n += countLoopContinues(stmts.get(i));
+        }
+        return n;
+    }
+
+    private static int countLoopContinues(Statement s) {
+        if (s == null) return 0;
+        if (s instanceof ContinueStatement) {
+            return ((ContinueStatement) s).getLabel() == null ? 1 : 0;
+        }
+        if (s instanceof BlockStatement) {
+            return countLoopContinues(((BlockStatement) s).getStatements());
+        }
+        if (s instanceof IfStatement) {
+            return countLoopContinues(((IfStatement) s).getThenBody());
+        }
+        if (s instanceof IfElseStatement) {
+            return countLoopContinues(((IfElseStatement) s).getThenBody())
+                + countLoopContinues(((IfElseStatement) s).getElseBody());
+        }
+        if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            int n = countLoopContinues(t.getTryBody());
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) {
+                n += countLoopContinues(cc.body);
+            }
+            if (t.getFinallyBody() != null) n += countLoopContinues(t.getFinallyBody());
+            return n;
+        }
+        if (s instanceof SynchronizedStatement) {
+            return countLoopContinues(((SynchronizedStatement) s).getBody());
+        }
+        if (s instanceof LabelStatement) {
+            return countLoopContinues(((LabelStatement) s).getBody());
+        }
+        if (s instanceof SwitchStatement) {
+            int n = 0;
+            for (SwitchStatement.SwitchCase sc : ((SwitchStatement) s).getCases()) {
+                n += countLoopContinues(sc.getStatements());
+            }
+            return n;
+        }
+        return 0; // nested loops: their continues bind to the inner loop
+    }
+    // END_CHANGE: BUG-2026-0056-19
+
+    // START_CHANGE: BUG-2026-0056-20260610-1 - Public entry point so TryCatchReconstructor can
+    // structure an exception-handler body (if/else, short-circuit conditions, switch, loops)
+    // instead of walking its blocks linearly. The linear walk emitted the fall-through branch
+    // of a conditional unconditionally and silently dropped the condition and the other branch
+    // (e.g. a catch composing an exception message via if/else). Must only be called after
+    // buildStatements() has run (blocks decoded, merge points precomputed). Uses a fresh
+    // visited set: handler blocks are unreachable from the entry walk.
+    public List<Statement> buildHandlerBody(BasicBlock handlerBlock, int stopPc) {
+        List<Statement> out = new ArrayList<Statement>();
+        buildFromBlock(handlerBlock, out, new HashSet<Integer>(), stopPc);
+        return out;
+    }
+    // END_CHANGE: BUG-2026-0056-1
+
     /**
      * Recursively build statements from a block and its successors.
      *
@@ -973,6 +1039,32 @@ public class StructuredFlowBuilder {
                 outerLoopMergePoints.remove(outerLoopMergePoints.size() - 1);
             }
             // END_CHANGE: ISS-2026-0007-3
+
+            // START_CHANGE: BUG-2026-0056-20260610-18 - When an exception handler sits between
+            // the loop body and the increment block, the body's last block reaches the increment
+            // via a forward GOTO (skipping the handler bytecode); that goto was emitted as
+            // `continue` and the increment block itself was never visited, silently losing the
+            // loop update (infinite loop at runtime) and the statements between the try region
+            // and the back-edge. Inline the unvisited continue-target block at the end of the
+            // body and drop the now-redundant trailing `continue` - only when that trailing
+            // continue is the sole continue bound to this loop, so no other path skips the
+            // inlined statements.
+            if (continueTargetPc >= 0
+                    && !visited.contains(Integer.valueOf(continueTargetPc))
+                    && !body.isEmpty()
+                    && body.get(body.size() - 1) instanceof ContinueStatement
+                    && ((ContinueStatement) body.get(body.size() - 1)).getLabel() == null
+                    && countLoopContinues(body) == 1) {
+                BasicBlock incBlock = cfg.getBlockAtPc(continueTargetPc);
+                if (incBlock != null && incBlock.isGoto()
+                        && incBlock.branchTargetPc == condBlock.startPc
+                        && incBlock.statements != null && !incBlock.statements.isEmpty()) {
+                    body.remove(body.size() - 1);
+                    body.addAll(incBlock.statements);
+                    visited.add(Integer.valueOf(continueTargetPc));
+                }
+            }
+            // END_CHANGE: BUG-2026-0056-18
 
             // START_CHANGE: BUG-2026-0016-20260326-1 - Merge assignment into while condition
             // Detect pattern: last statement assigns a variable used in condition

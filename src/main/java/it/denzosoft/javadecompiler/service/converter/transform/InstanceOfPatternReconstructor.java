@@ -134,6 +134,15 @@ public final class InstanceOfPatternReconstructor {
             InstanceOfExpression io = (InstanceOfExpression) l;
             if (!io.hasPatternVariable() && !io.hasRecordPattern()) {
                 String v = findBindingVar(r, io.getCheckType());
+                // START_CHANGE: BUG-2026-0056-20260610-17 - Never bind the instanceof operand
+                // itself as the pattern variable: `e instanceof T e` is illegal Java. This
+                // fired on catch bodies like `e instanceof X && e.getMessage().contains(...)`
+                // once structured handler decoding preserved the conditional.
+                if (v != null && io.getExpression() instanceof LocalVariableExpression
+                        && v.equals(((LocalVariableExpression) io.getExpression()).getName())) {
+                    v = null;
+                }
+                // END_CHANGE: BUG-2026-0056-17
                 if (v != null) {
                     InstanceOfExpression bound = new InstanceOfExpression(io.getLineNumber(),
                         io.getExpression(), io.getCheckType(), v);

@@ -62,7 +62,16 @@ DecompilerTest, 57-class matrix, 13-class corpus (both pipelines), 160-class sel
 compared on real inputs); annotation fixes reflection-proven; synchronized/sealed fixes
 bytecode-proven via javap.
 
+### Closed in the final sweep
+- **BUG-2026-0056** — catch-conditional body drop: handler bodies with control flow now route through
+  `StructuredFlowBuilder.buildHandlerBody` (full if/else, `&&`, switch in catch); structural finally
+  matching extended with locals-normalized signatures; `Object v = null` retyping; try-declared var
+  hoisting; nested catch-var disambiguation (runtime-proven on the SimogClient shape).
+- **BUG-2026-0069** — final residual (a) closed by the new `transform/BranchVarHoister` (if/else and
+  fall-through declaration hoisting with definite-assignment proof). Item fully resolved.
+- **IMP-2026-0001** — inner classes emitted interleaved at their original line positions
+  (LineNumberTable anchors; byte-identical fallback without line info).
+
 ## Still open
 
-- BUG-2026-0056 — catch-conditional body drop (TryCatchReconstructor path)
-- BUG-2026-0069(a) — branch-scoped declaration hoisting residual
+(none — all tracked bugs and improvements closed)
