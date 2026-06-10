@@ -28,7 +28,6 @@ Index shows ONLY open items.
 | BUG-2026-0091 | HIGH | Count-based finally dedup deletes trailing returns | [BUG-2026-0091](items/BUG-2026-0091.md) |
 | BUG-2026-0092 | HIGH | Nested synchronized flattened; `static synchronized` modifier dropped | [BUG-2026-0092](items/BUG-2026-0092.md) |
 | BUG-2026-0093 | HIGH | Cast operand printed without precedence parens (`(T) a >= 0 ? x : y`) | [BUG-2026-0093](items/BUG-2026-0093.md) |
-| BUG-2026-0094 | MEDIUM | Present Signature attributes unread: implements/extends + record components erased | [BUG-2026-0094](items/BUG-2026-0094.md) |
 | BUG-2026-0095 | HIGH | `&&`/`||` merge discards second condition block's statements | [BUG-2026-0095](items/BUG-2026-0095.md) |
 | BUG-2026-0096 | MEDIUM | No-LVT slot typing: boolean as int; incompatible slot reuse shares one var | [BUG-2026-0096](items/BUG-2026-0096.md) |
 | BUG-2026-0097 | HIGH | Local classes never loaded; anonymous `val$` captures unmapped; outer param leaks | [BUG-2026-0097](items/BUG-2026-0097.md) |

@@ -165,6 +165,33 @@ public class JavaSourceWriter implements Processor {
     }
     // END_CHANGE: IMP-2026-0005-2
 
+    // START_CHANGE: BUG-2026-0094-20260610-3 - Extract the trailing type-argument group from a
+    // parsed signature type (e.g. "Container<E>" -> "<E>") so extends/implements clauses can
+    // append the generic arguments after the erased base emitted via emitRef (preserving
+    // hyperlinking). Returns null when there are no usable type arguments, or when the base
+    // itself is parameterized (e.g. "Outer<T>.Inner<U>") where a suffix alone would be wrong.
+    private String signatureTypeArguments(String parsedType) {
+        if (parsedType == null || !parsedType.endsWith(">")) return null;
+        int depth = 0;
+        int start = -1;
+        for (int i = parsedType.length() - 1; i >= 0; i--) {
+            char c = parsedType.charAt(i);
+            if (c == '>') {
+                depth++;
+            } else if (c == '<') {
+                depth--;
+                if (depth == 0) {
+                    start = i;
+                    break;
+                }
+            }
+        }
+        if (start <= 0) return null;
+        if (parsedType.lastIndexOf('<', start - 1) >= 0) return null;
+        return parsedType.substring(start);
+    }
+    // END_CHANGE: BUG-2026-0094-3
+
     // START_CHANGE: BUG-2026-0046-20260327-2 - Resolve access$NNN to actual private member name
     private String resolveAccessorName(String ownerInternalName, String accessMethodName) {
         if (currentResult == null) return null;
@@ -388,7 +415,16 @@ public class JavaSourceWriter implements Processor {
             for (int i = 0; i < comps.size(); i++) {
                 if (i > 0) printer.printText(", ");
                 JavaSyntaxResult.RecordComponentInfo comp = comps.get(i);
-                writeType(printer, comp.type, internalName);
+                // START_CHANGE: BUG-2026-0094-20260610-8 - Prefer the per-component generic
+                // signature (`T value`, `List<T> list`) over the erased descriptor type.
+                String genericCompType = comp.signature != null
+                    ? SignatureParser.parseFieldSignature(comp.signature) : null;
+                if (genericCompType != null) {
+                    printer.printText(genericCompType);
+                } else {
+                    writeType(printer, comp.type, internalName);
+                }
+                // END_CHANGE: BUG-2026-0094-8
                 printer.printText(" ");
                 printer.printText(sn(comp.name, "fld"));
             }
@@ -403,6 +439,14 @@ public class JavaSourceWriter implements Processor {
             printer.printKeyword("extends");
             printer.printText(" ");
             emitRef(printer,Printer.TYPE, superName, TypeNameUtil.simpleNameFromInternal(superName), "", null);
+            // START_CHANGE: BUG-2026-0094-20260610-4 - Append generic type arguments from the
+            // class Signature attribute (`extends AbstractBox<E>` instead of erased `AbstractBox`).
+            String superTypeArgs = signatureTypeArguments(
+                SignatureParser.parseClassSuperType(result.getSignature()));
+            if (superTypeArgs != null) {
+                printer.printText(superTypeArgs);
+            }
+            // END_CHANGE: BUG-2026-0094-4
         }
 
         // Implements / extends interfaces
@@ -411,11 +455,26 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             printer.printKeyword(result.isInterface() ? "extends" : "implements");
             printer.printText(" ");
+            // START_CHANGE: BUG-2026-0094-20260610-5 - Parse the superinterface section of the
+            // class Signature attribute so `implements Container<E>` keeps its type arguments
+            // (the constant-pool interface list is erased). Falls back to the erased form when
+            // the signature is absent or does not match the interface count.
+            String[] ifaceSigs = SignatureParser.parseClassInterfaceTypes(result.getSignature());
+            if (ifaceSigs != null && ifaceSigs.length != interfaces.length) {
+                ifaceSigs = null;
+            }
             for (int i = 0; i < interfaces.length; i++) {
                 if (i > 0) printer.printText(", ");
                 emitRef(printer,Printer.TYPE, interfaces[i],
                     TypeNameUtil.simpleNameFromInternal(interfaces[i]), "", null);
+                if (ifaceSigs != null) {
+                    String ifaceTypeArgs = signatureTypeArguments(ifaceSigs[i]);
+                    if (ifaceTypeArgs != null) {
+                        printer.printText(ifaceTypeArgs);
+                    }
+                }
             }
+            // END_CHANGE: BUG-2026-0094-5
         }
 
         // Permits (sealed). BUG-2026-0075: an enum with constant bodies carries a PermittedSubclasses
@@ -745,7 +804,16 @@ public class JavaSourceWriter implements Processor {
             for (int i = 0; i < comps.size(); i++) {
                 if (i > 0) printer.printText(", ");
                 JavaSyntaxResult.RecordComponentInfo comp = comps.get(i);
-                writeType(printer, comp.type, innerInternalName);
+                // START_CHANGE: BUG-2026-0094-20260610-9 - Prefer the per-component generic
+                // signature over the erased descriptor type (mirrors the top-level record path).
+                String genericCompType = comp.signature != null
+                    ? SignatureParser.parseFieldSignature(comp.signature) : null;
+                if (genericCompType != null) {
+                    printer.printText(genericCompType);
+                } else {
+                    writeType(printer, comp.type, innerInternalName);
+                }
+                // END_CHANGE: BUG-2026-0094-9
                 printer.printText(" ");
                 printer.printText(sn(comp.name, "fld"));
             }
@@ -761,6 +829,14 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             emitRef(printer,Printer.TYPE, superName,
                 TypeNameUtil.simpleNameFromInternal(superName), "", null);
+            // START_CHANGE: BUG-2026-0094-20260610-6 - Append generic type arguments from the
+            // inner class Signature attribute (mirrors the top-level extends handling).
+            String superTypeArgs = signatureTypeArguments(
+                SignatureParser.parseClassSuperType(inner.getSignature()));
+            if (superTypeArgs != null) {
+                printer.printText(superTypeArgs);
+            }
+            // END_CHANGE: BUG-2026-0094-6
         }
 
         // Implements / extends interfaces
@@ -769,11 +845,25 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
             printer.printKeyword(inner.isInterface() ? "extends" : "implements");
             printer.printText(" ");
+            // START_CHANGE: BUG-2026-0094-20260610-7 - Parse the superinterface section of the
+            // inner class Signature attribute so `implements Container<E>` keeps its type
+            // arguments (mirrors the top-level implements handling).
+            String[] ifaceSigs = SignatureParser.parseClassInterfaceTypes(inner.getSignature());
+            if (ifaceSigs != null && ifaceSigs.length != interfaces.length) {
+                ifaceSigs = null;
+            }
             for (int i = 0; i < interfaces.length; i++) {
                 if (i > 0) printer.printText(", ");
                 emitRef(printer,Printer.TYPE, interfaces[i],
                     TypeNameUtil.simpleNameFromInternal(interfaces[i]), "", null);
+                if (ifaceSigs != null) {
+                    String ifaceTypeArgs = signatureTypeArguments(ifaceSigs[i]);
+                    if (ifaceTypeArgs != null) {
+                        printer.printText(ifaceTypeArgs);
+                    }
+                }
             }
+            // END_CHANGE: BUG-2026-0094-7
         }
 
         printer.printText(" {");
@@ -1565,7 +1655,11 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" ");
         }
         if (!isClass) {
-            if ((accessFlags & StringConstants.ACC_SYNCHRONIZED) != 0 && (accessFlags & StringConstants.ACC_STATIC) == 0) {
+            // START_CHANGE: BUG-2026-0092-20260610-2 - 'static synchronized' is legal Java (monitor is the
+            // Class object): do not suppress the keyword on static methods. The enclosing !isClass guard
+            // already excludes the ACC_SUPER (0x0020) ambiguity on classes.
+            if ((accessFlags & StringConstants.ACC_SYNCHRONIZED) != 0) {
+            // END_CHANGE: BUG-2026-0092-2
                 printer.printKeyword("synchronized");
                 printer.printText(" ");
             }
