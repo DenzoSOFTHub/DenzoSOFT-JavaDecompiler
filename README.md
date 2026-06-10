@@ -1,4 +1,4 @@
-# DenzoSOFT Java Decompiler v1.8.0
+# DenzoSOFT Java Decompiler v1.10.0
 
 A Java bytecode decompiler supporting **Java 1.0 through Java 25**, with zero external dependencies.
 
@@ -58,7 +58,12 @@ This is a Copyleft license that gives the user the right to use, copy and modify
 - **String concatenation**: Template-based reconstruction from `makeConcatWithConstants` bootstrap
 - **Varargs**: Displayed as `Type...`
 - **Static initializers**: `static { }` blocks decompiled
-- **Module declarations**: `module-info.java` with requires/exports/opens/uses/provides
+- **Module declarations**: `module-info.java` with requires (incl. `transitive`/`static` modifiers)/exports/opens/uses/provides
+- **Switch expressions** (Java 14+): value arms, `yield` blocks, throwing arms, nested switch expressions, exhaustive enum switches
+- **Pattern matching for switch** (Java 21+): type patterns, `when` guards, `case null`, record deconstruction patterns (flat, nested, generic), unnamed `case Type _` arms (Java 22+)
+- **Pattern matching for instanceof** (Java 16+): bindings incl. `&&`-tail usage and record deconstruction
+- **Flexible constructor bodies** (Java 25): statements before `super()`/`this()` preserved
+- **Annotation declarations**: `@interface` with `@Retention`/`@Target` meta-annotations and `default` element values
 
 ### Output Quality
 - **Variable declarations**: `int total = 0` merged from separate declaration and assignment
@@ -527,7 +532,7 @@ it.denzosoft.javadecompiler
 mvn clean package
 ```
 
-The resulting JAR will be in `target/java-decompiler-1.0.0-SNAPSHOT.jar`.
+The resulting JAR will be in `target/java-decompiler-1.10.0.jar`.
 
 Source compatibility: **Java 1.6** (runs on any JVM 1.6+).
 Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
@@ -548,24 +553,26 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 | 15 | 59 | Text blocks, sealed classes (preview) |
 | 16 | 60 | Records (final), pattern matching for `instanceof` |
 | 17 | 61 | Sealed classes (final), `strictfp` default |
-| 21 | 65 | Pattern matching for switch, record patterns |
-| 25 | 69 | Latest features |
+| 21 | 65 | Pattern matching for switch (incl. `when` guards, `case null`), record patterns (flat and nested deconstruction) |
+| 22 | 66 | Unnamed variables and patterns (`case Integer _`) |
+| 25 | 69 | Flexible constructor bodies (JEP 513), compact source files / instance `main` (JEP 512), `module-info` `requires transitive`/`static` |
 
 ## Known Limitations
 
 ### Permanent Limitations
-- **Generic type erasure**: Some generic type parameters are lost at bytecode level; raw types may appear where generics were used. `LocalVariableTypeTable` is used when available for better results.
+- **Generic type erasure**: Some generic type parameters are lost at bytecode level. v1.10.0 recovers most common cases without debug info: class headers and record components from the Signature attribute, collection locals from for-each element casts and a known-generic-factory table (`Arrays.asList`, `List.of`, `Optional.of`, …), and functional-interface locals from the invokedynamic `instantiatedMethodType` (`Function<Integer, Integer> f = x -> …`). `LocalVariableTypeTable` is used when available. Residual raw types can still appear in uncommon shapes (e.g. user factory methods).
 - **`@Override`**: Not reconstructable (has `RetentionPolicy.SOURCE`, not present in class files)
 - **Text blocks** (Java 15+): Heuristic detection based on newline count and safety check (2+ newlines, no trailing quote, no `\r`, no `"""`, no control chars); when not safe, output falls back to an escaped string literal. Exact distinction is impossible since text blocks and regular strings compile to identical bytecode.
 - **String templates** (Java 21+ preview): Not supported
 - **Cross-module sealed `permits`**: Sealed classes in one JDK module whose `permits` lists classes from another module fail to compile as a standalone file. The decompilation output is correct — this is a cross-module linkage requirement.
 
 ### Output Quality
-- **Inner/anonymous classes**: Named inner classes are fully inlined. Anonymous classes have display name mapping but body inlining into `new` expressions is in progress.
+- **Inner/anonymous/local classes** (since v1.10.0): named inner classes fully emitted, anonymous class bodies inlined into `new` expressions with captured variables (`val$`) substituted by their call-site expressions, local classes loaded and emitted (as nested members), member-inner synthetic outer parameters stripped. Inner classes are positioned at their original line locations.
 - **Type annotations** (Java 8+): Field type and method return type annotations are rendered. Annotations on generic type arguments (`List<@NonNull String>`) are not yet supported.
 - **Extreme bytecode patterns**: A handful of JDK-internal classes (Panama FFI `BindingSpecializer`, `FallbackLinker`, `ForkJoinPool`, `DirectMethodHandleDescImpl`) use bytecode patterns the decoder still can't fully reconstruct. When this happens the output contains explicit `// === DECOMPILATION NOTES ===` comment blocks identifying the pc and opcode of each unresolved site.
 
 ### Resolved in Previous Versions
+- **v1.10.0 — construct-matrix campaign (57/57 clean)**: all 11 verified silent miscompilations eliminated (`super.m()` → `this.m()` recursion, `return a++` value, deleted ternary branches, switch fall-through cascades, double-evaluated `(b = in.read())`, record canonical-ctor validation loss, annotation metadata loss, text-block trailing whitespace) plus switch expressions (yield blocks, enum/MatchException defaults, nested), pattern-switch folding (guarded `when`, unnamed `case Type _`), nested synchronized, `static synchronized`, structural finally dedup, modern/nested try-with-resources, `wide` opcode, catch bodies with control flow, branch-scoped declaration hoisting. Full list: `docs/releases/v1.10.0/release-notes.md`.
 - **String switch** (Java 7+): Fully reconstructed from hashCode/equals pattern since v1.1.0
 - **Enum constant initialization**: Synthetic members suppressed, constructor arguments extracted since v1.1.0/v1.2.0
 - **Lambda captures**: Captured variables properly resolved via bootstrap method analysis since v1.1.0
@@ -601,10 +608,21 @@ Decompiled output is verified to produce compilable Java source on real-world by
 
 | Test Set | Classes | Compile OK | Rate |
 |---|---|---|---|
+| **Construct matrix** (Java 1.0–25, one class per language construct, strict decompile→recompile, no debug info) | 57 | 57 | **100%** (v1.10.0) |
 | **java.base** (core JDK 25) | 3,372 | 3,368 | **99.88%** |
+| **JDK 25 breadth** (random real classes, marker-clean) | 1,674 | 1,669, 0 crashes | **99.7%** (v1.10.0) |
 | **Spring Boot uber-jar** (contrp.be-springboot 22.2.66) | 1,402 | 1,402 decompile OK, 0 diagnostics | **100%** |
 | **Spring Boot uber-jar** (contrp.be-springboot 22.2.65) | 1,401 | 1,401 decompile OK, 0 diagnostics | **100%** |
 | Obfuscated classes (no debug info, keyword names) | all | all | **100%** |
+
+**Comparison with JD-Core 1.3.0** (official engine via jd-cli, same strict recompile test): construct
+matrix 57/57 vs 44/57 (JD-Core produces no output at all for 6 classes: records, sealed, pattern
+switch, unnamed); 13-class Java 8–21 corpus 7 total errors vs 39 plus 4 classes with no output.
+JD-Core produces a better result on zero classes.
+
+Semantic verification (v1.10.0): beyond recompilation, decompiled-and-recompiled classes are
+runtime-compared against the originals (identical outputs on real inputs), annotations are
+reflection-compared, and monitor/flag structure is verified via `javap`.
 
 The remaining 4 java.base files that don't compile are JDK-internal classes with extreme bytecode patterns (Panama FFI `BindingSpecializer`, `FallbackLinker`, `ForkJoinPool`, `DirectMethodHandleDescImpl`). A separate group of files fails to compile only because of sealed `permits` clauses referencing classes in other JDK modules — the decompilation output itself is correct, the compile failure is a cross-module linkage issue.
 
@@ -648,7 +666,7 @@ Recorded event types:
 
 ## Test Suite
 
-16 automated tests covering:
+38 automated tests (37 passing, 1 known pre-existing failure) covering:
 - Basic classes, constructors, field initialization
 - Annotations (`@Deprecated`, custom)
 - Generics (`<T extends Comparable<T>>`, `List<String>`)
@@ -661,5 +679,7 @@ Recorded event types:
 
 Run tests:
 ```bash
-java -cp target/classes it.denzosoft.javadecompiler.DecompilerTest /path/to/javac
+mvn clean compile
+javac -cp target/classes src/test/java/it/denzosoft/javadecompiler/DecompilerTest.java -d target/test-classes
+java -cp target/classes:target/test-classes it.denzosoft.javadecompiler.DecompilerTest /path/to/jdk-25/bin/javac
 ```
