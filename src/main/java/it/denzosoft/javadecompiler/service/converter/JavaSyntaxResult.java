@@ -234,12 +234,21 @@ public class JavaSyntaxResult {
         public final String name;
         public final String descriptor;
         public final Type type;
+        // START_CHANGE: BUG-2026-0094-20260610-2 - Carry the per-component generic Signature
+        // (JVMS 4.7.30) so the writer can emit `T value` instead of the erased descriptor type.
+        public final String signature;
 
         public RecordComponentInfo(String name, String descriptor, Type type) {
+            this(name, descriptor, type, null);
+        }
+
+        public RecordComponentInfo(String name, String descriptor, Type type, String signature) {
             this.name = name;
             this.descriptor = descriptor;
             this.type = type;
+            this.signature = signature;
         }
+        // END_CHANGE: BUG-2026-0094-2
     }
 
     public static class InnerClassInfo {

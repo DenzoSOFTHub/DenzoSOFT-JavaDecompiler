@@ -157,8 +157,28 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         if (record != null) {
             List<JavaSyntaxResult.RecordComponentInfo> components = new ArrayList<JavaSyntaxResult.RecordComponentInfo>();
             for (RecordAttribute.RecordComponent rc : record.getComponents()) {
+                // START_CHANGE: BUG-2026-0094-20260610-1 - Use the per-component Signature
+                // attribute (when present) instead of the erased descriptor, so generic record
+                // components decompile as `T value` / `List<T> list` rather than `Object value`.
+                String componentSignature = null;
+                if (rc.attributes != null) {
+                    for (Attribute rcAttr : rc.attributes) {
+                        if (rcAttr instanceof SignatureAttribute) {
+                            componentSignature = ((SignatureAttribute) rcAttr).getSignature();
+                            break;
+                        }
+                    }
+                }
+                Type componentType = null;
+                if (componentSignature != null) {
+                    componentType = parseSignatureType(componentSignature);
+                }
+                if (componentType == null) {
+                    componentType = parseType(rc.descriptor);
+                }
                 components.add(new JavaSyntaxResult.RecordComponentInfo(
-                    rc.name, rc.descriptor, parseType(rc.descriptor)));
+                    rc.name, rc.descriptor, componentType, componentSignature));
+                // END_CHANGE: BUG-2026-0094-1
             }
             result.setRecordComponents(components);
         }
@@ -3793,68 +3813,178 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         if (statements == null || statements.size() < 2) return statements;
         // First pass: strip monitor markers from inside try-finally and unwrap synthetic try-finally
         List<Statement> cleaned = stripMonitorFromTryFinally(statements);
+        // START_CHANGE: BUG-2026-0092-20260610-1 - Balanced __MONITORENTER__/__MONITOREXIT__ pairing:
+        // recurse on nested enters (instead of skipping them) so nested synchronized blocks are
+        // preserved, and hoist a value-Return/Throw that immediately follows the closing exit into
+        // the innermost body (its value was computed under the lock before monitorexit).
         List<Statement> result = new ArrayList<Statement>(cleaned.size());
-        for (int i = 0; i < cleaned.size(); i++) {
+        int i = 0;
+        while (i < cleaned.size()) {
             // Look for __MONITORENTER__ marker
             if (isMonitorMarker(cleaned.get(i), "MONITORENTER")) {
                 // Find the lock expression: the statement before monitorenter should be
                 // varX = lockExpr (the dup+astore pattern)
-                Expression lockExpr = null;
-                int lockStmtIdx = -1;
-                if (!result.isEmpty()) {
-                    Statement prev = result.get(result.size() - 1);
-                    if (prev instanceof VariableDeclarationStatement) {
-                        VariableDeclarationStatement vds = (VariableDeclarationStatement) prev;
-                        if (vds.hasInitializer()) {
-                            lockExpr = vds.getInitializer();
-                            lockStmtIdx = result.size() - 1;
-                        }
-                    } else if (prev instanceof ExpressionStatement) {
-                        Expression expr = ((ExpressionStatement) prev).getExpression();
-                        if (expr instanceof AssignmentExpression) {
-                            AssignmentExpression ae = (AssignmentExpression) expr;
-                            lockExpr = ae.getRight();
-                            lockStmtIdx = result.size() - 1;
-                        }
-                    }
-                }
+                Expression lockExpr = extractLockFromTail(result);
                 if (lockExpr == null) {
+                    i++;
                     continue;
                 }
-                result.remove(lockStmtIdx);
-                // Collect body statements until __MONITOREXIT__ or end
-                List<Statement> syncBody = new ArrayList<Statement>();
-                i++;
-                while (i < cleaned.size()) {
-                    if (isMonitorMarker(cleaned.get(i), "MONITOREXIT")) {
-                        break;
+                int[] pos = new int[] { i + 1 };
+                SynchronizedStatement sync = collectSynchronizedRegion(cleaned, pos, lockExpr);
+                i = pos[0];
+                // A Return-with-value/Throw immediately after the final monitorexit was computed
+                // inside the monitor (value carried across monitorexit on the operand stack):
+                // move it inside the innermost reconstructed body.
+                if (i < cleaned.size()) {
+                    Statement next = cleaned.get(i);
+                    boolean hoistable = (next instanceof ReturnStatement && ((ReturnStatement) next).hasExpression())
+                        || next instanceof ThrowStatement;
+                    if (hoistable) {
+                        SynchronizedStatement hoisted = hoistTailIntoSync(sync, next);
+                        if (hoisted != null) {
+                            sync = hoisted;
+                            i++;
+                        }
                     }
-                    // Skip nested monitor markers in collected body
-                    if (!isMonitorMarker(cleaned.get(i), "MONITORENTER")) {
-                        syncBody.add(cleaned.get(i));
-                    }
-                    i++;
                 }
-                // Remove any remaining monitor markers from collected body
-                syncBody = removeMonitorMarkers(syncBody);
-                int line = lockExpr instanceof AbstractExpression
-                    ? ((AbstractExpression) lockExpr).getLineNumber() : 0;
-                Statement body;
-                if (syncBody.size() == 1) {
-                    body = syncBody.get(0);
-                } else {
-                    body = new BlockStatement(line, syncBody);
-                }
-                result.add(new SynchronizedStatement(line, lockExpr, body));
+                result.add(sync);
                 continue;
             }
             if (isMonitorMarker(cleaned.get(i), "MONITOREXIT")) {
+                i++;
                 continue;
             }
             result.add(cleaned.get(i));
+            i++;
         }
         return result;
     }
+
+    /**
+     * Extract the lock expression from the trailing statement of {@code list}
+     * (the dup+astore pattern: varX = lockExpr just before __MONITORENTER__).
+     * On success the trailing statement is removed from the list.
+     */
+    private Expression extractLockFromTail(List<Statement> list) {
+        if (list.isEmpty()) return null;
+        Statement prev = list.get(list.size() - 1);
+        Expression lockExpr = null;
+        if (prev instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) prev;
+            if (vds.hasInitializer()) {
+                lockExpr = vds.getInitializer();
+            }
+        } else if (prev instanceof ExpressionStatement) {
+            Expression expr = ((ExpressionStatement) prev).getExpression();
+            if (expr instanceof AssignmentExpression) {
+                lockExpr = ((AssignmentExpression) expr).getRight();
+            }
+        }
+        if (lockExpr != null) {
+            list.remove(list.size() - 1);
+        }
+        return lockExpr;
+    }
+
+    /**
+     * Collect the body of a synchronized region starting just after its __MONITORENTER__
+     * marker ({@code pos[0]}). Markers are paired like balanced parentheses: a nested
+     * __MONITORENTER__ opens an inner SynchronizedStatement (consuming the preceding
+     * lock-temp declaration as its monitor expression) and the region terminates at its
+     * own depth-matched __MONITOREXIT__. On return {@code pos[0]} points just past the
+     * consumed closing marker (or end of list).
+     */
+    private SynchronizedStatement collectSynchronizedRegion(List<Statement> cleaned, int[] pos, Expression lockExpr) {
+        List<Statement> syncBody = new ArrayList<Statement>();
+        while (pos[0] < cleaned.size()) {
+            Statement s = cleaned.get(pos[0]);
+            if (isMonitorMarker(s, "MONITOREXIT")) {
+                pos[0]++;
+                break;
+            }
+            if (isMonitorMarker(s, "MONITORENTER")) {
+                Expression innerLock = extractLockFromTail(syncBody);
+                if (innerLock == null) {
+                    // Unpaired nested marker without a lock-temp declaration: drop it
+                    pos[0]++;
+                    continue;
+                }
+                pos[0]++;
+                SynchronizedStatement inner = collectSynchronizedRegion(cleaned, pos, innerLock);
+                // The enclosing region's monitorexit may have been stripped already (try-finally
+                // unwrap), leaving a Return/Throw right after the inner region's exit: hoist it
+                // into the inner body as well (its value was computed under both locks).
+                if (pos[0] < cleaned.size()) {
+                    Statement next = cleaned.get(pos[0]);
+                    boolean hoistable = (next instanceof ReturnStatement && ((ReturnStatement) next).hasExpression())
+                        || next instanceof ThrowStatement;
+                    if (hoistable) {
+                        SynchronizedStatement hoisted = hoistTailIntoSync(inner, next);
+                        if (hoisted != null) {
+                            inner = hoisted;
+                            pos[0]++;
+                        }
+                    }
+                }
+                syncBody.add(inner);
+                continue;
+            }
+            syncBody.add(s);
+            pos[0]++;
+        }
+        // Remove any remaining monitor markers from collected body (nested blocks)
+        syncBody = removeMonitorMarkers(syncBody);
+        int line = lockExpr instanceof AbstractExpression
+            ? ((AbstractExpression) lockExpr).getLineNumber() : 0;
+        Statement body;
+        if (syncBody.size() == 1) {
+            body = syncBody.get(0);
+        } else {
+            body = new BlockStatement(line, syncBody);
+        }
+        return new SynchronizedStatement(line, lockExpr, body);
+    }
+
+    /**
+     * Rebuild {@code sync} with {@code tail} appended to the innermost body, descending
+     * through a trailing chain of nested SynchronizedStatements. Returns null when the
+     * innermost body already ends abruptly (appending would create unreachable code).
+     */
+    private SynchronizedStatement hoistTailIntoSync(SynchronizedStatement sync, Statement tail) {
+        Statement body = sync.getBody();
+        if (body instanceof SynchronizedStatement) {
+            SynchronizedStatement inner = hoistTailIntoSync((SynchronizedStatement) body, tail);
+            if (inner == null) return null;
+            return new SynchronizedStatement(sync.getLineNumber(), sync.getMonitor(), inner);
+        }
+        List<Statement> stmts;
+        int bodyLine;
+        if (body instanceof BlockStatement) {
+            stmts = new ArrayList<Statement>(((BlockStatement) body).getStatements());
+            bodyLine = body.getLineNumber();
+        } else {
+            stmts = new ArrayList<Statement>();
+            stmts.add(body);
+            bodyLine = sync.getLineNumber();
+        }
+        if (!stmts.isEmpty()) {
+            Statement last = stmts.get(stmts.size() - 1);
+            if (last instanceof SynchronizedStatement) {
+                SynchronizedStatement inner = hoistTailIntoSync((SynchronizedStatement) last, tail);
+                if (inner == null) return null;
+                stmts.set(stmts.size() - 1, inner);
+                return new SynchronizedStatement(sync.getLineNumber(), sync.getMonitor(),
+                    new BlockStatement(bodyLine, stmts));
+            }
+            if (last instanceof ReturnStatement || last instanceof ThrowStatement) {
+                return null;
+            }
+        }
+        stmts.add(tail);
+        return new SynchronizedStatement(sync.getLineNumber(), sync.getMonitor(),
+            new BlockStatement(bodyLine, stmts));
+    }
+    // END_CHANGE: BUG-2026-0092-1
 
     /**
      * Strip monitor markers from inside try-finally blocks.
