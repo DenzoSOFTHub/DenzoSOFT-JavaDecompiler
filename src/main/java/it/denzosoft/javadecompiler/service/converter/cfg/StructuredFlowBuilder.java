@@ -72,6 +72,16 @@ public class StructuredFlowBuilder {
         this.decoder = decoder;
     }
 
+    // START_CHANGE: BUG-2026-0066-20260610-15 - The method's return type matters for switch
+    // EXPRESSION reconstruction: a boolean method's `ireturn` merge consumes int 0/1 arm values
+    // that must be rendered as boolean literals (`case SAT, SUN -> true`). The converter sets
+    // this from the method descriptor; transforms like BooleanSimplifier run too late (they do
+    // not descend into SwitchExpression arms).
+    private boolean methodReturnsBoolean = false;
+
+    public void setMethodReturnsBoolean(boolean b) { this.methodReturnsBoolean = b; }
+    // END_CHANGE: BUG-2026-0066-15
+
     /**
      * Build structured statements from the CFG.
      * Returns a list of statements representing the method body.
@@ -364,14 +374,26 @@ public class StructuredFlowBuilder {
                 // START_CHANGE: BUG-2026-0066-20260608-1 - Try to reconstruct a switch EXPRESSION
                 // first (every arm yields a value into a common `return` merge). Falls through to the
                 // statement-switch builder if the shape does not match.
-                Statement switchExpr = tryBuildSwitchExpression(block, switchMergePc, visited);
+                Statement switchExpr = tryBuildSwitchExpression(block, switchMergePc, visited, stopPc);
                 if (switchExpr != null) {
                     if (switchExpr instanceof BlockStatement) {
                         output.addAll(((BlockStatement) switchExpr).getStatements());
                     } else {
                         output.add(switchExpr);
                     }
-                    return; // return-merge: flow ends here
+                    // START_CHANGE: BUG-2026-0066-20260610-3 - The merge block was NOT consumed:
+                    // its consumer statement now embeds the reconstructed SwitchExpression (in-place
+                    // substitution), so continue the normal flow there. For a `return` merge the
+                    // flow ends naturally; for a store-merge (e.g. `x = switch(...)` inside an
+                    // enclosing switch arm) the merge's own terminal (goto-as-break, fall-through)
+                    // is handled by the regular machinery.
+                    BasicBlock seMergeBlock = cfg.getBlockAtPc(switchMergePc);
+                    if (seMergeBlock != null && !visited.contains(seMergeBlock.startPc)) {
+                        block = seMergeBlock;
+                        continue;
+                    }
+                    return;
+                    // END_CHANGE: BUG-2026-0066-3
                 }
                 // END_CHANGE: BUG-2026-0066-1
 
@@ -1531,21 +1553,34 @@ public class StructuredFlowBuilder {
      * or the default target if all non-default cases goto there.
      */
     // START_CHANGE: BUG-2026-0066-20260608-3 - Switch-expression reconstruction.
-    private Statement tryBuildSwitchExpression(BasicBlock block, int mergePc, Set<Integer> visited) {
+    private Statement tryBuildSwitchExpression(BasicBlock block, int mergePc, Set<Integer> visited,
+                                               int stopPc) {
         if (mergePc < 0 || block.switchKeys == null || block.switchDefaultTarget < 0) return null;
         BasicBlock mergeBlock = cfg.getBlockAtPc(mergePc);
         if (mergeBlock == null) return null;
-        // Only the `return switch(...)` shape for now: the merge is a `*return` (its own returned
-        // value is one arm's value leaked across the stack-merge; we replace it with the switch expr).
-        if (!mergeBlock.isReturn()) {
-            return null;
-        }
+        // START_CHANGE: BUG-2026-0066-20260610-4 - The merge no longer has to be a bare `*return`
+        // block: any merge whose consumer statement embeds an arm value (assignment store-merge,
+        // switch-expr as call argument, `return f(switch...)`) is accepted via in-place
+        // substitution below. It must still carry statements to host the substitution, must not
+        // have been emitted already, and the caller must be able to continue into it (the merge
+        // at or before the current build bound is processed by this or the enclosing region).
+        if (visited.contains(mergeBlock.startPc)) return null;
+        if (mergeBlock.statements == null || mergeBlock.statements.isEmpty()) return null;
+        boolean mergeReachable = stopPc < 0 || stopPc <= block.startPc || mergePc <= stopPc;
+        // NOTE: the !mergeReachable bail is applied below, AFTER the pattern-switch detection:
+        // a guarded pattern switch lives inside a while(true) restart loop whose body bound is
+        // the back-edge goto, so its merge legitimately lies beyond stopPc (BUG-2026-0066-18).
+        // END_CHANGE: BUG-2026-0066-4
         int line = block.lineNumber > 0 ? block.lineNumber : 0;
 
         // Selector.
-        Expression selector = null;
+        // START_CHANGE: BUG-2026-0066-20260610-5 - Prefer the block's saved selector (the exact
+        // expression popped by the tableswitch/lookupswitch opcode) over the last-statement
+        // heuristic, mirroring BUG-2026-0085-14 on the statement-switch path: an unrelated
+        // trailing assignment must neither become the selector nor be dropped from the output.
+        Expression selector = block.selectorExpression;
         boolean selFromStmt = false;
-        if (block.statements != null && !block.statements.isEmpty()) {
+        if (selector == null && block.statements != null && !block.statements.isEmpty()) {
             Statement last = block.statements.get(block.statements.size() - 1);
             if (last instanceof ExpressionStatement) {
                 Expression e = ((ExpressionStatement) last).getExpression();
@@ -1553,7 +1588,7 @@ public class StructuredFlowBuilder {
                 selFromStmt = true;
             }
         }
-        if (selector == null && block.selectorExpression != null) selector = block.selectorExpression;
+        // END_CHANGE: BUG-2026-0066-5
         if (selector == null) return null;
 
         // BUG-2026-0067: pattern switch — `switch (SwitchBootstraps.typeSwitch(sel, idx))`. The real
@@ -1568,6 +1603,12 @@ public class StructuredFlowBuilder {
                 realSelector = smie.getArguments().get(0);
             }
         }
+        // START_CHANGE: BUG-2026-0066-20260610-18 - Apply the merge-bound bail (see change -4):
+        // pattern switches are exempt because their while(true) restart-loop body bound always
+        // precedes the merge; the caller's continue-into-merge walks past the bound and the
+        // single resulting `return switch(...)` statement makes the loop wrapper collapse.
+        if (!mergeReachable && !patternSwitch) return null;
+        // END_CHANGE: BUG-2026-0066-18
 
         // Group keys that share a target into a single case.
         List<List<Integer>> keyGroups = new ArrayList<List<Integer>>();
@@ -1597,6 +1638,10 @@ public class StructuredFlowBuilder {
         List<SwitchExpression.SwitchCase> exprCases = new ArrayList<SwitchExpression.SwitchCase>();
         Type valType = null;
         Set<Integer> armPcs = new HashSet<Integer>();
+        // START_CHANGE: BUG-2026-0066-20260610-17 - Leaf arm values for identity substitution
+        // (filled by simpleSwitchExprArm, including nested arms' leaves).
+        List<Expression> leakValues = new ArrayList<Expression>();
+        // END_CHANGE: BUG-2026-0066-17
         for (int g = 0; g < keyGroups.size(); g++) {
             BasicBlock tb = cfg.getBlockAtPc(targetPcs.get(g).intValue());
             SwitchExpression.SwitchCase sc;
@@ -1614,13 +1659,15 @@ public class StructuredFlowBuilder {
                     if (sc == null) return null;
                 }
             } else {
-                Expression val = switchArmValue(tb, mergePc);
-                if (val == null) return null;
                 List<Expression> labels = new ArrayList<Expression>();
                 for (int k = 0; k < keyGroups.get(g).size(); k++) {
                     labels.add(IntegerConstantExpression.valueOf(line, keyGroups.get(g).get(k).intValue()));
                 }
-                sc = new SwitchExpression.SwitchCase(labels, val);
+                // START_CHANGE: BUG-2026-0066-20260610-8 - Accept block-bodied, throwing and
+                // nested arms, not just bare values (see simpleSwitchExprArm).
+                sc = simpleSwitchExprArm(tb, mergePc, labels, armPcs, leakValues, 0);
+                if (sc == null) return null;
+                // END_CHANGE: BUG-2026-0066-8
             }
             if (valType == null && sc.getValue() != null && sc.getValue().getType() != null) valType = sc.getValue().getType();
             exprCases.add(sc);
@@ -1631,10 +1678,19 @@ public class StructuredFlowBuilder {
             // Exhaustive pattern switch: the synthetic `default -> throw MatchException` is implicit.
             armPcs.add(Integer.valueOf(db.startPc));
         } else {
-            Expression defVal = switchArmValue(db, mergePc);
-            if (defVal == null) return null; // need a value default (no block arms yet)
-            exprCases.add(new SwitchExpression.SwitchCase(null, defVal));
+            // START_CHANGE: BUG-2026-0066-20260610-9 - The default arm may also be a block-bodied
+            // or throwing arm. An exhaustive enum-ordinal switch expression compiles to a plain
+            // tableswitch over `e.ordinal()` whose synthetic default is
+            // `throw new MatchException(null, null)`; emitting it verbatim keeps the int-keyed
+            // switch exhaustive for javac and is runtime-identical.
+            SwitchExpression.SwitchCase dsc = simpleSwitchExprArm(db, mergePc, null, armPcs, leakValues, 0);
+            if (dsc == null) return null;
+            if (valType == null && dsc.getValue() != null && dsc.getValue().getType() != null) {
+                valType = dsc.getValue().getType();
+            }
+            exprCases.add(dsc);
             armPcs.add(Integer.valueOf(db.startPc));
+            // END_CHANGE: BUG-2026-0066-9
         }
         selector = realSelector;
 
@@ -1647,17 +1703,226 @@ public class StructuredFlowBuilder {
             if (reachesMerge) return null;
         }
 
-        // Commit.
+        // START_CHANGE: BUG-2026-0066-20260610-10 - Commit by IN-PLACE SUBSTITUTION: the merge
+        // block's first statement (its consumer: `return <v>`, `Type x = <v>`, `x = <v>`,
+        // `f(<v>)`, `return f(<v>)`) holds ONE arm's leaked value; replace that value with the
+        // reconstructed SwitchExpression and leave the merge block UNCONSUMED so the caller
+        // continues the normal flow there (the old code always emitted `return switch(...)` and
+        // swallowed the merge, which silently dropped post-switch code on store merges).
+        // (a) Boolean target: an int-valued merge (ireturn/istore of iconst_0/iconst_1) whose
+        //     consumer is boolean-typed means the arms are boolean literals.
+        Statement consumer = mergeBlock.statements.get(0);
+        boolean booleanTarget = false;
+        if (consumer instanceof ReturnStatement) {
+            Expression re = ((ReturnStatement) consumer).getExpression();
+            booleanTarget = methodReturnsBoolean || re instanceof BooleanExpression
+                || (re != null && re.getType() == PrimitiveType.BOOLEAN);
+        } else if (consumer instanceof VariableDeclarationStatement) {
+            booleanTarget = ((VariableDeclarationStatement) consumer).getType() == PrimitiveType.BOOLEAN;
+        } else if (consumer instanceof ExpressionStatement
+                && ((ExpressionStatement) consumer).getExpression() instanceof AssignmentExpression) {
+            Expression lhs = ((AssignmentExpression) ((ExpressionStatement) consumer).getExpression()).getLeft();
+            booleanTarget = lhs != null && lhs.getType() == PrimitiveType.BOOLEAN;
+        }
+        List<Expression> originalValues = new ArrayList<Expression>(leakValues);
+        for (int ci = 0; ci < exprCases.size(); ci++) {
+            if (exprCases.get(ci).getValue() != null) originalValues.add(exprCases.get(ci).getValue());
+        }
+        if (booleanTarget) {
+            for (int ci = 0; ci < exprCases.size(); ci++) {
+                Expression v = exprCases.get(ci).getValue();
+                if (v instanceof IntegerConstantExpression) {
+                    int iv = ((IntegerConstantExpression) v).getValue();
+                    if (iv == 0 || iv == 1) {
+                        exprCases.get(ci).setValue(new BooleanExpression(line, iv == 1));
+                    }
+                }
+            }
+            valType = PrimitiveType.BOOLEAN;
+        }
+
         SwitchExpression se = new SwitchExpression(line,
             valType != null ? valType : PrimitiveType.INT, selector, exprCases);
+
+        // (b) Substitute: identity-match one of the original leaked arm values inside the
+        //     consumer. If the converter re-materialized the leaked constant (e.g. iconst_1
+        //     became the literal `true` of a boolean ireturn), fall back to replacing a bare
+        //     literal return wholesale — a literal cannot embed the leak in a sub-expression.
+        boolean substituted = false;
+        for (int vi = 0; vi < originalValues.size() && !substituted; vi++) {
+            substituted = substituteSwitchValue(mergeBlock, originalValues.get(vi), se);
+        }
+        if (!substituted && consumer instanceof ReturnStatement
+                && isLiteralExpr(((ReturnStatement) consumer).getExpression())) {
+            mergeBlock.statements.set(0, new ReturnStatement(line, se));
+            substituted = true;
+        }
+        if (!substituted) return null; // nothing mutated up to this point: safe fallback
+
         for (Integer pc : armPcs) visited.add(pc);
-        visited.add(Integer.valueOf(mergeBlock.startPc));
+        // NOTE: the merge block is deliberately NOT marked visited - the caller continues there.
 
         List<Statement> out = new ArrayList<Statement>(block.statements);
         if (selFromStmt && !out.isEmpty()) out.remove(out.size() - 1);
-        out.add(new ReturnStatement(line, se));
         return new BlockStatement(line, out);
+        // END_CHANGE: BUG-2026-0066-10
     }
+
+    // START_CHANGE: BUG-2026-0066-20260610-11 - A plain, block-bodied, throwing or nested arm of
+    // a non-pattern switch expression. Plain: the arm block leaves a value on the stack and flows
+    // to the merge. Block-bodied: same, plus straight-line statements executed first
+    // (`case X -> { stmts; yield v; }`). Throwing: the arm completes abruptly with athrow and
+    // never reaches the merge (`default -> throw new MatchException(null, null);`). Nested: the
+    // arm block is itself a switch whose arms all flow to the SAME outer merge
+    // (`case X -> switch (sel) { ... }`). `consumedPcs` collects the entry PCs of inner arms so
+    // the caller marks them visited; `leaks` collects every leaf arm value (one of them is the
+    // expression leaked into the merge's consumer statement, used for identity substitution).
+    private SwitchExpression.SwitchCase simpleSwitchExprArm(BasicBlock tb, int mergePc,
+                                                            List<Expression> labels,
+                                                            Set<Integer> consumedPcs,
+                                                            List<Expression> leaks, int depth) {
+        if (tb == null) return null;
+        boolean gotoMerge = tb.isGoto() && tb.branchTargetPc == mergePc;
+        boolean fallMerge = tb.endPc == mergePc;
+        if (tb.stackTopExpression != null && (gotoMerge || fallMerge)) {
+            SwitchExpression.SwitchCase sc = new SwitchExpression.SwitchCase(labels, tb.stackTopExpression);
+            if (tb.statements != null && !tb.statements.isEmpty()) {
+                sc.setBodyStatements(new ArrayList<Statement>(tb.statements));
+            }
+            leaks.add(tb.stackTopExpression);
+            return sc;
+        }
+        if (tb.stackTopExpression == null && tb.statements != null && !tb.statements.isEmpty()
+                && tb.statements.get(tb.statements.size() - 1) instanceof ThrowStatement) {
+            SwitchExpression.SwitchCase sc = new SwitchExpression.SwitchCase(labels, null);
+            sc.setBodyStatements(new ArrayList<Statement>(tb.statements));
+            return sc;
+        }
+        // Nested switch-expression arm.
+        if (depth < 3 && tb.type == BasicBlock.SWITCH && tb.switchKeys != null
+                && tb.switchDefaultTarget >= 0 && tb.selectorExpression != null
+                && (tb.statements == null || tb.statements.isEmpty())) {
+            int line = tb.lineNumber > 0 ? tb.lineNumber : 0;
+            List<List<Integer>> kg = new ArrayList<List<Integer>>();
+            List<Integer> tp = new ArrayList<Integer>();
+            for (int i = 0; i < tb.switchKeys.length; i++) {
+                int t = (tb.switchTargets != null && i < tb.switchTargets.length) ? tb.switchTargets[i] : -1;
+                int gi = tp.indexOf(Integer.valueOf(t));
+                if (gi >= 0) {
+                    kg.get(gi).add(Integer.valueOf(tb.switchKeys[i]));
+                } else {
+                    List<Integer> grp = new ArrayList<Integer>();
+                    grp.add(Integer.valueOf(tb.switchKeys[i]));
+                    kg.add(grp);
+                    tp.add(Integer.valueOf(t));
+                }
+            }
+            List<SwitchExpression.SwitchCase> innerCases = new ArrayList<SwitchExpression.SwitchCase>();
+            Set<Integer> innerPcs = new HashSet<Integer>();
+            List<Expression> innerLeaks = new ArrayList<Expression>();
+            Type innerType = null;
+            for (int g = 0; g < kg.size(); g++) {
+                BasicBlock itb = cfg.getBlockAtPc(tp.get(g).intValue());
+                List<Expression> il = new ArrayList<Expression>();
+                for (int k = 0; k < kg.get(g).size(); k++) {
+                    il.add(IntegerConstantExpression.valueOf(line, kg.get(g).get(k).intValue()));
+                }
+                SwitchExpression.SwitchCase isc = simpleSwitchExprArm(itb, mergePc, il, innerPcs, innerLeaks, depth + 1);
+                if (isc == null) return null;
+                if (innerType == null && isc.getValue() != null && isc.getValue().getType() != null) {
+                    innerType = isc.getValue().getType();
+                }
+                innerCases.add(isc);
+                innerPcs.add(Integer.valueOf(itb.startPc));
+            }
+            BasicBlock idb = cfg.getBlockAtPc(tb.switchDefaultTarget);
+            SwitchExpression.SwitchCase idc = simpleSwitchExprArm(idb, mergePc, null, innerPcs, innerLeaks, depth + 1);
+            if (idc == null) return null;
+            if (innerType == null && idc.getValue() != null && idc.getValue().getType() != null) {
+                innerType = idc.getValue().getType();
+            }
+            innerCases.add(idc);
+            innerPcs.add(Integer.valueOf(idb.startPc));
+            consumedPcs.addAll(innerPcs);
+            leaks.addAll(innerLeaks);
+            SwitchExpression inner = new SwitchExpression(line,
+                innerType != null ? innerType : PrimitiveType.INT, tb.selectorExpression, innerCases);
+            return new SwitchExpression.SwitchCase(labels, inner);
+        }
+        return null;
+    }
+
+    // In-place substitution of the reconstructed switch expression for the leaked arm value
+    // (identity match) inside the merge block's consumer statement. Returns false (with NO
+    // mutation) when the consumer shape is not recognized.
+    private boolean substituteSwitchValue(BasicBlock mergeBlock, Expression target, Expression repl) {
+        Statement consumer = mergeBlock.statements.get(0);
+        if (consumer instanceof ReturnStatement) {
+            ReturnStatement rs = (ReturnStatement) consumer;
+            if (rs.getExpression() == target) {
+                mergeBlock.statements.set(0, new ReturnStatement(rs.getLineNumber(), repl));
+                return true;
+            }
+            return substituteInCallArgs(rs.getExpression(), target, repl);
+        }
+        if (consumer instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement vds = (VariableDeclarationStatement) consumer;
+            if (vds.getInitializer() == target) {
+                VariableDeclarationStatement nv = new VariableDeclarationStatement(
+                    vds.getLineNumber(), vds.getType(), vds.getName(), repl,
+                    vds.isFinal(), vds.isVar());
+                nv.setGenericSignature(vds.getGenericSignature());
+                mergeBlock.statements.set(0, nv);
+                return true;
+            }
+            return substituteInCallArgs(vds.getInitializer(), target, repl);
+        }
+        if (consumer instanceof ExpressionStatement) {
+            Expression e = ((ExpressionStatement) consumer).getExpression();
+            if (e instanceof AssignmentExpression) {
+                AssignmentExpression ae = (AssignmentExpression) e;
+                if (ae.getRight() == target) {
+                    mergeBlock.statements.set(0, new ExpressionStatement(
+                        new AssignmentExpression(ae.getLineNumber(), ae.getType(),
+                            ae.getLeft(), ae.getOperator(), repl)));
+                    return true;
+                }
+                return substituteInCallArgs(ae.getRight(), target, repl);
+            }
+            return substituteInCallArgs(e, target, repl);
+        }
+        return false;
+    }
+
+    // Replace `target` (identity) with `repl` inside a call's argument list, recursing through
+    // nested call arguments. Argument lists are mutable in place.
+    private boolean substituteInCallArgs(Expression e, Expression target, Expression repl) {
+        List<Expression> args = null;
+        if (e instanceof MethodInvocationExpression) {
+            args = ((MethodInvocationExpression) e).getArguments();
+        } else if (e instanceof StaticMethodInvocationExpression) {
+            args = ((StaticMethodInvocationExpression) e).getArguments();
+        } else if (e instanceof NewExpression) {
+            args = ((NewExpression) e).getArguments();
+        }
+        if (args == null) return false;
+        for (int i = 0; i < args.size(); i++) {
+            if (args.get(i) == target) {
+                args.set(i, repl);
+                return true;
+            }
+            if (substituteInCallArgs(args.get(i), target, repl)) return true;
+        }
+        return false;
+    }
+
+    private boolean isLiteralExpr(Expression e) {
+        return e instanceof IntegerConstantExpression || e instanceof BooleanExpression
+            || e instanceof StringConstantExpression || e instanceof LongConstantExpression
+            || e instanceof DoubleConstantExpression || e instanceof FloatConstantExpression
+            || e instanceof NullExpression;
+    }
+    // END_CHANGE: BUG-2026-0066-11
 
     private Expression switchArmValue(BasicBlock tb, int mergePc) {
         if (tb == null || tb.stackTopExpression == null) return null;
@@ -1831,6 +2096,26 @@ public class StructuredFlowBuilder {
         // Count ALL goto targets including the default target - the most common
         // goto destination from case bodies is the merge point.
         Map<Integer, Integer> gotoCounts = new HashMap<Integer, Integer>();
+        // START_CHANGE: BUG-2026-0066-20260610-12 - Two passes: first collect the candidate
+        // merge targets, then count, skipping gotos that originate at/after a NEARER candidate
+        // (they belong to that candidate's downstream region, not to this switch's arms). A
+        // switch whose default region is a second switch (javac's string-switch-expression
+        // lowering: hash lookupswitch + index dispatch tableswitch) had its merge stolen by the
+        // dispatch arms' gotos (4 gotos to the ireturn beat 3 gotos to the dispatch entry),
+        // nesting the dispatch inside the first hash case and dropping the method tail.
+        Set<Integer> candidatePcs = new HashSet<Integer>();
+        for (BasicBlock b : cfg.getBlocks()) {
+            if (regionStopPc >= 0 && regionStopPc > switchBlock.startPc
+                    && b.startPc >= regionStopPc) continue;
+            if (b.startPc > switchBlock.startPc && b.isGoto() && b.branchTargetPc > switchBlock.startPc) {
+                if ((b.branchTargetPc == switchBlock.switchDefaultTarget
+                        || !casePcs.contains(b.branchTargetPc))
+                        && b.branchTargetPc >= maxTargetPc) {
+                    candidatePcs.add(Integer.valueOf(b.branchTargetPc));
+                }
+            }
+        }
+        // END_CHANGE: BUG-2026-0066-12
         for (BasicBlock b : cfg.getBlocks()) {
             // START_CHANGE: BUG-2026-0085-20260610-12 - Ignore gotos from outside the region.
             // Only applicable to a forward bound: inside a loop body the bound is the header PC,
@@ -1849,6 +2134,18 @@ public class StructuredFlowBuilder {
                         || !casePcs.contains(b.branchTargetPc))
                         && b.branchTargetPc >= maxTargetPc) {
                 // END_CHANGE: BUG-2026-0085-9
+                    // START_CHANGE: BUG-2026-0066-20260610-13 - Skip gotos downstream of a
+                    // nearer candidate (see change -12 above).
+                    boolean downstreamOfNearerCandidate = false;
+                    for (Iterator<Integer> ci = candidatePcs.iterator(); ci.hasNext();) {
+                        int c = ci.next().intValue();
+                        if (c < b.branchTargetPc && c <= b.startPc) {
+                            downstreamOfNearerCandidate = true;
+                            break;
+                        }
+                    }
+                    if (downstreamOfNearerCandidate) continue;
+                    // END_CHANGE: BUG-2026-0066-13
                     Integer count = gotoCounts.get(b.branchTargetPc);
                     gotoCounts.put(b.branchTargetPc, count == null ? 1 : count + 1);
                 }

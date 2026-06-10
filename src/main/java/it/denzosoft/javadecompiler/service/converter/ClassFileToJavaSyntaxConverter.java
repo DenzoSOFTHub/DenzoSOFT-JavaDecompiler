@@ -1277,6 +1277,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
         // Build structured statements from CFG
         StructuredFlowBuilder builder = new StructuredFlowBuilder(cfg, decoder);
+        // START_CHANGE: BUG-2026-0066-20260610-16 - Tell the flow builder whether `ireturn`
+        // returns a boolean so reconstructed switch-expression arms with int 0/1 values render
+        // as boolean literals (BooleanSimplifier runs too late to descend into the arms).
+        builder.setMethodReturnsBoolean(
+            "Z".equals(TypeNameUtil.parseMethodReturnDescriptor(method.getDescriptor())));
+        // END_CHANGE: BUG-2026-0066-16
         try {
             List<Statement> result = builder.buildStatements();
             if (result != null && !result.isEmpty()) {

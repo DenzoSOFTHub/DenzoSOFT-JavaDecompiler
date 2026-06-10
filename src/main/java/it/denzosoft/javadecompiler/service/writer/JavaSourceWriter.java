@@ -3394,8 +3394,45 @@ public class JavaSourceWriter implements Processor {
                     }
                 }
                 printer.printText(" -> ");
-                writeExpression(printer, sc.getValue(), ownerInternalName);
-                printer.printText("; ");
+                // START_CHANGE: BUG-2026-0066-20260610-14 - Block-bodied arms
+                // (`case X -> { stmts; yield v; }`) and throwing arms
+                // (`default -> throw new MatchException(null, null);`).
+                if (sc.hasBodyStatements()) {
+                    List<Statement> armBody = sc.getBodyStatements();
+                    if (sc.getValue() == null && armBody.size() == 1
+                            && armBody.get(0) instanceof ThrowStatement) {
+                        printer.printKeyword("throw");
+                        printer.printText(" ");
+                        writeExpression(printer,
+                            ((ThrowStatement) armBody.get(0)).getExpression(), ownerInternalName);
+                        printer.printText("; ");
+                    } else {
+                        printer.printText("{ ");
+                        for (int bi = 0; bi < armBody.size(); bi++) {
+                            Statement armStmt = armBody.get(bi);
+                            if (armStmt instanceof ThrowStatement) {
+                                printer.printKeyword("throw");
+                                printer.printText(" ");
+                                writeExpression(printer,
+                                    ((ThrowStatement) armStmt).getExpression(), ownerInternalName);
+                            } else {
+                                writeInlineStatement(printer, armStmt, ownerInternalName);
+                            }
+                            printer.printText("; ");
+                        }
+                        if (sc.getValue() != null) {
+                            printer.printKeyword("yield");
+                            printer.printText(" ");
+                            writeExpression(printer, sc.getValue(), ownerInternalName);
+                            printer.printText("; ");
+                        }
+                        printer.printText("} ");
+                    }
+                } else {
+                    writeExpression(printer, sc.getValue(), ownerInternalName);
+                    printer.printText("; ");
+                }
+                // END_CHANGE: BUG-2026-0066-14
             }
             printer.printText("}");
             // END_CHANGE: BUG-2026-0066-2

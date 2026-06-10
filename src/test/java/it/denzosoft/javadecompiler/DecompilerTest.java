@@ -64,6 +64,10 @@ public class DecompilerTest {
         testNestedRecordPattern();  // BUG-2026-0067: nested record deconstruction
         testGenericRecordPattern(); // BUG-2026-0067: generic record deconstruction (cast type)
         testSwitchRecordPattern();  // BUG-2026-0079: SWITCH-form record deconstruction (JD pipeline)
+        // START_CHANGE: BUG-2026-0067-20260610-49 - Sealed-exhaustive switch + unnamed components.
+        testExhaustiveSwitchRecordPattern(); // BUG-2026-0067: no-default record switch (tail-arm reclaim)
+        testUnnamedPatternComponent();       // BUG-2026-0067: dead component folds to `Type _`
+        // END_CHANGE: BUG-2026-0067-49
         testInstanceofAmpersand();  // BUG-2026-0067: `o instanceof X v && v.m()` binding
         testUndeclaredAssignPromotion(); // BUG-2026-0077: reused slot gets a declaration
         testWhileTrueBreak();       // BUG-2026-0078: break out of while(true)
@@ -483,6 +487,49 @@ public class DecompilerTest {
             new String[]{"switch", "L(", "P(", "->", "default"},
             new String[]{"SwitchBootstraps", "typeSwitch", "MatchException"});
     }
+
+    // START_CHANGE: BUG-2026-0067-20260610-50 - Sealed-exhaustive record switch: the synthetic
+    // `default -> throw MatchException` is skipped and the fall-out tail arm is reclaimed into the
+    // switch expression (no default arm in the source, none in the output).
+    private static void testExhaustiveSwitchRecordPattern() {
+        runTestFull("ExhSw",
+            "sealed interface ShE permits CiE, ReE, TrE {}\n" +
+            "record CiE(double r) implements ShE {}\n" +
+            "record ReE(double w, double h) implements ShE {}\n" +
+            "record TrE(double b, double h) implements ShE {}\n" +
+            "public class ExhSw {\n" +
+            "    double area(ShE s) {\n" +
+            "        return switch (s) {\n" +
+            "            case CiE(double r) -> r * r;\n" +
+            "            case ReE(double w, double h) -> w * h;\n" +
+            "            case TrE(double b, double h) -> 0.5 * b * h;\n" +
+            "        };\n" +
+            "    }\n" +
+            "}\n",
+            new String[]{"switch", "CiE(", "ReE(", "TrE(", "->"},
+            new String[]{"SwitchBootstraps", "MatchException", "while (true)", "default"});
+    }
+
+    // BUG-2026-0067: a record component the source never bound (unnamed `_`) folds to `Type _`
+    // instead of aborting the deconstruction (dead scratch slot, no live copy).
+    private static void testUnnamedPatternComponent() {
+        runTestFull("UnComp",
+            "public class UnComp {\n" +
+            "    record P(int x, int y) {}\n" +
+            "    record Q(P a, P b) {}\n" +
+            "    int f(Object o) {\n" +
+            "        if (o instanceof P(int x, int _)) return x;\n" +
+            "        return -1;\n" +
+            "    }\n" +
+            "    int g(Object o) {\n" +
+            "        if (o instanceof Q(P(int x, var _), P _)) return x;\n" +
+            "        return -1;\n" +
+            "    }\n" +
+            "}\n",
+            new String[]{"instanceof", "P(", "int _", "P _"},
+            new String[]{"MatchException", "catch (Throwable"});
+    }
+    // END_CHANGE: BUG-2026-0067-50
 
     // BUG-2026-0067: a pattern binding used in the `&&` tail is recovered: `o instanceof X v && v.m()`.
     private static void testInstanceofAmpersand() {

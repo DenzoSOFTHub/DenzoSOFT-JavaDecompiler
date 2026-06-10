@@ -39,8 +39,7 @@ Index shows ONLY open items.
 |---|---|---|---|
 | BUG-2026-0053 | HIGH | Ternary in lambda body (→ consolidated in BUG-2026-0083) | [BUG-2026-0053](items/BUG-2026-0053.md) |
 | BUG-2026-0056 | HIGH | Try-catch-finally: catch-conditional body still dropped (post-try part FIXED) | [BUG-2026-0056](items/BUG-2026-0056.md) |
-| BUG-2026-0066 | HIGH | Switch-expressions: enum/yield-block/nested-merge arms still unreconstructed | [BUG-2026-0066](items/BUG-2026-0066.md) |
-| BUG-2026-0067 | HIGH | Pattern switch: MatchException default + empty tail case still bail folding | [BUG-2026-0067](items/BUG-2026-0067.md) |
+| BUG-2026-0067 | HIGH | Pattern switch: transform folding DONE (exhaustive tail reclaim, `_` components); guarded/unnamed statement-form leak = flow-level (see item residuals 1–2) | [BUG-2026-0067](items/BUG-2026-0067.md) |
 | BUG-2026-0068 | HIGH | Modern TWR: nested/multi-resource/effectively-final shapes still uncollapsed | [BUG-2026-0068](items/BUG-2026-0068.md) |
 | BUG-2026-0069 | HIGH | Local decl/type loss (ternary part → 0083; slot part → 0096; generics → erasure plan) | [BUG-2026-0069](items/BUG-2026-0069.md) |
 | BUG-2026-0080 | HIGH | Construct-matrix umbrella (37/57 clean; full plan in report-construct-matrix-gap-analysis.md) | [BUG-2026-0080](items/BUG-2026-0080.md) |

@@ -43,14 +43,20 @@ public final class TypeSwitchRecordFolder {
             FoldResult fr = tryFold((SwitchStatement) s, statements, i);
             if (fr != null) {
                 statements.set(i, fr.folded);
-                if (fr.absorbedNext && i + 1 < statements.size()) statements.remove(i + 1);
+                // START_CHANGE: BUG-2026-0067-20260610-30 - absorbedNext is now a count: the fold may
+                // reclaim the whole post-switch tail (the exhaustive switch's fall-out arm), not just
+                // a single default `return X;`.
+                for (int k = 0; k < fr.absorbedNext && i + 1 < statements.size(); k++) statements.remove(i + 1);
+                // END_CHANGE: BUG-2026-0067-30
                 return statements;
             }
         }
         return statements;
     }
 
-    private static final class FoldResult { final Statement folded; final boolean absorbedNext; FoldResult(Statement f, boolean a) { folded = f; absorbedNext = a; } }
+    // START_CHANGE: BUG-2026-0067-20260610-31 - absorbedNext as a count (see reconstruct()).
+    private static final class FoldResult { final Statement folded; final int absorbedNext; FoldResult(Statement f, int a) { folded = f; absorbedNext = a; } }
+    // END_CHANGE: BUG-2026-0067-31
 
     private static void recurse(Statement s) {
         if (s instanceof BlockStatement) reconstruct(((BlockStatement) s).getStatements());
@@ -89,9 +95,26 @@ public final class TypeSwitchRecordFolder {
 
         List<SwitchExpression.SwitchCase> exprCases = new ArrayList<SwitchExpression.SwitchCase>();
         Type valueType = null;
+        // START_CHANGE: BUG-2026-0067-20260610-32 - Sealed-exhaustive shape: the synthetic
+        // `default: throw new MatchException(...)` arm is skipped (exhaustive marker), and ONE empty
+        // labeled case is allowed — its arm fell out of the switch and is reclaimed from the
+        // post-switch statements after the loop.
+        boolean exhaustive = false;
+        int tailPos = -1;
         for (SwitchStatement.SwitchCase sc : sw.getCases()) {
             List<Statement> body = sc.getStatements();
-            if (body == null || body.isEmpty()) continue; // spurious `default:`/empty fall-through label
+            if (body == null || body.isEmpty()) {
+                if (sc.isDefault()) continue; // spurious `default:`/empty fall-through label
+                if (tailPos >= 0) return null; // at most one fall-out arm
+                tailPos = exprCases.size();
+                exprCases.add(null); // placeholder, filled after the loop
+                continue;
+            }
+            if (sc.isDefault() && body.size() == 1 && isMatchExceptionThrow(body.get(0))) {
+                exhaustive = true; // synthetic exhaustive default -> no default arm in the source
+                continue;
+            }
+            // END_CHANGE: BUG-2026-0067-32
             // The arm must start with `Type v = (Type) subject;` (decl or assignment).
             CastBind cb = matchCastBind(body.get(0), subject);
             if (cb == null) return null; // not a pattern arm -> bail (safe)
@@ -114,14 +137,43 @@ public final class TypeSwitchRecordFolder {
         }
         if (exprCases.isEmpty()) return null;
 
-        // Default value: the `return X;` immediately after the switch.
+        // START_CHANGE: BUG-2026-0067-20260610-33 - Reclaim the fall-out arm: the empty tail case's
+        // body is the post-switch statements `Type v = (Type) subject; <deconstruction>; return <value>;`.
+        // Only the sealed-exhaustive shape (MatchException default) produces it, and the fold must
+        // consume the whole tail (no trailing live code may be absorbed).
+        int absorbedNext = 0;
+        if (tailPos >= 0) {
+            if (!exhaustive || idx + 2 > outer.size()) return null;
+            CastBind tcb = matchCastBind(outer.get(idx + 1), subject);
+            if (tcb == null) return null;
+            List<Statement> tailRest = new ArrayList<Statement>(outer.subList(idx + 2, outer.size()));
+            RecordDeconstructionFolder.ArmFold taf = RecordDeconstructionFolder.foldArm(tcb.binding, tailRest);
+            if (taf == null || taf.remainingBody.size() != 1
+                    || !(taf.remainingBody.get(0) instanceof ReturnStatement)
+                    || !((ReturnStatement) taf.remainingBody.get(0)).hasExpression()) return null;
+            boolean coversTail = taf.flatWalk
+                ? taf.consumed + taf.remainingBody.size() == tailRest.size()
+                : taf.consumed == tailRest.size();
+            if (!coversTail) return null;
+            Expression tailValue = ((ReturnStatement) taf.remainingBody.get(0)).getExpression();
+            SwitchExpression.SwitchCase tec = new SwitchExpression.SwitchCase(null, tailValue);
+            tec.setPatternType(tcb.type);
+            tec.setRecordPattern(new RecordPattern(taf.components));
+            exprCases.set(tailPos, tec);
+            if (valueType == null && tailValue != null) valueType = tailValue.getType();
+            absorbedNext = outer.size() - idx - 1;
+        }
+
+        // Default value: the `return X;` immediately after the switch (only when the switch is NOT
+        // exhaustive — for the exhaustive shape any post-switch return is unrelated code).
         Expression defaultValue = null;
-        boolean absorbedNext = false;
-        if (idx + 1 < outer.size() && outer.get(idx + 1) instanceof ReturnStatement
+        if (tailPos < 0 && !exhaustive
+                && idx + 1 < outer.size() && outer.get(idx + 1) instanceof ReturnStatement
                 && ((ReturnStatement) outer.get(idx + 1)).hasExpression()) {
             defaultValue = ((ReturnStatement) outer.get(idx + 1)).getExpression();
-            absorbedNext = true;
+            absorbedNext = 1;
         }
+        // END_CHANGE: BUG-2026-0067-33
         if (defaultValue != null) {
             exprCases.add(new SwitchExpression.SwitchCase(null, defaultValue));
         }
@@ -131,6 +183,18 @@ public final class TypeSwitchRecordFolder {
             subject, exprCases);
         return new FoldResult(new ReturnStatement(sw.getLineNumber(), swExpr), absorbedNext);
     }
+
+    // START_CHANGE: BUG-2026-0067-20260610-34 - Recognize the synthetic `throw new MatchException(...)`
+    // default arm of a sealed-exhaustive pattern switch.
+    private static boolean isMatchExceptionThrow(Statement s) {
+        if (!(s instanceof ThrowStatement)) return false;
+        Expression e = ((ThrowStatement) s).getExpression();
+        if (!(e instanceof NewExpression)) return false;
+        NewExpression ne = (NewExpression) e;
+        if (ne.getInternalTypeName() != null && ne.getInternalTypeName().endsWith("MatchException")) return true;
+        return ne.getType() != null && "MatchException".equals(ne.getType().getName());
+    }
+    // END_CHANGE: BUG-2026-0067-34
 
     private static final class CastBind { final String binding; final Type type; CastBind(String b, Type t) { binding = b; type = t; } }
 

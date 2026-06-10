@@ -123,7 +123,10 @@ public final class RecordDeconstructionFolder {
         final List<RecordPattern.Component> components;
         final List<Statement> finalStmts;
         final int bodyStart;
-        Fold(List<RecordPattern.Component> c, List<Statement> s, int b) { this.components = c; this.finalStmts = s; this.bodyStart = b; }
+        // START_CHANGE: BUG-2026-0067-20260610-38 - Top-list consumption (see Walk.topConsumed).
+        final int topConsumed;
+        Fold(List<RecordPattern.Component> c, List<Statement> s, int b, int top) { this.components = c; this.finalStmts = s; this.bodyStart = b; this.topConsumed = top; }
+        // END_CHANGE: BUG-2026-0067-38
     }
 
     /**
@@ -134,14 +137,28 @@ public final class RecordDeconstructionFolder {
     public static ArmFold foldArm(String subject, List<Statement> body) {
         Fold f = foldFlat(subject, body);
         if (f == null) return null;
+        // START_CHANGE: BUG-2026-0067-20260610-35 - Expose how much of the TOP-LEVEL list the walk
+        // consumed (flat walk: the machinery prefix; descended walk: up to and including the nested if),
+        // so the typeSwitch tail-arm reclaim can verify it absorbs the whole post-switch tail.
+        boolean flat = f.finalStmts == body;
         return new ArmFold(f.components,
-            new ArrayList<Statement>(f.finalStmts.subList(f.bodyStart, f.finalStmts.size())));
+            new ArrayList<Statement>(f.finalStmts.subList(f.bodyStart, f.finalStmts.size())),
+            flat, flat ? f.bodyStart : f.topConsumed);
+        // END_CHANGE: BUG-2026-0067-35
     }
 
     public static final class ArmFold {
         public final List<RecordPattern.Component> components;
         public final List<Statement> remainingBody;
-        ArmFold(List<RecordPattern.Component> c, List<Statement> r) { this.components = c; this.remainingBody = r; }
+        // START_CHANGE: BUG-2026-0067-20260610-36 - Top-level coverage info for the tail-arm reclaim.
+        /** Whether the walk stayed in the passed-in list (no nested-if descent). */
+        public final boolean flatWalk;
+        /** Statements consumed from the passed-in list (excluding {@link #remainingBody} when flat). */
+        public final int consumed;
+        ArmFold(List<RecordPattern.Component> c, List<Statement> r, boolean flat, int consumed) {
+            this.components = c; this.remainingBody = r; this.flatWalk = flat; this.consumed = consumed;
+        }
+        // END_CHANGE: BUG-2026-0067-36
     }
 
     /** Consume the component-extraction prefix of a then-block for subject {@code subjectName}. */
@@ -149,12 +166,15 @@ public final class RecordDeconstructionFolder {
         Walk w = new Walk(stmts, 0);
         List<RecordPattern.Component> comps = foldOuter(subjectName, w, w.fullScan);
         if (comps == null || comps.isEmpty()) return null;
-        return new Fold(comps, w.stmts, w.i);
+        return new Fold(comps, w.stmts, w.i, w.topConsumed);
     }
 
     /** Mutable cursor: a statement list + index; the list may switch to a nested if-body during descent. */
     private static final class Walk {
         List<Statement> stmts; int i; final List<Statement> fullScan;
+        // START_CHANGE: BUG-2026-0067-20260610-37 - Top-list consumption marker, frozen on first descent.
+        int topConsumed;
+        // END_CHANGE: BUG-2026-0067-37
         Walk(List<Statement> s, int idx) { this.stmts = s; this.i = idx; this.fullScan = s; }
     }
 
@@ -192,6 +212,10 @@ public final class RecordDeconstructionFolder {
                 pending.add(new Object[]{ innerType, nestedSubject, Integer.valueOf(comps.size()) });
                 comps.add(null); // placeholder, filled below
                 // Descend: continue collecting THIS subject's remaining components inside the if body.
+                // START_CHANGE: BUG-2026-0067-20260610-39 - Freeze the top-list consumption on the first
+                // descent (everything up to and including the nested if belongs to the pattern machinery).
+                if (w.stmts == w.fullScan) w.topConsumed = w.i;
+                // END_CHANGE: BUG-2026-0067-39
                 w.stmts = innerBody; w.i = innerStart;
                 continue;
             }
@@ -210,11 +234,30 @@ public final class RecordDeconstructionFolder {
                     live = cp;
                 }
             }
-            if (live == null) return null;
+            // START_CHANGE: BUG-2026-0067-20260610-40 - Dead component -> unnamed pattern. When no copy
+            // of the extracted component is live AND the scratch slot itself is dead downstream
+            // (write-before-read), the source bound a component it never used: emit `Type _` / `var _`
+            // instead of aborting the whole fold (C_Unnamed onlyX/firstX).
+            if (live == null) {
+                if (!scratchDeadFrom(head.scratch, w.stmts, w.i)) return null;
+                Type deadType = head.castType;
+                if (deadType == null && !isObjectType(head.accessorType)) deadType = head.accessorType;
+                if (deadType == null && !copies.isEmpty()) deadType = copies.get(0).bindType;
+                if (deadType != null) comps.add(new RecordPattern.Component(deadType, "_", false));
+                else comps.add(new RecordPattern.Component(null, "_", true)); // `var _`
+                if (w.i <= before) return null;
+                continue;
+            }
             // A cast on the accessor head (generic erasure: `String s = (String) t.value()`) carries the
             // real component type; the alias copy's declared slot is then erased (Object) and must be
             // overridden.
             Type bindType = head.castType != null ? head.castType : live.bindType;
+            // The copy's declared slot may be erased to Object by slot reuse; the accessor's static
+            // return type is more precise (C_RecordPattern.describe: Line(Point a, Point b)).
+            if (isObjectType(bindType) && head.accessorType != null && !isObjectType(head.accessorType)) {
+                bindType = head.accessorType;
+            }
+            // END_CHANGE: BUG-2026-0067-40
             comps.add(new RecordPattern.Component(bindType, live.destName, false));
             if (w.i <= before) return null;
         }
@@ -275,7 +318,11 @@ public final class RecordDeconstructionFolder {
 
     private static final class Head {
         final String scratch; final Type castType;
-        Head(String s, Type c) { this.scratch = s; this.castType = c; }
+        // START_CHANGE: BUG-2026-0067-20260610-41 - The accessor's static return type (from the method
+        // descriptor) — more precise than an erased Object copy slot.
+        final Type accessorType;
+        Head(String s, Type c, Type accessor) { this.scratch = s; this.castType = c; this.accessorType = accessor; }
+        // END_CHANGE: BUG-2026-0067-41
     }
     private static final class Copy {
         final String destName; final Type bindType;
@@ -301,8 +348,56 @@ public final class RecordDeconstructionFolder {
             castType = ((CastExpression) rhs).getType();
             rhs = ((CastExpression) rhs).getExpression();
         }
-        return isAccessorOn(rhs, subject) ? new Head(dest, castType) : null;
+        // START_CHANGE: BUG-2026-0067-20260610-42 - Carry the accessor's static return type.
+        if (!isAccessorOn(rhs, subject)) return null;
+        return new Head(dest, castType, rhs.getType());
+        // END_CHANGE: BUG-2026-0067-42
     }
+
+    // START_CHANGE: BUG-2026-0067-20260610-43 - Helpers for the dead-component / erased-type fixes.
+    /** Whether {@code t} is unknown or the erased {@code java.lang.Object}. */
+    private static boolean isObjectType(Type t) {
+        if (t == null) return true;
+        if (t instanceof it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType) {
+            return "java/lang/Object".equals(
+                ((it.denzosoft.javadecompiler.model.javasyntax.type.ObjectType) t).getInternalName());
+        }
+        return "java.lang.Object".equals(t.getName()) || "Object".equals(t.getName());
+    }
+
+    /**
+     * Whether the scratch slot {@code name} is dead from {@code stmts[from]} on: a top-level plain
+     * reassignment (whose RHS does not read it) kills it before any read. Conservative: any read first
+     * (including inside nested control flow) means live.
+     */
+    private static boolean scratchDeadFrom(String name, List<Statement> stmts, int from) {
+        for (int k = from; k < stmts.size(); k++) {
+            Statement s = stmts.get(k);
+            if (isPlainWriteTo(s, name)) return true; // killed before any read
+            if (readsStmt(s, name)) return false;
+        }
+        return true; // never read again
+    }
+
+    /** `name = rhs;` or `Type name = rhs;` where rhs does not read {@code name}. */
+    private static boolean isPlainWriteTo(Statement s, String name) {
+        if (s instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement v = (VariableDeclarationStatement) s;
+            return name.equals(v.getName()) && (!v.hasInitializer() || !readsExpr(v.getInitializer(), name));
+        }
+        if (s instanceof ExpressionStatement) {
+            Expression e = ((ExpressionStatement) s).getExpression();
+            if (e instanceof AssignmentExpression) {
+                AssignmentExpression ae = (AssignmentExpression) e;
+                return "=".equals(ae.getOperator())
+                    && ae.getLeft() instanceof LocalVariableExpression
+                    && name.equals(((LocalVariableExpression) ae.getLeft()).getName())
+                    && !readsExpr(ae.getRight(), name);
+            }
+        }
+        return false;
+    }
+    // END_CHANGE: BUG-2026-0067-43
 
     private static boolean isAccessorOn(Expression e, String subject) {
         if (!(e instanceof MethodInvocationExpression)) return false;
