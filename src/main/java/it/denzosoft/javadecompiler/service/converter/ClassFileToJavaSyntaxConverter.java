@@ -242,9 +242,13 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 result.setModuleVersion(moduleAttr.getModuleVersion());
 
                 List<String[]> reqList = new ArrayList<String[]>();
+                // START_CHANGE: BUG-2026-0099-20260610-2 - Carry requires_flags through to the
+                // writer ([name, version, flags-as-decimal-string]) so `requires transitive` /
+                // `requires static` modifiers survive decompilation.
                 for (ModuleAttribute.Requires req : moduleAttr.getRequires()) {
-                    reqList.add(new String[]{req.name, req.version});
+                    reqList.add(new String[]{req.name, req.version, String.valueOf(req.flags)});
                 }
+                // END_CHANGE: BUG-2026-0099-2
                 result.setModuleRequires(reqList);
 
                 List<String[]> expList = new ArrayList<String[]>();
@@ -393,6 +397,18 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             bodyStatements = decompileMethodBody(code, classFile.getConstantPool(), method);
         }
 
+        // START_CHANGE: BUG-2026-0089-20260610-1 - A record canonical constructor with a non-trivial
+        // component assignment (`this.celsius = Math.max(-273.15, celsius)`) was dropped by the
+        // writer's RHS-blind triviality check, silently deleting the user's validation/clamping
+        // logic. Rewrite such assignments into compact-constructor form (`celsius = Math.max(...);
+        // this.celsius = celsius;`): the parameter reassignment makes the ctor visibly non-trivial,
+        // and the writer's compact emitter keeps it while stripping the now-trivial field assignment.
+        if ("<init>".equals(method.getName()) && classFile.findAttribute("Record") != null) {
+            RecordAttribute recordAttr = (RecordAttribute) classFile.findAttribute("Record");
+            compactifyRecordCanonicalCtor(bodyStatements, paramDescriptors, paramNames, recordAttr);
+        }
+        // END_CHANGE: BUG-2026-0089-1
+
         // Max line number for printer
         int maxLineNumber = 0;
         if (code != null) {
@@ -409,6 +425,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
         // Method annotations
         List<AnnotationInfo> methodAnnotations = extractAnnotations(method.getAttributes());
+
+        // START_CHANGE: BUG-2026-0090-20260610-2 - Surface the AnnotationDefault attribute
+        // (parsed by AttributeParser but previously dropped) so annotation type elements
+        // keep their `default <value>` clause.
+        AnnotationDefaultAttribute annotationDefaultAttr = method.findAttribute("AnnotationDefault");
+        // END_CHANGE: BUG-2026-0090-2
 
         // Parameter annotations
         List<List<AnnotationInfo>> paramAnnotations = new ArrayList<List<AnnotationInfo>>();
@@ -448,6 +470,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             returnType, paramTypes, paramNames, thrownExceptions,
             bodyStatements, maxLineNumber, signature,
             methodAnnotations, paramAnnotations);
+        // START_CHANGE: BUG-2026-0090-20260610-3 - Attach the annotation element default value
+        if (annotationDefaultAttr != null) {
+            md.annotationDefault = annotationDefaultAttr.getDefaultValue();
+        }
+        // END_CHANGE: BUG-2026-0090-3
         // START_CHANGE: IMP-LINES-20260326-6 - Populate bytecode metadata
         if (code != null) {
             md.bytecodeLength = code.getCode().length;
@@ -498,6 +525,88 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         // END_CHANGE: IMP-2026-0002-10
         return md;
     }
+
+    // START_CHANGE: BUG-2026-0089-20260610-2 - Rewrite non-trivial component assignments of a record
+    // canonical constructor into compact-constructor form so no user logic is silently dropped.
+    // `this.<comp> = <expr>` (expr != bare parameter) becomes `<param> = <expr>; this.<comp> = <param>;`
+    // — the exact desugaring javac performs for a compact constructor, run in reverse. The trailing
+    // trivial field assignment is then correctly classified as implicit by the writer, while the
+    // parameter reassignment survives into the emitted compact body. The transform is aborted (body
+    // left untouched) if any reassigned parameter is read by a later statement, since the
+    // reassignment would change the value those reads observe.
+    private void compactifyRecordCanonicalCtor(List<Statement> body, String[] paramDescriptors,
+                                               List<String> paramNames, RecordAttribute recordAttr) {
+        if (body == null || body.isEmpty() || recordAttr == null) return;
+        RecordAttribute.RecordComponent[] comps = recordAttr.getComponents();
+        if (comps == null || comps.length == 0 || comps.length != paramDescriptors.length
+                || paramNames.size() < comps.length) {
+            return;
+        }
+        // Canonical constructor only: parameter descriptors match the record components in order.
+        for (int i = 0; i < comps.length; i++) {
+            if (comps[i].descriptor == null || !comps[i].descriptor.equals(paramDescriptors[i])) return;
+        }
+        // Component order -> parameter local slot (instance ctor: slot 0 is `this`).
+        int[] slots = new int[comps.length];
+        int slot = 1;
+        for (int i = 0; i < comps.length; i++) {
+            slots[i] = slot;
+            slot += ("D".equals(paramDescriptors[i]) || "J".equals(paramDescriptors[i])) ? 2 : 1;
+        }
+        // Collect top-level `this.<comp_i> = <expr>` statements whose RHS is NOT the bare parameter i.
+        List<int[]> pending = new ArrayList<int[]>(); // {statementIndex, componentIndex}
+        for (int si = 0; si < body.size(); si++) {
+            Statement s = body.get(si);
+            if (!(s instanceof ExpressionStatement)) continue;
+            Expression e = ((ExpressionStatement) s).getExpression();
+            if (!(e instanceof AssignmentExpression)) continue;
+            AssignmentExpression ae = (AssignmentExpression) e;
+            if (!"=".equals(ae.getOperator()) || !(ae.getLeft() instanceof FieldAccessExpression)) continue;
+            FieldAccessExpression fa = (FieldAccessExpression) ae.getLeft();
+            if (fa.getObject() != null && !(fa.getObject() instanceof ThisExpression)) continue;
+            int ci = -1;
+            for (int i = 0; i < comps.length; i++) {
+                if (comps[i].name != null && comps[i].name.equals(fa.getName())) { ci = i; break; }
+            }
+            if (ci < 0) continue;
+            Expression rhs = ae.getRight();
+            if (rhs instanceof LocalVariableExpression
+                    && paramNames.get(ci).equals(((LocalVariableExpression) rhs).getName())) {
+                continue; // already the implicit `this.x = x` form
+            }
+            // Safety gate: the parameter must not be read after this statement — the compact-form
+            // reassignment would change the value those later reads observe. Abort entirely.
+            for (int sj = si + 1; sj < body.size(); sj++) {
+                if (statementReadsLocal(body.get(sj), paramNames.get(ci))) return;
+            }
+            pending.add(new int[]{si, ci});
+        }
+        // Apply back-to-front so collected statement indices stay valid.
+        for (int pi = pending.size() - 1; pi >= 0; pi--) {
+            int si = pending.get(pi)[0];
+            int ci = pending.get(pi)[1];
+            AssignmentExpression ae = (AssignmentExpression) ((ExpressionStatement) body.get(si)).getExpression();
+            int ln = ae.getLineNumber();
+            Type pt = parseType(paramDescriptors[ci]);
+            body.set(si, new ExpressionStatement(new AssignmentExpression(ln, pt,
+                new LocalVariableExpression(ln, pt, paramNames.get(ci), slots[ci]), "=", ae.getRight())));
+            body.add(si + 1, new ExpressionStatement(new AssignmentExpression(ln, ae.getType(),
+                ae.getLeft(), "=", new LocalVariableExpression(ln, pt, paramNames.get(ci), slots[ci]))));
+        }
+    }
+
+    /** True if the statement tree references the named local (conservative: writes count too). */
+    private boolean statementReadsLocal(Statement s, final String name) {
+        final boolean[] found = new boolean[1];
+        new it.denzosoft.javadecompiler.service.converter.transform.AstLocalRewriter() {
+            protected Expression onLocal(LocalVariableExpression lv) {
+                if (name.equals(lv.getName())) found[0] = true;
+                return lv;
+            }
+        }.rewrite(s);
+        return found[0];
+    }
+    // END_CHANGE: BUG-2026-0089-2
 
     // START_CHANGE: IMP-2026-0062-20260422-25 - Quality heuristic for JD output.
     // Walks the statement tree looking for placeholder string constants the emitter
@@ -3097,6 +3206,20 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             // END_CHANGE: BUG-2026-0063-1
         }
         // END_CHANGE: LIM-0002-1
+
+        // START_CHANGE: BUG-2026-0087-20260610-1 - A `dup; istore` pair (assignment used as a value,
+        // e.g. `while ((b = in.read()) != -1)`) leaves the ORIGINAL expression aliased on the stack:
+        // re-materializing it would duplicate its side effect (the stream would be read twice and the
+        // stale first byte written). Replace the alias with a reference to the just-stored local, so
+        // the consumer sees `b != -1` — which the StructuredFlowBuilder assignment-into-condition
+        // merge (BUG-2026-0016) then folds back into `(b = in.read()) != -1`. The reference-identity
+        // check keeps `new;dup;invokespecial;astore` (alias already consumed by invokespecial) and
+        // other dup idioms untouched; `i = j = k` degrades gracefully to `j = k; i = j;`.
+        if (value != null && !stack.isEmpty() && stack.peek() == value) {
+            stack.pop();
+            stack.push(new LocalVariableExpression(line, type, name, index));
+        }
+        // END_CHANGE: BUG-2026-0087-1
 
         if (declaredVars != null && !declaredVars.contains(index)) {
             // First assignment - emit as variable declaration

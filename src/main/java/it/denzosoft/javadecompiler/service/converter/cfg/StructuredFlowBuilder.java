@@ -40,6 +40,20 @@ public class StructuredFlowBuilder {
     private List<Integer> outerLoopMergePoints = new ArrayList<Integer>();
     // BUG-2026-0078: exit PCs of enclosing `while(true)` loops; a goto to one of these is a plain `break`.
     private List<Integer> whileTrueExitStack = new ArrayList<Integer>();
+    // START_CHANGE: BUG-2026-0085-20260610-1 - Merge PCs of enclosing statement switches; a goto
+    // to the innermost entry is a switch `break` (the statement-switch builder never emitted
+    // breaks: case bodies walked into the merge and stopped silently, so every printed case
+    // fell through and e.g. C_Java7StringSwitch.category returned "unknown" for every input).
+    private List<Integer> switchMergeStack = new ArrayList<Integer>();
+    // END_CHANGE: BUG-2026-0085-1
+    // START_CHANGE: BUG-2026-0086-20260610-3 - Continue-target PCs of enclosing loops: the
+    // for-loop increment block (last backjump source) or the do-while condition block. A forward
+    // goto to the innermost entry from a nested context (switch arm, nested if) is a `continue`;
+    // it used to be emitted as a plain `break` by the generic goto-beyond-stopPc path, silently
+    // turning `continue` into loop exit. while(true) loops push a -1 sentinel (their continue is
+    // a backward goto, already handled) so a nested goto can never match an OUTER loop's entry.
+    private List<Integer> loopContinueTargets = new ArrayList<Integer>();
+    // END_CHANGE: BUG-2026-0086-3
     // START_CHANGE: BUG-2026-0083-20260610-3 - Ternaries whose merge block carries the merged
     // value onward on the operand stack (e.g. the first of two ternary call arguments: the
     // merge block IS the next ternary's condition block and has no statements of its own).
@@ -182,7 +196,12 @@ public class StructuredFlowBuilder {
                     } else {
                         // Separate condition block: collect body blocks up to condition
                         bodyStmts = new ArrayList<Statement>();
+                        // START_CHANGE: BUG-2026-0086-20260610-7 - A do-while `continue` is a
+                        // forward goto to the condition block: track it as the continue target.
+                        loopContinueTargets.add(Integer.valueOf(condBlock.startPc));
                         buildFromBlock(block, bodyStmts, visited, condBlock.startPc);
+                        loopContinueTargets.remove(loopContinueTargets.size() - 1);
+                        // END_CHANGE: BUG-2026-0086-7
 
                         // Decode the condition block to get the condition expression
                         decoder.decodeBlock(condBlock);
@@ -251,7 +270,13 @@ public class StructuredFlowBuilder {
                 // BUG-2026-0078: mark the loop exit so an inner `goto exit` becomes a plain `break`.
                 boolean pushedExit078 = false;
                 if (exitPc >= 0) { whileTrueExitStack.add(Integer.valueOf(exitPc)); pushedExit078 = true; }
+                // START_CHANGE: BUG-2026-0086-20260610-8 - Sentinel: a while(true) continue is a
+                // backward goto (already handled); the sentinel keeps a nested goto from matching
+                // an OUTER loop's continue target as a plain `continue`.
+                loopContinueTargets.add(Integer.valueOf(-1));
                 buildFromBlock(block, bodyStmts, visited, bodyStopPc);
+                loopContinueTargets.remove(loopContinueTargets.size() - 1);
+                // END_CHANGE: BUG-2026-0086-8
                 if (pushedExit078) whileTrueExitStack.remove(whileTrueExitStack.size() - 1);
 
                 int bodyLine = block.lineNumber > 0 ? block.lineNumber : 0;
@@ -304,6 +329,15 @@ public class StructuredFlowBuilder {
                                 break;
                             }
                         }
+                        // START_CHANGE: BUG-2026-0085-20260610-6 - Never follow a merge into or
+                        // past the innermost enclosing switch's merge PC: the switch statement's
+                        // own continuation processes the merge block, and following it from
+                        // inside a case body nested the post-switch code into the first case.
+                        if (!mergeIsOuterExit && !switchMergeStack.isEmpty()
+                                && mergePoint >= switchMergeStack.get(switchMergeStack.size() - 1).intValue()) {
+                            mergeIsOuterExit = true;
+                        }
+                        // END_CHANGE: BUG-2026-0085-6
                     }
                     if (mergePoint >= 0 && mergePoint != stopPc && !mergeIsOuterExit) {
                         BasicBlock mergeBlock = cfg.getBlockAtPc(mergePoint);
@@ -320,7 +354,12 @@ public class StructuredFlowBuilder {
 
             if (block.type == BasicBlock.SWITCH) {
                 // Compute merge point for the switch: the PC where all cases converge
-                int switchMergePc = findSwitchMergePoint(block);
+                // START_CHANGE: BUG-2026-0085-20260610-10 - Pass the current build bound so the
+                // merge scan ignores gotos that originate outside this switch's region (a nested
+                // switch used to adopt the OUTER switch's merge because the outer arms' break
+                // gotos outnumbered its own).
+                int switchMergePc = findSwitchMergePoint(block, stopPc);
+                // END_CHANGE: BUG-2026-0085-10
 
                 // START_CHANGE: BUG-2026-0066-20260608-1 - Try to reconstruct a switch EXPRESSION
                 // first (every arm yields a value into a common `return` merge). Falls through to the
@@ -369,25 +408,84 @@ public class StructuredFlowBuilder {
                             targetPcs.add(Integer.valueOf(targetPc));
                         }
                     }
+                    // START_CHANGE: BUG-2026-0085-20260610-2 - Build cases in bytecode PC order
+                    // with next-target bounding and break emission on verified goto-to-merge
+                    // terminals.
+                    // (a) Slot the default group at its PC position and sort all groups by target
+                    //     PC ascending: bytecode layout order IS the original source case order.
+                    //     Key-order processing used to inline a shared fall-through tail into the
+                    //     key-order-first case and then drop the default because its target block
+                    //     was already visited (C_ControlFlow.switchWithFallAccumulate).
+                    // (b) Bound each case body with the NEXT group's target PC so a case that
+                    //     physically falls into the next case stops there (genuine fall-through
+                    //     preserved, shared tails never inlined into the wrong case).
+                    // (c) A goto to the switch merge PC is a `break`: push the merge on
+                    //     switchMergeStack (consumed in the goto handling of buildFromBlock0) and
+                    //     additionally append a trailing break when the case region's physically
+                    //     last block is a goto-to-merge that the structured-pattern machinery
+                    //     swallowed (e.g. a conditional branching straight to the merge).
+                    if (block.switchDefaultTarget >= 0) {
+                        int dIdx = targetPcs.indexOf(Integer.valueOf(block.switchDefaultTarget));
+                        if (dIdx >= 0) {
+                            // `case X: default:` share the same body: default subsumes the keys.
+                            keyGroups.set(dIdx, null);
+                        } else {
+                            keyGroups.add(null); // null label list = default group
+                            targetPcs.add(Integer.valueOf(block.switchDefaultTarget));
+                        }
+                    }
+                    // Sort the groups by target PC ascending (insertion sort: groups are few).
+                    for (int a = 1; a < targetPcs.size(); a++) {
+                        for (int b = a; b > 0
+                                && targetPcs.get(b).intValue() < targetPcs.get(b - 1).intValue(); b--) {
+                            Integer tmpPc = targetPcs.get(b);
+                            targetPcs.set(b, targetPcs.get(b - 1));
+                            targetPcs.set(b - 1, tmpPc);
+                            List<Integer> tmpGroup = keyGroups.get(b);
+                            keyGroups.set(b, keyGroups.get(b - 1));
+                            keyGroups.set(b - 1, tmpGroup);
+                        }
+                    }
+                    boolean pushedMerge085 = false;
+                    if (switchMergePc >= 0) {
+                        switchMergeStack.add(Integer.valueOf(switchMergePc));
+                        pushedMerge085 = true;
+                    }
                     for (int g = 0; g < keyGroups.size(); g++) {
-                        List<Expression> labels = new ArrayList<Expression>();
-                        for (int k = 0; k < keyGroups.get(g).size(); k++) {
-                            labels.add(IntegerConstantExpression.valueOf(block.lineNumber, keyGroups.get(g).get(k).intValue()));
+                        List<Expression> labels = null;
+                        if (keyGroups.get(g) != null) {
+                            labels = new ArrayList<Expression>();
+                            for (int k = 0; k < keyGroups.get(g).size(); k++) {
+                                labels.add(IntegerConstantExpression.valueOf(block.lineNumber, keyGroups.get(g).get(k).intValue()));
+                            }
                         }
                         List<Statement> caseStmts = new ArrayList<Statement>();
                         int targetPc = targetPcs.get(g).intValue();
+                        // Bound the body at the next group's target (the fall-through boundary).
+                        int boundPc = (g + 1 < targetPcs.size())
+                            ? targetPcs.get(g + 1).intValue() : caseStopPc;
                         if (targetPc >= 0) {
                             BasicBlock targetBlock = cfg.getBlockAtPc(targetPc);
                             if (targetBlock != null && !visited.contains(targetBlock.startPc)) {
-                                buildFromBlock(targetBlock, caseStmts, visited, caseStopPc);
+                                buildFromBlock(targetBlock, caseStmts, visited, boundPc);
+                                appendSwitchBreak(caseStmts, targetPc, boundPc, switchMergePc);
+                            } else if (labels == null) {
+                                continue; // default body already consumed elsewhere (legacy behavior)
                             }
                         }
                         cases.add(new SwitchStatement.SwitchCase(labels, caseStmts));
                     }
+                    if (pushedMerge085) {
+                        switchMergeStack.remove(switchMergeStack.size() - 1);
+                    }
+                    // END_CHANGE: BUG-2026-0085-2
                 }
                 // END_CHANGE: BUG-2026-0017-1
                 // Default case
-                if (block.switchDefaultTarget >= 0) {
+                // START_CHANGE: BUG-2026-0085-20260610-3 - Only when the key grouping above could
+                // not run; otherwise the default was already slotted at its PC position.
+                if (block.switchKeys == null && block.switchDefaultTarget >= 0) {
+                // END_CHANGE: BUG-2026-0085-3
                     BasicBlock defaultBlock = cfg.getBlockAtPc(block.switchDefaultTarget);
                     if (defaultBlock != null && !visited.contains(defaultBlock.startPc)) {
                         List<Statement> defaultStmts = new ArrayList<Statement>();
@@ -398,8 +496,17 @@ public class StructuredFlowBuilder {
 
                 // Get selector expression - it's the last expression loaded before the switch
                 Expression selector = null;
+                // START_CHANGE: BUG-2026-0085-20260610-14 - Prefer the block's saved selector:
+                // it is the exact expression popped by the tableswitch/lookupswitch opcode. The
+                // last-statement heuristic mistook an unrelated trailing assignment (e.g.
+                // `var2 = "1"; switch (arg1) {...}`) for the selector setup, switching on the
+                // wrong variable.
+                if (block.selectorExpression != null) {
+                    selector = block.selectorExpression;
+                }
+                // END_CHANGE: BUG-2026-0085-14
                 // Try to extract from block's statements - the last assignment or load is the selector
-                if (!block.statements.isEmpty()) {
+                if (selector == null && !block.statements.isEmpty()) {
                     Statement lastStmt = block.statements.get(block.statements.size() - 1);
                     if (lastStmt instanceof ExpressionStatement) {
                         Expression expr = ((ExpressionStatement) lastStmt).getExpression();
@@ -412,10 +519,6 @@ public class StructuredFlowBuilder {
                         block.statements.remove(block.statements.size() - 1);
                     }
                 }
-                // Try to get selector from block's saved selector expression
-                if (selector == null && block.selectorExpression != null) {
-                    selector = block.selectorExpression;
-                }
                 if (selector == null) {
                     selector = new LocalVariableExpression(block.lineNumber, PrimitiveType.INT, "var", 0);
                 }
@@ -424,7 +527,13 @@ public class StructuredFlowBuilder {
                 // Continue processing from the merge point (if any) instead of returning.
                 // This is critical for patterns like string switch where two consecutive
                 // switches (hashCode switch + index switch) must be emitted sequentially.
-                if (switchMergePc >= 0) {
+                // START_CHANGE: BUG-2026-0085-20260610-13 - but never past the current build
+                // bound: a nested switch whose break gotos exit the enclosing arm used to pull
+                // the enclosing merge's code (e.g. the method's return) into its own arm. A
+                // backward bound (loop header before the switch) does not constrain the merge.
+                if (switchMergePc >= 0
+                        && (stopPc < 0 || stopPc <= block.startPc || switchMergePc <= stopPc)) {
+                // END_CHANGE: BUG-2026-0085-13
                     BasicBlock mergeBlock = cfg.getBlockAtPc(switchMergePc);
                     if (mergeBlock != null && !visited.contains(mergeBlock.startPc)) {
                         block = mergeBlock;
@@ -447,12 +556,32 @@ public class StructuredFlowBuilder {
                     // The loop was already handled in matchConditionalPattern
                     return;
                 }
+                // START_CHANGE: BUG-2026-0085-20260610-4 - A forward goto to the innermost
+                // enclosing statement-switch's merge PC is a switch `break`. Previously the case
+                // body walked into the merge block and stopped silently (no statement emitted),
+                // so the printed cases fell through where the bytecode did not.
+                if (target != null && !switchMergeStack.isEmpty()
+                        && target.startPc == switchMergeStack.get(switchMergeStack.size() - 1).intValue()) {
+                    output.add(new BreakStatement(block.lineNumber));
+                    return;
+                }
+                // END_CHANGE: BUG-2026-0085-4
                 // BUG-2026-0078: a forward goto to an enclosing while(true)'s exit PC is a plain `break`.
                 // (Checked before the labeled-break logic so the innermost loop stays unlabeled.)
                 if (target != null && whileTrueExitStack.contains(Integer.valueOf(target.startPc))) {
                     output.add(new BreakStatement(block.lineNumber));
                     return;
                 }
+                // START_CHANGE: BUG-2026-0086-20260610-4 - A forward goto to the innermost
+                // enclosing loop's continue target is a `continue` (e.g. `case 1: continue;`
+                // inside a for loop jumps to the increment block). target == stopPc is excluded:
+                // that is the natural end of the current region, not a statement.
+                if (target != null && !loopContinueTargets.isEmpty() && target.startPc != stopPc
+                        && target.startPc == loopContinueTargets.get(loopContinueTargets.size() - 1).intValue()) {
+                    output.add(new ContinueStatement(block.lineNumber));
+                    return;
+                }
+                // END_CHANGE: BUG-2026-0086-4
                 // START_CHANGE: ISS-2026-0007-20260324-5 - Detect labeled break (goto targets beyond current stopPc)
                 if (target != null && stopPc >= 0 && target.startPc > stopPc) {
                     // Check if this target matches an outer loop merge point
@@ -478,6 +607,38 @@ public class StructuredFlowBuilder {
                 block = target;
             } else if (block.type == BasicBlock.FALL_THROUGH || block.type == BasicBlock.NORMAL) {
                 block = block.trueSuccessor;
+            } else if (block.isConditional()) {
+                // START_CHANGE: BUG-2026-0086-20260610-2 - Harden: an unmatched conditional must
+                // never silently drop both successors (whole loop/catch bodies vanished while the
+                // result still compiled). Emit a structural if/else with both forward successors
+                // recursively built, bounded by the current stopPc. The display condition is true
+                // on the fall-through (falseSuccessor) path.
+                BasicBlock thenTarget = block.falseSuccessor;
+                BasicBlock elseTarget = block.trueSuccessor;
+                int hLine = block.lineNumber > 0 ? block.lineNumber : 0;
+                Expression hCond = block.condition != null
+                    ? block.condition : new BooleanExpression(hLine, true);
+                List<Statement> hThen = new ArrayList<Statement>();
+                if (thenTarget != null && thenTarget.startPc > block.startPc
+                        && thenTarget.startPc != stopPc && !visited.contains(thenTarget.startPc)) {
+                    buildFromBlock(thenTarget, hThen, visited, stopPc);
+                }
+                List<Statement> hElse = new ArrayList<Statement>();
+                if (elseTarget != null && elseTarget.startPc > block.startPc
+                        && elseTarget.startPc != stopPc && !visited.contains(elseTarget.startPc)) {
+                    buildFromBlock(elseTarget, hElse, visited, stopPc);
+                }
+                if (!hThen.isEmpty() && !hElse.isEmpty()) {
+                    output.add(new IfElseStatement(hLine, hCond,
+                        new BlockStatement(hLine, hThen), new BlockStatement(hLine, hElse)));
+                } else if (!hThen.isEmpty()) {
+                    output.add(new IfStatement(hLine, hCond, new BlockStatement(hLine, hThen)));
+                } else if (!hElse.isEmpty()) {
+                    output.add(new IfStatement(hLine, negateCondition(hCond, hLine),
+                        new BlockStatement(hLine, hElse)));
+                }
+                return;
+                // END_CHANGE: BUG-2026-0086-2
             } else {
                 return;
             }
@@ -722,11 +883,26 @@ public class StructuredFlowBuilder {
                 outerLoopMergePoints.add(loopExitPc);
             }
             // END_CHANGE: ISS-2026-0007-2
+            // START_CHANGE: BUG-2026-0086-20260610-5 - Track the loop's continue target: the
+            // start of the LAST block that jumps back to the header (for-loop increment block /
+            // while-loop backjump). A nested goto to it is a `continue` (see change -4).
+            int continueTargetPc = -1;
+            for (BasicBlock b : cfg.getBlocks()) {
+                if (b.isGoto() && b.branchTargetPc == condBlock.startPc
+                        && b.startPc > condBlock.startPc && b.startPc > continueTargetPc) {
+                    continueTargetPc = b.startPc;
+                }
+            }
+            loopContinueTargets.add(Integer.valueOf(continueTargetPc));
+            // END_CHANGE: BUG-2026-0086-5
             // while(condition) { body }
             List<Statement> body = new ArrayList<Statement>();
             buildFromBlock(trueTarget, body, visited, condBlock.startPc);
 
             // START_CHANGE: ISS-2026-0007-20260324-3 - Pop outer loop merge point
+            // START_CHANGE: BUG-2026-0086-20260610-6 - and the continue target.
+            loopContinueTargets.remove(loopContinueTargets.size() - 1);
+            // END_CHANGE: BUG-2026-0086-6
             if (loopExitPc >= 0) {
                 outerLoopMergePoints.remove(outerLoopMergePoints.size() - 1);
             }
@@ -810,7 +986,30 @@ public class StructuredFlowBuilder {
                 }
             }
             if (mergeExceedsOuterExit) {
-                mergePoint = -1; // Force fall-through to Pattern 3
+                // START_CHANGE: BUG-2026-0086-20260610-1 - Continue-outer / break-inner shape: a
+                // branch that is a goto to an enclosing loop's exit PC is a labeled break, not a
+                // merge violation. Redirect the merge to the OTHER branch so the if-then path
+                // builds the goto branch as the then-body (the goto handling emits the labeled
+                // break and registers the label Pattern 1 wraps around the loop). Previously the
+                // merge was voided, Pattern 3 failed too, matchConditionalPattern returned null
+                // and the unmatched conditional dropped BOTH successors — the whole inner loop
+                // body vanished (C_ControlFlow.labeledContinue: empty infinite inner while).
+                boolean redirected086 = false;
+                if (trueTarget.isGoto()
+                        && outerLoopMergePoints.contains(Integer.valueOf(trueTarget.branchTargetPc))
+                        && falseTarget.startPc > condBlock.startPc) {
+                    mergePoint = falseTarget.startPc;
+                    redirected086 = true;
+                } else if (falseTarget.isGoto()
+                        && outerLoopMergePoints.contains(Integer.valueOf(falseTarget.branchTargetPc))
+                        && trueTarget.startPc > condBlock.startPc) {
+                    mergePoint = trueTarget.startPc;
+                    redirected086 = true;
+                }
+                if (!redirected086) {
+                    mergePoint = -1; // Force fall-through to Pattern 3
+                }
+                // END_CHANGE: BUG-2026-0086-1
             }
         }
         // END_CHANGE: BUG-2026-0014-1
@@ -1102,6 +1301,26 @@ public class StructuredFlowBuilder {
             if (block.fallThroughPc == headerPc) return true;
         }
 
+        // START_CHANGE: BUG-2026-0086-20260610-9 - Traverse switch successors: a loop whose body
+        // starts with (or contains) a switch was never recognized as a loop because the walk
+        // stopped dead at the SWITCH block, so Pattern 1 failed and the loop degenerated into a
+        // bodyless while(true) (S5 regression-suite shape: for + switch with break/continue).
+        if (block.type == BasicBlock.SWITCH) {
+            if (block.switchTargets != null) {
+                for (int t : block.switchTargets) {
+                    if (t > block.startPc) {
+                        BasicBlock tb = cfg.getBlockAtPc(t);
+                        if (tb != null && hasDirectBackEdge(headerPc, tb, seen)) return true;
+                    }
+                }
+            }
+            if (block.switchDefaultTarget > block.startPc) {
+                BasicBlock db = cfg.getBlockAtPc(block.switchDefaultTarget);
+                if (db != null && hasDirectBackEdge(headerPc, db, seen)) return true;
+            }
+            return false;
+        }
+        // END_CHANGE: BUG-2026-0086-9
         // Follow FORWARD edges only (don't follow backward edges to other targets)
         if (block.type == BasicBlock.FALL_THROUGH || block.type == BasicBlock.NORMAL) {
             if (block.trueSuccessor != null && block.trueSuccessor.startPc > block.startPc) {
@@ -1410,12 +1629,26 @@ public class StructuredFlowBuilder {
     }
     // END_CHANGE: BUG-2026-0067-1
 
-    private int findSwitchMergePoint(BasicBlock switchBlock) {
+    // START_CHANGE: BUG-2026-0085-20260610-11 - regionStopPc: the build bound active when the
+    // switch is reached; goto blocks at or beyond it belong to an enclosing region, not to this
+    // switch's arms, and must not vote for the merge point.
+    private int findSwitchMergePoint(BasicBlock switchBlock, int regionStopPc) {
+    // END_CHANGE: BUG-2026-0085-11
         // Collect all switch target PCs (case targets only, not default)
         Set<Integer> casePcs = new HashSet<Integer>();
+        // START_CHANGE: BUG-2026-0085-20260610-7 - The merge can never precede an arm's entry:
+        // arm regions are laid out in PC order and the merge follows the last one. Without this
+        // lower bound a loop back-edge goto INSIDE an arm (e.g. a while loop in one case body)
+        // could win the goto count and yield a "merge" in the middle of an arm, corrupting every
+        // bound derived from it (AttributeParser.parseTypeAnnotation lost its whole tail).
+        int maxTargetPc = switchBlock.switchDefaultTarget;
+        // END_CHANGE: BUG-2026-0085-7
         if (switchBlock.switchTargets != null) {
             for (int t : switchBlock.switchTargets) {
                 casePcs.add(t);
+                // START_CHANGE: BUG-2026-0085-20260610-8 - Track the highest arm entry PC.
+                if (t > maxTargetPc) maxTargetPc = t;
+                // END_CHANGE: BUG-2026-0085-8
             }
         }
 
@@ -1424,9 +1657,23 @@ public class StructuredFlowBuilder {
         // goto destination from case bodies is the merge point.
         Map<Integer, Integer> gotoCounts = new HashMap<Integer, Integer>();
         for (BasicBlock b : cfg.getBlocks()) {
+            // START_CHANGE: BUG-2026-0085-20260610-12 - Ignore gotos from outside the region.
+            // Only applicable to a forward bound: inside a loop body the bound is the header PC,
+            // which lies BEFORE the switch.
+            if (regionStopPc >= 0 && regionStopPc > switchBlock.startPc
+                    && b.startPc >= regionStopPc) continue;
+            // END_CHANGE: BUG-2026-0085-12
             if (b.startPc > switchBlock.startPc && b.isGoto() && b.branchTargetPc > switchBlock.startPc) {
                 // Only exclude gotos back to case entry points (not the default target)
-                if (!casePcs.contains(b.branchTargetPc)) {
+                // START_CHANGE: BUG-2026-0085-20260610-9 - and require the candidate to sit at or
+                // after the last arm entry (see change -7 above). The default target stays a
+                // candidate even when it is ALSO a case target: a tableswitch maps its hole keys
+                // to the default entry, and when the source default is empty that entry IS the
+                // merge all the break gotos point at.
+                if ((b.branchTargetPc == switchBlock.switchDefaultTarget
+                        || !casePcs.contains(b.branchTargetPc))
+                        && b.branchTargetPc >= maxTargetPc) {
+                // END_CHANGE: BUG-2026-0085-9
                     Integer count = gotoCounts.get(b.branchTargetPc);
                     gotoCounts.put(b.branchTargetPc, count == null ? 1 : count + 1);
                 }
@@ -1477,6 +1724,47 @@ public class StructuredFlowBuilder {
 
         return bestTarget;
     }
+
+    // START_CHANGE: BUG-2026-0085-20260610-5 - Append the switch `break` the structured-pattern
+    // machinery swallowed: when the case region's physically last block is a goto to the switch
+    // merge PC, every path reaching the region end exits the switch. Only append when the built
+    // body can still complete normally — otherwise the break would be duplicated or unreachable
+    // (an unreachable statement is a javac error).
+    private void appendSwitchBreak(List<Statement> caseStmts, int targetPc, int boundPc,
+                                   int switchMergePc) {
+        if (switchMergePc < 0 || caseStmts.isEmpty()) return;
+        if (completesAbruptly(caseStmts.get(caseStmts.size() - 1))) return;
+        int regionEnd = boundPc >= 0 ? boundPc : switchMergePc;
+        BasicBlock endBlock = null;
+        for (BasicBlock b : cfg.getBlocks()) {
+            if (b.startPc >= targetPc && b.startPc < regionEnd
+                    && (endBlock == null || b.startPc > endBlock.startPc)) {
+                endBlock = b;
+            }
+        }
+        if (endBlock != null && endBlock.isGoto() && endBlock.branchTargetPc == switchMergePc) {
+            int line = endBlock.lineNumber > 0 ? endBlock.lineNumber : 0;
+            caseStmts.add(new BreakStatement(line));
+        }
+    }
+
+    /** Conservative: true only when the statement provably completes abruptly on every path. */
+    private boolean completesAbruptly(Statement s) {
+        if (s instanceof ReturnStatement || s instanceof ThrowStatement
+                || s instanceof BreakStatement || s instanceof ContinueStatement) {
+            return true;
+        }
+        if (s instanceof BlockStatement) {
+            List<Statement> stmts = ((BlockStatement) s).getStatements();
+            return !stmts.isEmpty() && completesAbruptly(stmts.get(stmts.size() - 1));
+        }
+        if (s instanceof IfElseStatement) {
+            IfElseStatement ie = (IfElseStatement) s;
+            return completesAbruptly(ie.getThenBody()) && completesAbruptly(ie.getElseBody());
+        }
+        return false;
+    }
+    // END_CHANGE: BUG-2026-0085-5
 
     /**
      * Check if a block terminates (return or throw) without continuing.
