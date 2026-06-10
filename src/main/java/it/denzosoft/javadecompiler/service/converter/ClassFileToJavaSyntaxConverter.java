@@ -1503,6 +1503,16 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         builder.setMethodReturnsBoolean(
             "Z".equals(TypeNameUtil.parseMethodReturnDescriptor(method.getDescriptor())));
         // END_CHANGE: BUG-2026-0066-16
+        // START_CHANGE: BUG-2026-0067-20260610-56 - Expose the typeSwitch bootstrap labels to the
+        // flow builder so it can synthesize unnamed type-pattern arms (`case Integer _ ->`),
+        // which carry NO cast-bind statement. The callback reads the field LIVE: the labels are
+        // recorded during block decode, which happens inside builder.buildStatements().
+        builder.setPatternLabelSource(new StructuredFlowBuilder.PatternLabelSource() {
+            public List<String> labelsFor(String key) {
+                return patternSwitchLabels == null ? null : patternSwitchLabels.get(key);
+            }
+        });
+        // END_CHANGE: BUG-2026-0067-56
         try {
             List<Statement> result = builder.buildStatements();
             if (result != null && !result.isEmpty()) {

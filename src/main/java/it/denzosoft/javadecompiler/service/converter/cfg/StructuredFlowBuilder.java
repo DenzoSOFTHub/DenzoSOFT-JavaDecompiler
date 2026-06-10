@@ -82,6 +82,20 @@ public class StructuredFlowBuilder {
     public void setMethodReturnsBoolean(boolean b) { this.methodReturnsBoolean = b; }
     // END_CHANGE: BUG-2026-0066-15
 
+    // START_CHANGE: BUG-2026-0067-20260610-53 - Bootstrap label lookup for unnamed pattern arms.
+    // An unnamed type-pattern arm (`case Integer _ ->`) has NO cast-bind statement in its block
+    // (the binding is dead, javac emits nothing), so the pattern type can only come from the
+    // SwitchBootstraps.typeSwitch bootstrap arguments. Those are decoded by the converter
+    // (keyed `methodName + "_" + line`); this callback reads them live AFTER block decode.
+    public interface PatternLabelSource {
+        List<String> labelsFor(String key);
+    }
+
+    private PatternLabelSource patternLabelSource;
+
+    public void setPatternLabelSource(PatternLabelSource s) { this.patternLabelSource = s; }
+    // END_CHANGE: BUG-2026-0067-53
+
     /**
      * Build structured statements from the CFG.
      * Returns a list of statements representing the method body.
@@ -1656,6 +1670,14 @@ public class StructuredFlowBuilder {
                 } else {
                     sc = patternArm(tb, mergePc);
                     if (sc == null) sc = guardedPatternArm(tb, mergePc, switchStartPc, restartVar, armPcs);
+                    // START_CHANGE: BUG-2026-0067-20260610-54 - Unnamed type-pattern arm
+                    // (`case Integer _ ->`): 0 statements, value-only block. The pattern type is
+                    // synthesized from the typeSwitch bootstrap label for the arm's switch key.
+                    if (sc == null) {
+                        sc = unnamedPatternArm(tb, mergePc,
+                            (StaticMethodInvocationExpression) selector, keyGroups.get(g));
+                    }
+                    // END_CHANGE: BUG-2026-0067-54
                     if (sc == null) return null;
                 }
             } else {
@@ -1964,6 +1986,42 @@ public class StructuredFlowBuilder {
         sc.setPatternBinding(pbind);
         return sc;
     }
+
+    // START_CHANGE: BUG-2026-0067-20260610-55 - Unnamed type-pattern arm (`case Integer _ ->`):
+    // the binding is dead, so javac emits NO cast-bind statement — the arm block is value-only
+    // (load constant/expression, goto merge). The pattern type comes from the typeSwitch
+    // bootstrap label at the arm's switch key; the `_` binding is the CORRECT reconstruction
+    // because the class file cannot carry an unnamed binding in the LVT (Java 21+ output).
+    private SwitchExpression.SwitchCase unnamedPatternArm(BasicBlock tb, int mergePc,
+                                                          StaticMethodInvocationExpression typeSwitchCall,
+                                                          List<Integer> keys) {
+        if (tb == null || tb.stackTopExpression == null) return null;
+        if (tb.statements != null && !tb.statements.isEmpty()) return null;
+        boolean gotoMerge = tb.isGoto() && tb.branchTargetPc == mergePc;
+        boolean fallMerge = tb.endPc == mergePc;
+        if (!(gotoMerge || fallMerge)) return null;
+        if (patternLabelSource == null || typeSwitchCall == null) return null;
+        // One key per arm: the case-model carries a single pattern type. (A multi-label unnamed
+        // arm `case Integer _, String _ ->` is left to the safe statement fallback.)
+        if (keys == null || keys.size() != 1) return null;
+        int key = keys.get(0).intValue();
+        if (key < 0) return null; // -1 is `case null`, handled by the caller
+        List<String> labels = patternLabelSource.labelsFor(
+            typeSwitchCall.getMethodName() + "_" + typeSwitchCall.getLineNumber());
+        if (labels == null || key >= labels.size()) return null;
+        String label = labels.get(key);
+        // Only CONSTANT_Class bootstrap labels name a type pattern; constant labels (quoted
+        // strings, enum names, integers) are real `case` constants, not type patterns. Array
+        // classes (`[Ljava/lang/String;`) would need descriptor parsing — leave to fallback.
+        if (label == null || label.length() == 0) return null;
+        char c0 = label.charAt(0);
+        if (c0 == '"' || c0 == '-' || c0 == '[' || (c0 >= '0' && c0 <= '9')) return null;
+        SwitchExpression.SwitchCase sc = new SwitchExpression.SwitchCase(null, tb.stackTopExpression);
+        sc.setPatternType(new ObjectType(label));
+        sc.setPatternBinding("_");
+        return sc;
+    }
+    // END_CHANGE: BUG-2026-0067-55
 
     // A guarded pattern arm: `Type b = (Type) sel;` then a conditional whose two successors are a
     // value (-> merge) and a restart (set the typeSwitch index + goto the loop header). Reconstructs
