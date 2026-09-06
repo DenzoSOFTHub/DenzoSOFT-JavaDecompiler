@@ -2,6 +2,81 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.11.0] - 2026-09-05
+
+Correctness release driven by an evidence-based audit of the decompilation process. The v1.10.0
+headline numbers held only for javac's DEFAULT debug settings and only for the recompile metric;
+measuring production jars (`-g`) and stripped/obfuscated jars (`-g:none`) exposed three defects that
+silently changed program semantics while still producing compilable output.
+
+### Fixed
+- **Exception handlers no longer disappear from classes without a LineNumberTable** (BUG-2026-0100).
+  Try-region membership was decided by comparing SOURCE LINES, so `-g:none` code — the shape of every
+  stripped or obfuscated jar — had the region rejected outright and lost **every** `catch` body while
+  the remaining happy path still compiled. Statements are now tagged with the bytecode pc they were
+  decoded at, and regions are classified on exact bytecode ranges (the JVM's own rule) whenever line
+  information is absent. Construct matrix at `-g:none`: `catch` clauses recovered 0 -> 15 of 15.
+- **`synchronized` nested inside any compound statement is no longer dropped** (BUG-2026-0101).
+  Reconstruction ran only on a method's top-level statement list, so a monitor region inside an
+  `if`/loop/`try`/`switch` kept its internal markers and the lock silently vanished. It now descends
+  into every compound body — after the enclosing list has consumed its own markers, which is what
+  keeps an enclosing region from losing its end. JDK 25 `java.base`: leaked `__MONITORENTER__` markers
+  98 files -> 0, reconstructed `synchronized` blocks 720 -> 932.
+- **No more `int sum; int sum = 0;` on classes with a LocalVariableTable** (BUG-2026-0106). The
+  pre-declaration pass and the undeclared-assignment promotion each emitted a declaration for the same
+  slot, producing output that does not compile. Construct matrix at `-g`: 44/55 -> 53/55 recompile-clean;
+  Together with BUG-2026-0107 this takes `java.base` from 1,120 files / 8,055 sites of
+  re-declared locals down to 15 / 28.
+
+- **The same local is never declared twice in one scope** (BUG-2026-0107). Two consecutive
+  `for (int i = ...)` loops share one bytecode slot, and with each declaration hoisted out of its
+  for-header the output declared `i` (and the accumulator) twice — four declarations for two
+  variables, which does not compile. A new `DuplicateDeclarationDemoter` pass, run last in both flow
+  paths, rewrites a same-type re-declaration as an assignment using Java's own scoping rules.
+  `java.base`: 1,120 files / 8,055 sites -> 15 / 28.
+- **Variables sharing a bytecode slot keep their own identity** (BUG-2026-0103). The
+  LocalVariableTable was flattened to one name and type per slot, so two variables javac placed in the
+  same slot collapsed into one: `String label = "yes"` came out as `Integer count; Integer count;` …
+  `count = "yes"`, with the wrong name, the wrong type and a duplicate declaration. Slots holding more
+  than one variable are now resolved by bytecode position; single-variable slots are untouched.
+  It also repairs types: `String[] da = 0;` used as an int loop counter in `java/lang/Package`
+  becomes `int i = 0;`.
+- **Long/double duplication no longer lost** (BUG-2026-0104). `dup2_x1` and `dup2_x2` were no-ops and
+  `dup2`/`dup_x2` chose their form on stack depth rather than on computational type category, so a
+  duplicated category-2 value vanished: `StampedLock.releaseWrite` decompiled to the uncompilable
+  `long nextState = null;` behind a STACK_UNDERFLOW note. All JVMS 6.5 forms are implemented, and the
+  `dup;putfield;store` shape now aliases the duplicate to a field read so the right-hand side is
+  evaluated once instead of twice. `java.base` files with STACK_UNDERFLOW: 16 -> 7.
+- **Lambda bodies no longer lose statements** (BUG-2026-0102). A lambda whose body contained a loop,
+  `switch`, `try`, `throw`, `synchronized`, label, `assert` or `yield` had that statement replaced by
+  the placeholder `/* inline stmt */;` — the code was gone, and since the placeholder is a valid empty
+  statement the output still compiled. The inline lambda writer now renders the full statement model.
+  JDK 25 `java.base`: 36 files / 66 sites -> **0**.
+- **Class files newer than Java 25 are decompiled instead of refused** (BUG-2026-0118). Any major
+  version above 69 produced no output at all; the format is stable across releases, so newer files are
+  now parsed on a best-effort basis (verified on major 70, 71 and 99) and Java 26/27 are recognized
+  explicitly. Genuinely unreadable content still fails at the precise construct rather than discarding
+  the class.
+
+### Changed
+- Per-method bytecode disassembly is computed only when `--show-bytecode` is requested (OPT-0007).
+  `java.base` batch: 2,856-4,399 ms -> 2,150-2,342 ms, with byte-identical default output.
+
+### Added
+- `docs/reports/report-java25-plus-audit.md` — the full audit: three-mode construct matrix, 3,376
+  `java.base` classes, Java 21-25 probe fixtures, class-file headroom probes (major 70+ is rejected
+  today), performance profile, and a prioritized backlog of 30 items with file:line anchors.
+- Seven regression tests (`testCatchWithoutDebugInfo`, `testNestedSynchronized`,
+  `testNoDuplicateDeclaration`, `testCategory2Dup`, `testLambdaCompoundBody`, `testSharedSlotScopes`,
+  `testNoReDeclaration`) and a debug-mode aware test harness, so tests can pin behaviour under
+  `-g`, default and `-g:none` compilation. Suite is now 44/45.
+
+### Known issues
+- BUG-2026-0121: a `synchronized` inside an `if` followed by further statements can still lose the
+  method's trailing `return` (pre-existing, found while verifying BUG-2026-0101).
+- BUG-2026-0122: the bytecode-pc criterion is applied only when line information is missing; enabling
+  it for line-bearing classes regressed try-with-resources collapse and is tracked separately.
+
 ## [1.10.0] - 2026-06-10
 
 ### Highlights

@@ -43,6 +43,69 @@ public class TryCatchReconstructor {
     }
     // END_CHANGE: BUG-2026-0056-3
 
+    // START_CHANGE: BUG-2026-0100-20260905-5 - Bytecode positions of decoded statements.
+    // Try-region membership is decided on these when available; source lines are only the
+    // fallback for statements a transform synthesised. Without this, a class compiled with
+    // -g:none (no LineNumberTable) lost EVERY catch clause: `tryStartLine < 0` rejected the
+    // group and handler blocks, unreachable from the entry walk, were never emitted.
+    private IdentityHashMap<Statement, Integer> statementPcs;
+
+    public void setStatementPcs(IdentityHashMap<Statement, Integer> statementPcs) {
+        this.statementPcs = statementPcs;
+    }
+
+    /**
+     * Lowest bytecode pc contained in {@code s}, or -1 when unknown. Compound statements built
+     * by the flow builder are not themselves in the map, so their position is the minimum of the
+     * decoded statements they wrap.
+     */
+    private int minPcOf(Statement s) {
+        if (s == null || statementPcs == null) return -1;
+        Integer direct = statementPcs.get(s);
+        if (direct != null) return direct.intValue();
+        int best = -1;
+        if (s instanceof BlockStatement) best = minPcOf(((BlockStatement) s).getStatements());
+        else if (s instanceof IfStatement) best = minPcOf(((IfStatement) s).getThenBody());
+        else if (s instanceof IfElseStatement) {
+            best = minOf(minPcOf(((IfElseStatement) s).getThenBody()),
+                         minPcOf(((IfElseStatement) s).getElseBody()));
+        }
+        else if (s instanceof WhileStatement) best = minPcOf(((WhileStatement) s).getBody());
+        else if (s instanceof DoWhileStatement) best = minPcOf(((DoWhileStatement) s).getBody());
+        else if (s instanceof ForStatement) {
+            best = minOf(minPcOf(((ForStatement) s).getInit()), minPcOf(((ForStatement) s).getBody()));
+        }
+        else if (s instanceof ForEachStatement) best = minPcOf(((ForEachStatement) s).getBody());
+        else if (s instanceof LabelStatement) best = minPcOf(((LabelStatement) s).getBody());
+        else if (s instanceof SynchronizedStatement) best = minPcOf(((SynchronizedStatement) s).getBody());
+        else if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            best = minPcOf(t.getTryBody());
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) best = minOf(best, minPcOf(cc.body));
+            best = minOf(best, minPcOf(t.getFinallyBody()));
+        }
+        else if (s instanceof SwitchStatement) {
+            for (SwitchStatement.SwitchCase c : ((SwitchStatement) s).getCases()) {
+                best = minOf(best, minPcOf(c.getStatements()));
+            }
+        }
+        return best;
+    }
+
+    private int minPcOf(List<Statement> list) {
+        if (list == null) return -1;
+        int best = -1;
+        for (int i = 0; i < list.size(); i++) best = minOf(best, minPcOf(list.get(i)));
+        return best;
+    }
+
+    private static int minOf(int a, int b) {
+        if (a < 0) return b;
+        if (b < 0) return a;
+        return a < b ? a : b;
+    }
+    // END_CHANGE: BUG-2026-0100-5
+
     public TryCatchReconstructor(ControlFlowGraph cfg,
                                   Map<Integer, Integer> pcToLine,
                                   Map<Integer, String> localVarNames,
@@ -178,7 +241,15 @@ public class TryCatchReconstructor {
             int tryStartLine = findLineForPc(tryStartPc, sortedPcs);
             int tryEndLine = findLineBeforePc(tryEndPc, sortedPcs);
 
-            if (tryStartLine < 0) return null;
+            // START_CHANGE: BUG-2026-0100-20260905-6 - Bytecode positions make the region decision
+            // possible without a LineNumberTable. They are used ONLY when the region has no line
+            // information: with lines present the established line-based grouping is what the
+            // downstream reconstructors (notably ModernTwrReconstructor) are tuned against, and
+            // switching it wholesale regressed try-with-resources collapse. The displacement class
+            // of line-based defects is tracked separately as BUG-2026-0122.
+            boolean usePc100 = tryStartLine < 0 && statementPcs != null && !statementPcs.isEmpty();
+            if (tryStartLine < 0 && !usePc100) return null;
+            // END_CHANGE: BUG-2026-0100-6
 
             List<Statement> tryBody = new ArrayList<Statement>();
             List<Statement> beforeTry = new ArrayList<Statement>();
@@ -210,7 +281,28 @@ public class TryCatchReconstructor {
             boolean inTryRegion = false;
             for (Statement s : statements) {
                 int sLine = s.getLineNumber();
-                if (sLine > 0 && sLine >= tryStartLine && sLine <= tryEndLine) {
+                // START_CHANGE: BUG-2026-0100-20260905-7 - Prefer the exact bytecode range.
+                // A statement decoded at pc P belongs to the try region iff P is inside
+                // [startPc, endPc) of the exception entry -- exactly the JVM's own rule.
+                int sPc100 = usePc100 ? minPcOf(s) : -1;
+                if (sPc100 >= 0) {
+                    if (sPc100 >= tryStartPc && sPc100 < tryEndPc) {
+                        inTryRegion = true;
+                        tryBody.add(s);
+                    } else if (!inTryRegion) {
+                        beforeTry.add(s);
+                    } else if (firstHandlerPc != Integer.MAX_VALUE && sPc100 >= firstHandlerPc
+                               && afterTryStartLine > 0 && sLine > 0 && sLine < afterTryStartLine) {
+                        // Decoded from inside a handler body and not yet past the merge point:
+                        // the handler is emitted separately as a catch clause.
+                        continue;
+                    } else {
+                        afterTry.add(s);
+                    }
+                    continue;
+                }
+                // END_CHANGE: BUG-2026-0100-7
+                if (sLine > 0 && tryStartLine >= 0 && sLine >= tryStartLine && sLine <= tryEndLine) {
                     inTryRegion = true;
                     tryBody.add(s);
                 } else if (!inTryRegion) {

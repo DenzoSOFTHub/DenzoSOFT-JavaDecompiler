@@ -54,12 +54,15 @@ public class ClassFileDeserializer implements Processor {
         int minorVersion = reader.readUnsignedShort();
         int majorVersion = reader.readUnsignedShort();
 
-        if (majorVersion > StringConstants.MAX_SUPPORTED_MAJOR_VERSION) {
-            throw new IllegalArgumentException(
-                "Unsupported class file version: " + majorVersion + "." + minorVersion +
-                " (max supported: " + StringConstants.MAX_SUPPORTED_MAJOR_VERSION + ".0 / Java " +
-                StringConstants.javaVersionFromMajor(StringConstants.MAX_SUPPORTED_MAJOR_VERSION) + ")");
-        }
+        // START_CHANGE: BUG-2026-0118-20260905-2 - Degrade instead of refusing. A class file from a
+        // release newer than this build is parsed on a best-effort basis: the format is stable, so a
+        // class using no new construct decompiles correctly. Anything genuinely new fails later at
+        // the precise place that cannot be read (an unknown constant-pool tag is still an error),
+        // which is far more useful than producing no output at all for the whole class.
+        // The major/minor version is preserved on the ClassFile, so surfacing it in the output
+        // header is a separate concern (IMP-2026-0073). No state is kept here: this deserializer
+        // instance is shared across decompile() calls.
+        // END_CHANGE: BUG-2026-0118-2
 
         // Constant pool
         ConstantPool constantPool = ConstantPool.parse(reader);

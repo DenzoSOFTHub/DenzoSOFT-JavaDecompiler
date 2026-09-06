@@ -3881,6 +3881,171 @@ public class JavaSourceWriter implements Processor {
             printer.printText(" { ");
             writeInlineLambdaBody(printer, ies.getElseBody(), ownerInternalName);
             printer.printText(" }");
+        // START_CHANGE: BUG-2026-0102-20260905-1 - Every remaining statement kind used to fall
+        // through to writeInlineStatement, which prints `/* inline stmt */` for anything that is
+        // not an expression, a declaration or a for-header block. A lambda body containing a
+        // throw, loop, switch, try, synchronized or labeled statement therefore LOST that code
+        // while still compiling: 36 files / 66 sites in JDK 25 java.base, e.g.
+        // `assert () -> { /* inline stmt */; }.getAsBoolean()` in java/lang/reflect/Proxy.
+        // These are rendered inline, on one line, to match how lambda bodies are emitted.
+        } else if (stmt instanceof ThrowStatement) {
+            printer.printKeyword("throw");
+            printer.printText(" ");
+            writeExpression(printer, ((ThrowStatement) stmt).getExpression(), ownerInternalName);
+            printer.printText(";");
+        } else if (stmt instanceof BreakStatement) {
+            BreakStatement bs = (BreakStatement) stmt;
+            printer.printKeyword("break");
+            if (bs.hasLabel()) { printer.printText(" "); printer.printText(bs.getLabel()); }
+            printer.printText(";");
+        } else if (stmt instanceof ContinueStatement) {
+            ContinueStatement cs = (ContinueStatement) stmt;
+            printer.printKeyword("continue");
+            if (cs.hasLabel()) { printer.printText(" "); printer.printText(cs.getLabel()); }
+            printer.printText(";");
+        } else if (stmt instanceof WhileStatement) {
+            WhileStatement ws = (WhileStatement) stmt;
+            printer.printKeyword("while");
+            printer.printText(" (");
+            writeExpression(printer, ws.getCondition(), ownerInternalName);
+            printer.printText(") { ");
+            writeInlineLambdaBody(printer, ws.getBody(), ownerInternalName);
+            printer.printText("}");
+        } else if (stmt instanceof DoWhileStatement) {
+            DoWhileStatement ds = (DoWhileStatement) stmt;
+            printer.printKeyword("do");
+            printer.printText(" { ");
+            writeInlineLambdaBody(printer, ds.getBody(), ownerInternalName);
+            printer.printText("} ");
+            printer.printKeyword("while");
+            printer.printText(" (");
+            writeExpression(printer, ds.getCondition(), ownerInternalName);
+            printer.printText(");");
+        } else if (stmt instanceof ForStatement) {
+            ForStatement fs = (ForStatement) stmt;
+            printer.printKeyword("for");
+            printer.printText(" (");
+            if (fs.getInit() != null) writeInlineStatement(printer, fs.getInit(), ownerInternalName);
+            printer.printText("; ");
+            if (fs.getCondition() != null) writeExpression(printer, fs.getCondition(), ownerInternalName);
+            printer.printText("; ");
+            if (fs.getUpdate() != null) writeInlineStatement(printer, fs.getUpdate(), ownerInternalName);
+            printer.printText(") { ");
+            writeInlineLambdaBody(printer, fs.getBody(), ownerInternalName);
+            printer.printText("}");
+        } else if (stmt instanceof ForEachStatement) {
+            ForEachStatement fes = (ForEachStatement) stmt;
+            printer.printKeyword("for");
+            printer.printText(" (");
+            writeType(printer, fes.getVariableType(), ownerInternalName);
+            printer.printText(" ");
+            printer.printText(sn(fes.getVariableName(), "var"));
+            printer.printText(" : ");
+            writeExpression(printer, fes.getIterable(), ownerInternalName);
+            printer.printText(") { ");
+            writeInlineLambdaBody(printer, fes.getBody(), ownerInternalName);
+            printer.printText("}");
+        } else if (stmt instanceof SynchronizedStatement) {
+            SynchronizedStatement ss = (SynchronizedStatement) stmt;
+            printer.printKeyword("synchronized");
+            printer.printText(" (");
+            writeExpression(printer, ss.getMonitor(), ownerInternalName);
+            printer.printText(") { ");
+            writeInlineLambdaBody(printer, ss.getBody(), ownerInternalName);
+            printer.printText("}");
+        } else if (stmt instanceof LabelStatement) {
+            LabelStatement ls = (LabelStatement) stmt;
+            printer.printText(ls.getLabel());
+            printer.printText(": ");
+            writeInlineLambdaStatement(printer, ls.getBody(), ownerInternalName);
+        } else if (stmt instanceof SwitchStatement) {
+            SwitchStatement sw = (SwitchStatement) stmt;
+            printer.printKeyword("switch");
+            printer.printText(" (");
+            writeExpression(printer, sw.getSelector(), ownerInternalName);
+            printer.printText(") { ");
+            for (int ci = 0; ci < sw.getCases().size(); ci++) {
+                SwitchStatement.SwitchCase c = sw.getCases().get(ci);
+                if (c.getLabels() == null || c.getLabels().isEmpty()) {
+                    printer.printKeyword("default");
+                    printer.printText(": ");
+                } else {
+                    for (int li = 0; li < c.getLabels().size(); li++) {
+                        printer.printKeyword("case");
+                        printer.printText(" ");
+                        writeExpression(printer, c.getLabels().get(li), ownerInternalName);
+                        printer.printText(": ");
+                    }
+                }
+                for (int si = 0; si < c.getStatements().size(); si++) {
+                    writeInlineLambdaStatement(printer, c.getStatements().get(si), ownerInternalName);
+                    printer.printText(" ");
+                }
+            }
+            printer.printText("}");
+        } else if (stmt instanceof TryCatchStatement) {
+            TryCatchStatement ts = (TryCatchStatement) stmt;
+            printer.printKeyword("try");
+            printer.printText(" ");
+            if (ts.getResources() != null && !ts.getResources().isEmpty()) {
+                printer.printText("(");
+                for (int ri = 0; ri < ts.getResources().size(); ri++) {
+                    if (ri > 0) printer.printText("; ");
+                    writeInlineStatement(printer, ts.getResources().get(ri), ownerInternalName);
+                }
+                printer.printText(") ");
+            }
+            printer.printText("{ ");
+            writeInlineLambdaBody(printer, ts.getTryBody(), ownerInternalName);
+            printer.printText("}");
+            for (int ci = 0; ci < ts.getCatchClauses().size(); ci++) {
+                TryCatchStatement.CatchClause cc = ts.getCatchClauses().get(ci);
+                printer.printText(" ");
+                printer.printKeyword("catch");
+                printer.printText(" (");
+                if (cc.exceptionTypes != null && !cc.exceptionTypes.isEmpty()) {
+                    for (int ti = 0; ti < cc.exceptionTypes.size(); ti++) {
+                        if (ti > 0) printer.printText(" | ");
+                        writeType(printer, cc.exceptionTypes.get(ti), ownerInternalName);
+                    }
+                } else {
+                    printer.printText("Throwable");
+                }
+                printer.printText(" ");
+                printer.printText(sn(cc.variableName, "e"));
+                printer.printText(") { ");
+                writeInlineLambdaBody(printer, cc.body, ownerInternalName);
+                printer.printText("}");
+            }
+            if (ts.getFinallyBody() != null) {
+                printer.printText(" ");
+                printer.printKeyword("finally");
+                printer.printText(" { ");
+                writeInlineLambdaBody(printer, ts.getFinallyBody(), ownerInternalName);
+                printer.printText("}");
+            }
+        } else if (stmt instanceof BlockStatement) {
+            printer.printText("{ ");
+            writeInlineLambdaBody(printer, stmt, ownerInternalName);
+            printer.printText("}");
+        } else if (stmt instanceof AssertStatement) {
+            AssertStatement as = (AssertStatement) stmt;
+            printer.printKeyword("assert");
+            printer.printText(" ");
+            writeExpression(printer, as.getCondition(), ownerInternalName);
+            if (as.hasMessage()) {
+                printer.printText(" : ");
+                writeExpression(printer, as.getMessage(), ownerInternalName);
+            }
+            printer.printText(";");
+        } else if (stmt instanceof YieldStatement) {
+            printer.printKeyword("yield");
+            printer.printText(" ");
+            writeExpression(printer, ((YieldStatement) stmt).getExpression(), ownerInternalName);
+            printer.printText(";");
+        } else if (stmt instanceof CommentStatement) {
+            printer.printText(((CommentStatement) stmt).getComment());
+        // END_CHANGE: BUG-2026-0102-1
         } else {
             writeInlineStatement(printer, stmt, ownerInternalName);
             printer.printText(";");
