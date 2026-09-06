@@ -15,7 +15,7 @@ fixtures, so it needs JDK 25.
 
 ```bash
 JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64 mvn clean compile   # Compile (plain `mvn` fails on JDK 25)
-JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64 mvn clean package   # Build target/java-decompiler-1.10.0.jar
+JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64 mvn clean package   # Build target/java-decompiler-1.12.0.jar
 ```
 
 `mvn test` runs **no tests** — there is no JUnit dependency and no surefire configuration. The real
@@ -52,24 +52,74 @@ exactly one of them:
 - `-g` (full LocalVariableTable; what Maven/Gradle emit, so every production jar) — current 53/55
 - `-g:none` (no LineNumberTable; stripped and obfuscated jars) — current 54/55
 
-**Recompiling is not enough of an oracle.** Output can compile cleanly and still have lost a `catch`
-clause, a lock, or a statement — the defect class this project ranks as the most severe. Pair the
-round trip with a keyword census against the source (`catch (`, `finally`, `synchronized (`, `try (`)
-and, for scale, count diagnostic markers over a large corpus. See
-`docs/reports/report-java25-plus-audit.md` for the method and the current numbers.
+## Verifying a decompiler fix (read this before claiming one works)
+
+**"It builds and nothing threw" proves nothing here.** The failure mode of a decompiler is output that
+compiles perfectly and means something else: a deleted `catch`, a lock that no longer wraps anything,
+a `for` counter typed `String[]`. Every one of those shipped in a release whose gates were green. Work
+through the ladder below and stop at the first rung that shows a problem.
+
+**1. Read the code you produced.** Decompile the fixture and actually read the method. Compare it to
+the source it came from, statement by statement. This is the step that catches the silent class, and
+it is the step easiest to skip.
+
+**2. Ask the bytecode, not your intuition.** When output and expectation disagree, `javap -p -c -v`
+settles it. A monitor region's real extent, whether an `iinc` sits inside or outside a lock, which
+exception range covers which instruction — all of it is in the class file. Do not reason about what
+javac "probably" emitted: several fixes this project has shipped were built on a shape that was read
+from real bytecode and turned out to differ from the obvious guess.
+
+**3. Build a baseline before you judge a diff.** `git stash` the change, build to a separate directory
+(`cp -r target/classes <scratch>/base-classes`), restore, rebuild. Then run both builds over the same
+input. Without it you cannot tell your regression from a defect that was already there — and both
+happen. Twice in this project a "regression" turned out to be the fix exposing an older bug, and once
+the reverse.
+
+**4. Recompile the output.** The construct matrix in all three debug modes (above). Necessary, never
+sufficient.
+
+**5. Census what recompilation cannot see.** Count the constructs that must survive and compare
+against the source: `catch (`, `finally`, `synchronized (`, `try (`. At `-g:none` this project once
+scored 53/55 on recompilation while emitting **zero** of the source's 15 `catch` clauses. A census
+would have caught it years earlier; the recompile gate never could.
+
+**6. Measure at scale, on a corpus you cannot recompile.** Batch-decompile JDK 25 `java.base`
+(~3,376 top-level classes) and count diagnostic markers and defect shapes: `__MONITORENTER__`,
+`/* inline stmt */`, `STACK_UNDERFLOW`, `SwitchBootstraps.typeSwitch`, locals re-declared in scope.
+Compare against the baseline build from step 3. Small fixtures cannot tell you whether a change helps
+or hurts across 3,376 classes; this is where net-negative changes reveal themselves.
+
+**7. Distrust your measuring instrument.** Three times in one session a hand-rolled scanner reported
+numbers that were simply wrong — it counted `return x;` as a declaration, treated fields as locals,
+and let `} else {` leak the then-branch's scope. Before quoting a number, print the individual sites
+it is built from and read a few. If a metric moves in a way you cannot explain by the change you made,
+the metric is the first suspect, not the last.
+
+**8. Prove the test is a real guard.** A regression test that passes on the pre-fix build tests
+nothing. Run every new test against the step-3 baseline and confirm it FAILS there, with the failure
+message describing the defect you set out to fix.
+
+**When a fix cannot be completed, say so in the item and leave the diagnostic in place.** Never make
+degraded output *look* correct: a rewrite that produces plausible syntax while the body is still
+missing its values, and that silences the diagnostic reporting it, is strictly worse than the raw
+output it replaced. Transforms should decline shapes they do not fully understand.
+
+Worked examples, with the numbers and the reasoning:
+`docs/reports/report-java25-plus-audit.md` and the item files under `docs/releases/v1.11.0/` and
+`docs/releases/v1.12.0/`.
 
 **Running the decompiler:**
 ```bash
-java -jar target/java-decompiler-1.10.0.jar                                   # GUI (default)
-java -jar target/java-decompiler-1.10.0.jar <file.class>                      # CLI, line-aligned
-java -jar target/java-decompiler-1.10.0.jar --compact <file.class>            # Compact output
-java -jar target/java-decompiler-1.10.0.jar --show-bytecode <file.class>      # Inline bytecode instructions
-java -jar target/java-decompiler-1.10.0.jar --show-native-info <file.class>   # JNI info on native methods
-java -jar target/java-decompiler-1.10.0.jar --deobfuscate <file.class>        # Sanitize obfuscated names
-java -jar target/java-decompiler-1.10.0.jar <file.jar> <ClassName>            # From JAR
-java -jar target/java-decompiler-1.10.0.jar --batch <file.jar|dir> <out-dir>  # Batch (also .war/.ear/.apk)
-java -jar target/java-decompiler-1.10.0.jar --gui [file.jar ...]              # GUI explicit
-java -jar target/java-decompiler-1.10.0.jar --trace <dir> <file>              # Tracing
+java -jar target/java-decompiler-1.12.0.jar                                   # GUI (default)
+java -jar target/java-decompiler-1.12.0.jar <file.class>                      # CLI, line-aligned
+java -jar target/java-decompiler-1.12.0.jar --compact <file.class>            # Compact output
+java -jar target/java-decompiler-1.12.0.jar --show-bytecode <file.class>      # Inline bytecode instructions
+java -jar target/java-decompiler-1.12.0.jar --show-native-info <file.class>   # JNI info on native methods
+java -jar target/java-decompiler-1.12.0.jar --deobfuscate <file.class>        # Sanitize obfuscated names
+java -jar target/java-decompiler-1.12.0.jar <file.jar> <ClassName>            # From JAR
+java -jar target/java-decompiler-1.12.0.jar --batch <file.jar|dir> <out-dir>  # Batch (also .war/.ear/.apk)
+java -jar target/java-decompiler-1.12.0.jar --gui [file.jar ...]              # GUI explicit
+java -jar target/java-decompiler-1.12.0.jar --trace <dir> <file>              # Tracing
 ```
 
 **Version is tracked in two places** (keep in sync): `pom.xml` `<version>` and `DenzoDecompiler.getVersion()`.
@@ -226,8 +276,8 @@ When beginning work on a new version:
 
 This way, when items are resolved during development, we already know where to move their files at release time.
 
-v1.10.0 is already released (`docs/releases/v1.10.0/` exists), so new work starts by bumping to the
-next version.
+The highest released version is the newest tagged `docs/releases/v{X.Y.Z}/`; new work starts by
+bumping past it. As of this writing v1.11.0 is released and v1.12.0 is prepared but not yet tagged.
 
 ### Resolving Items (during development)
 
