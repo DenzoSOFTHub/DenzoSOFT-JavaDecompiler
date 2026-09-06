@@ -2108,6 +2108,28 @@ public class StructuredFlowBuilder {
         if (label == null || label.length() == 0) return null;
         char c0 = label.charAt(0);
         if (c0 == '"' || c0 == '-' || c0 == '[' || (c0 >= '0' && c0 <= '9')) return null;
+        // START_CHANGE: BUG-2026-0108-20260906-3 - Labels resolved from a CONSTANT_Dynamic entry are
+        // CONSTANTS, not type patterns: a qualified enum constant carries a '.' after its internal
+        // class name, and boolean labels are literally true/false. Emitting them as a pattern type
+        // produced the uncompilable `case DayOfWeek.MONDAY _ ->` (a binding after a constant).
+        if ("true".equals(label) || "false".equals(label)) {
+            List<Expression> boolLabels = new ArrayList<Expression>();
+            boolLabels.add("true".equals(label) ? BooleanExpression.TRUE : BooleanExpression.FALSE);
+            return new SwitchExpression.SwitchCase(boolLabels, tb.stackTopExpression);
+        }
+        int dotAt = label.lastIndexOf('.');
+        if (dotAt > 0) {
+            String owner = label.substring(0, dotAt);
+            String constant = label.substring(dotAt + 1);
+            if (constant.length() > 0) {
+                List<Expression> constLabels = new ArrayList<Expression>();
+                constLabels.add(new FieldAccessExpression(
+                    typeSwitchCall.getLineNumber(), new ObjectType(owner), null,
+                    owner, constant, "L" + owner + ";"));
+                return new SwitchExpression.SwitchCase(constLabels, tb.stackTopExpression);
+            }
+        }
+        // END_CHANGE: BUG-2026-0108-3
         SwitchExpression.SwitchCase sc = new SwitchExpression.SwitchCase(null, tb.stackTopExpression);
         sc.setPatternType(new ObjectType(label));
         sc.setPatternBinding("_");
