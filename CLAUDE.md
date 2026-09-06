@@ -277,7 +277,7 @@ When beginning work on a new version:
 This way, when items are resolved during development, we already know where to move their files at release time.
 
 The highest released version is the newest tagged `docs/releases/v{X.Y.Z}/`; new work starts by
-bumping past it. As of this writing v1.11.0 is released and v1.12.0 is prepared but not yet tagged.
+bumping past it. As of this writing v1.12.0 is the latest released version.
 
 ### Resolving Items (during development)
 
