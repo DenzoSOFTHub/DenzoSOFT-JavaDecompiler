@@ -1,6 +1,6 @@
 # Release Notes - v1.11.0
 
-**Status**: READY (not yet tagged)
+**Status**: RELEASED
 
 Correctness release. An evidence-based audit of the decompilation process (construct matrix in three
 debug modes, 3,376 top-level classes of JDK 25 `java.base`, purpose-built Java 21-25 probe fixtures)
