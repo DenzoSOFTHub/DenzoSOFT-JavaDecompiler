@@ -1,6 +1,6 @@
 # Release Notes - v1.12.0
 
-**Status**: READY (not yet tagged)
+**Status**: RELEASED
 
 Focus: pattern switch (Java 21+) on real-world bytecode. The v1.11.0 audit measured that 27 of the
 31 JDK 25 `java.base` classes using `SwitchBootstraps.typeSwitch` still emitted the raw bootstrap

@@ -2,7 +2,7 @@
 
 Planning document for optimizations, structural improvements, stability, compatibility and maintainability.
 
-Current state: **v1.12.0 (ready, not yet tagged)** — construct matrix (Java 1.0–25, 55 top-level
+Current state: **v1.12.0** — construct matrix (Java 1.0–25, 55 top-level
 classes) **55/55** at javac-default debug, **53/55** at `-g`, **54/55** at `-g:none`; JDK 25
 `java.base` 3,376 classes with 0 errors; ~900 classes/sec single-thread (2,300/s at 4 threads);
 47 automated tests. Java 26+ class files decompile on a best-effort basis rather than being refused.
@@ -32,7 +32,7 @@ census, and found three silent-semantics defects — all fixed in v1.11.0 — pl
   control flow, branch declaration hoisting. Verified dominance over official JD-Core 1.3.0
   (57/57 vs 44/57; corpus 7 vs 39+4-no-output errors).
 
-## 1b. v1.12.0 (ready, not yet tagged)
+## 1b. v1.12.0
 
 Pattern switch (Java 21+). Statement-form pattern switches kept the raw `SwitchBootstraps.typeSwitch`
 dispatch instead of a real `switch` (BUG-2026-0109, `java.base` 28 raw bodies -> 7, all 7 remaining
