@@ -137,7 +137,7 @@ public class DenzoDecompiler implements Decompiler {
      * Get the version string of this decompiler.
      */
     public static String getVersion() {
-        return "1.10.0";
+        return "1.11.0";
     }
 
     /**

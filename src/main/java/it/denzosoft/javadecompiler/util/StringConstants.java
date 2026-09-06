@@ -80,8 +80,18 @@ public final class StringConstants {
     public static final int MAJOR_23 = 67;
     public static final int MAJOR_24 = 68;
     public static final int MAJOR_25 = 69;
+    // START_CHANGE: BUG-2026-0118-20260905-1 - Headroom for Java 26/27. The class file format is
+    // stable across these releases: a class that uses no new construct parses identically, so
+    // refusing it outright produced no output where correct output was available.
+    public static final int MAJOR_26 = 70;
+    public static final int MAJOR_27 = 71;
 
-    public static final int MAX_SUPPORTED_MAJOR_VERSION = MAJOR_25;
+    /** Highest major version this build has been verified against. */
+    public static final int MAX_SUPPORTED_MAJOR_VERSION = MAJOR_27;
+
+    /** Highest major version whose language features the pipeline actively reconstructs. */
+    public static final int MAX_KNOWN_FEATURE_MAJOR_VERSION = MAJOR_25;
+    // END_CHANGE: BUG-2026-0118-1
 
     /**
      * Get the Java version name for a given major class file version.

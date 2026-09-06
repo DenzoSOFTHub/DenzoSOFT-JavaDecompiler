@@ -78,6 +78,15 @@ public class DecompilerTest {
         // capture substitution, member-inner synthetic outer parameter stripping.
         testInnerClassCaptures();   // BUG-2026-0097: local/anon/member-inner round-trip
         // END_CHANGE: BUG-2026-0097-1
+        // START_CHANGE: v1.11.0-20260905-1 - Correctness regressions found by the Java 25+ audit.
+        testNestedSynchronized();      // BUG-2026-0101: synchronized nested in if/loop kept
+        testNoDuplicateDeclaration();  // BUG-2026-0106: no `int sum; int sum = 0;` with -g
+        testCatchWithoutDebugInfo();   // BUG-2026-0100: handlers survive -g:none (stripped jars)
+        testCategory2Dup();            // BUG-2026-0104: dup2_x1/dup2_x2 on long/double
+        testLambdaCompoundBody();      // BUG-2026-0102: lambda bodies keep loops/switch/try/throw
+        testSharedSlotScopes();        // BUG-2026-0103: LVT scope ranges give each variable its name/type
+        testNoReDeclaration();         // BUG-2026-0107: same name never declared twice in one scope
+        // END_CHANGE: v1.11.0-1
 
         // Summary
         System.out.println("\n=====================================");
@@ -638,7 +647,174 @@ public class DecompilerTest {
     }
     // END_CHANGE: BUG-2026-0097-2
 
+    // START_CHANGE: v1.11.0-20260905-2 - Regression tests for the audit fixes.
+    /**
+     * BUG-2026-0101: a monitor region nested inside any compound statement used to be dropped,
+     * leaving the raw marker comment and silently removing the lock from otherwise valid code.
+     */
+    private static void testNestedSynchronized() {
+        runTestFull("NestedSync",
+            "public class NestedSync {\n" +
+            "    private final Object lock = new Object();\n" +
+            "    private int counter;\n" +
+            "    int inIf(boolean f) {\n" +
+            "        if (f) {\n" +
+            "            synchronized (lock) { counter++; }\n" +
+            "        }\n" +
+            "        return counter;\n" +
+            "    }\n" +
+            "    int inLoop(int n) {\n" +
+            "        for (int i = 0; i < n; i++) {\n" +
+            "            synchronized (this) { counter += i; }\n" +
+            "        }\n" +
+            "        return counter;\n" +
+            "    }\n" +
+            "}",
+            new String[]{"synchronized (this.lock)", "synchronized (this)"},
+            new String[]{"__MONITORENTER__", "__MONITOREXIT__"});
+    }
+
+    /**
+     * BUG-2026-0106: with a LocalVariableTable the pre-declaration pass and the
+     * undeclared-assignment promotion both emitted a declaration for the same slot, producing
+     * the uncompilable `int sum; int sum = 0;`.
+     */
+    private static void testNoDuplicateDeclaration() {
+        runTestFull("DupDecl",
+            "public class DupDecl {\n" +
+            "    int sumWhile(int n) {\n" +
+            "        int sum = 0;\n" +
+            "        int i = 1;\n" +
+            "        while (i <= n) { sum += i; i++; }\n" +
+            "        return sum;\n" +
+            "    }\n" +
+            "}",
+            "-g",
+            new String[]{"int sum = 0"},
+            new String[]{"int sum;"});
+    }
+
+    /**
+     * BUG-2026-0100: compiled with -g:none there is no LineNumberTable, and try-region membership
+     * was decided by comparing source lines -- so every catch clause was silently deleted while
+     * the remaining happy path still compiled. This is the shape of stripped/obfuscated jars.
+     */
+    private static void testCatchWithoutDebugInfo() {
+        runTestFull("NoDebugCatch",
+            "public class NoDebugCatch {\n" +
+            "    int f(int[] a, int idx) {\n" +
+            "        int result = 0;\n" +
+            "        try {\n" +
+            "            result = a[idx];\n" +
+            "        } catch (ArrayIndexOutOfBoundsException e) {\n" +
+            "            result = -1;\n" +
+            "        } finally {\n" +
+            "            result += 1000;\n" +
+            "        }\n" +
+            "        return result;\n" +
+            "    }\n" +
+            "}",
+            "-g:none",
+            new String[]{"try {", "catch (ArrayIndexOutOfBoundsException", "finally"},
+            new String[]{});
+    }
+    /**
+     * BUG-2026-0104: `dup2_x1` / `dup2_x2` were no-ops and `dup2` always popped two values, so a
+     * duplicated long/double was lost. `long next = state = s + 1L;` decompiled to the uncompilable
+     * `long var3 = null;` behind a STACK_UNDERFLOW note.
+     */
+    private static void testCategory2Dup() {
+        runTestFull("Dup2Cat",
+            "public class Dup2Cat {\n" +
+            "    private long state;\n" +
+            "    long chained(long s) { long next = state = s + 1L; return next; }\n" +
+            "    double arrayChained(double[] a, int i) { double v = a[i] = 3.0; return v; }\n" +
+            "    boolean cmp(long deadline, long now) { long nanos; return (nanos = deadline - now) <= 0L; }\n" +
+            "}",
+            new String[]{"this.state = ", "long ", "double "},
+            new String[]{"= null", "STACK_UNDERFLOW"});
+    }
+    /**
+     * BUG-2026-0102: a lambda body containing anything other than an expression, a declaration, a
+     * return or an if had that statement replaced by `/* inline stmt *\/` — silent code loss that
+     * still compiled. 36 files / 66 sites in JDK 25 java.base.
+     */
+    private static void testLambdaCompoundBody() {
+        runTestFull("LamBody",
+            "import java.util.function.*;\n" +
+            "public class LamBody {\n" +
+            "    private final Object lock = new Object();\n" +
+            "    private int counter;\n" +
+            "    Runnable thr(String p) { return () -> { if (p == null) throw new IllegalArgumentException(); System.out.println(p); }; }\n" +
+            "    Runnable loop(int n) { return () -> { for (int i = 0; i < n; i++) System.out.println(i); }; }\n" +
+            "    Runnable sw(int n) { return () -> { switch (n) { case 1: System.out.println(\"a\"); break; default: System.out.println(\"b\"); } }; }\n" +
+            "    Runnable syn() { return () -> { synchronized (lock) { counter++; } }; }\n" +
+            "    Runnable tryc() { return () -> { try { System.out.println(\"x\"); } catch (RuntimeException e) { e.printStackTrace(); } finally { System.out.println(\"f\"); } }; }\n" +
+            "    Supplier<Integer> whl(int n) { return () -> { int i = 0; while (i < n) { i++; } return i; }; }\n" +
+            "}",
+            // NB: the `while` loop is legitimately reconstructed as an equivalent `for`, so the
+            // loop assertion is on `for (` only.
+            new String[]{"throw new IllegalArgumentException", "for (", "switch (", "synchronized (",
+                         "catch (", "finally"},
+            new String[]{"inline stmt"});
+    }
+    /**
+     * BUG-2026-0103: the LocalVariableTable was flattened to one name/type per SLOT (last entry
+     * wins), so two variables javac assigned to the same slot collapsed into one. The pre-fix build
+     * emits `Integer count; Integer count;` followed by `count = "yes";` — a duplicate declaration
+     * with the wrong name AND the wrong type, none of which compiles.
+     */
+    private static void testSharedSlotScopes() {
+        runTestFull("SlotShare",
+            "import java.util.*;\n" +
+            "public class SlotShare {\n" +
+            "    String pick(boolean f) {\n" +
+            "        if (f) { String label = \"yes\"; return label.toUpperCase(); }\n" +
+            "        else { Integer count = 42; return count.toString(); }\n" +
+            "    }\n" +
+            "    int scopes(List<String> xs) {\n" +
+            "        int total = 0;\n" +
+            "        { String first = xs.get(0); total += first.length(); }\n" +
+            "        { Integer size = xs.size(); total += size; }\n" +
+            "        return total;\n" +
+            "    }\n" +
+            "}",
+            "-g",
+            new String[]{"String label", "Integer count", "String first", "Integer size"},
+            new String[]{"Integer label", "String count", "Integer first"});
+    }
+    /**
+     * BUG-2026-0107: two consecutive `for (int i = ...)` loops share one bytecode slot; with the
+     * declarations hoisted out of the for-headers the same name was declared twice in one block.
+     * The pre-fix build emits `int total; int i; int total = 0; int i = 0;` — four declarations for
+     * two variables, which does not compile.
+     */
+    private static void testNoReDeclaration() {
+        runTestFull("ReDecl",
+            "public class ReDecl {\n" +
+            "    int twoLoops(int[] a, int[] b) {\n" +
+            "        int total = 0;\n" +
+            "        for (int i = 0; i < a.length; i++) { total += a[i]; }\n" +
+            "        for (int i = 0; i < b.length; i++) { total += b[i]; }\n" +
+            "        return total;\n" +
+            "    }\n" +
+            "}",
+            "-g",
+            new String[]{"int total = 0"},
+            new String[]{"int total;"});
+    }
+    // END_CHANGE: v1.11.0-2
+
     private static void runTestFull(String className, String sourceCode,
+                                    String[] mustContain, String[] mustNotContain) {
+        runTestFull(className, sourceCode, null, mustContain, mustNotContain);
+    }
+
+    // START_CHANGE: BUG-2026-0100-20260905-9 - Debug-mode aware variant. The decompiler behaves
+    // very differently depending on what javac emitted: `-g` adds a LocalVariableTable, `-g:none`
+    // removes even the LineNumberTable (the shape of stripped/obfuscated jars). Several defects
+    // only reproduce in one specific mode, so tests must be able to pick it.
+    private static void runTestFull(String className, String sourceCode, String javacDebugFlag,
                                     String[] mustContain, String[] mustNotContain) {
         total++;
         try {
@@ -649,7 +825,9 @@ public class DecompilerTest {
             fw.write(sourceCode);
             fw.close();
 
-            ProcessBuilder pb = new ProcessBuilder(javacPath, "-d", tmpDir.getAbsolutePath(), srcFile.getAbsolutePath());
+            ProcessBuilder pb = javacDebugFlag == null
+                ? new ProcessBuilder(javacPath, "-d", tmpDir.getAbsolutePath(), srcFile.getAbsolutePath())
+                : new ProcessBuilder(javacPath, javacDebugFlag, "-d", tmpDir.getAbsolutePath(), srcFile.getAbsolutePath());
             pb.redirectErrorStream(true);
             Process p = pb.start();
             if (p.waitFor() != 0) {

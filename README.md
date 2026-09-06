@@ -1,4 +1,4 @@
-# DenzoSOFT Java Decompiler v1.10.0
+# DenzoSOFT Java Decompiler v1.11.0
 
 A Java bytecode decompiler supporting **Java 1.0 through Java 25**, with zero external dependencies.
 
@@ -532,7 +532,7 @@ it.denzosoft.javadecompiler
 mvn clean package
 ```
 
-The resulting JAR will be in `target/java-decompiler-1.10.0.jar`.
+The resulting JAR will be in `target/java-decompiler-1.11.0.jar`.
 
 Source compatibility: **Java 1.6** (runs on any JVM 1.6+).
 Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
@@ -572,6 +572,15 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 - **Extreme bytecode patterns**: A handful of JDK-internal classes (Panama FFI `BindingSpecializer`, `FallbackLinker`, `ForkJoinPool`, `DirectMethodHandleDescImpl`) use bytecode patterns the decoder still can't fully reconstruct. When this happens the output contains explicit `// === DECOMPILATION NOTES ===` comment blocks identifying the pc and opcode of each unresolved site.
 
 ### Resolved in Previous Versions
+- **v1.11.0 — correctness on real-world debug shapes**: exception handlers were silently deleted from
+  every class without a LineNumberTable (`catch` 0 → 15 of 15 at `-g:none`); `synchronized` nested in
+  any compound statement was dropped, removing the lock (`java.base` 98 files → 0, locks 720 → 933);
+  lambda bodies containing a loop/`switch`/`try`/`throw` lost that statement (36 files / 66 sites → 0);
+  variables sharing a bytecode slot collapsed into one wrong name and type (`String[] da = 0;` used as
+  an int counter → `int i = 0;`); the same local was declared twice in one scope (1,120 files / 8,055
+  sites → 15 / 28); the `dup2`/`dup_x2` family mis-modelled long/double (STACK_UNDERFLOW 16 files → 7);
+  Java 26+ class files were refused outright and now decompile. Full list:
+  `docs/releases/v1.11.0/release-notes.md`.
 - **v1.10.0 — construct-matrix campaign (57/57 clean)**: all 11 verified silent miscompilations eliminated (`super.m()` → `this.m()` recursion, `return a++` value, deleted ternary branches, switch fall-through cascades, double-evaluated `(b = in.read())`, record canonical-ctor validation loss, annotation metadata loss, text-block trailing whitespace) plus switch expressions (yield blocks, enum/MatchException defaults, nested), pattern-switch folding (guarded `when`, unnamed `case Type _`), nested synchronized, `static synchronized`, structural finally dedup, modern/nested try-with-resources, `wide` opcode, catch bodies with control flow, branch-scoped declaration hoisting. Full list: `docs/releases/v1.10.0/release-notes.md`.
 - **String switch** (Java 7+): Fully reconstructed from hashCode/equals pattern since v1.1.0
 - **Enum constant initialization**: Synthetic members suppressed, constructor arguments extracted since v1.1.0/v1.2.0
@@ -608,15 +617,23 @@ Decompiled output is verified to produce compilable Java source on real-world by
 
 | Test Set | Classes | Compile OK | Rate |
 |---|---|---|---|
-| **Construct matrix** (Java 1.0–25, one class per language construct, strict decompile→recompile, no debug info) | 57 | 57 | **100%** (v1.10.0) |
-| **java.base** (core JDK 25) | 3,372 | 3,368 | **99.88%** |
+| **Construct matrix**, javac default debug (`-g:source,lines`) | 55 | 55 | **100%** (v1.11.0) |
+| **Construct matrix**, full debug `-g` (what Maven/Gradle emit) | 55 | 53 | **96%** (v1.11.0; was 44/55) |
+| **Construct matrix**, stripped `-g:none` (obfuscated jars) | 55 | 54 | **98%** (v1.11.0; was 53/55) |
+| **java.base** (core JDK 25) | 3,376 | 3,376 decompile OK, 0 errors | **100% decompile** |
 | **JDK 25 breadth** (random real classes, marker-clean) | 1,674 | 1,669, 0 crashes | **99.7%** (v1.10.0) |
 | **Spring Boot uber-jar** (contrp.be-springboot 22.2.66) | 1,402 | 1,402 decompile OK, 0 diagnostics | **100%** |
 | **Spring Boot uber-jar** (contrp.be-springboot 22.2.65) | 1,401 | 1,401 decompile OK, 0 diagnostics | **100%** |
 | Obfuscated classes (no debug info, keyword names) | all | all | **100%** |
 
+> **Read the debug mode with every number.** A class file compiled three different ways is three
+> different decompilation problems, and until v1.11.0 the published figures reflected only javac's
+> default settings. The v1.11.0 audit measured all three and fixed the defects the other two exposed —
+> notably that **every** `catch` clause was silently dropped from classes without a LineNumberTable.
+> See `docs/reports/report-java25-plus-audit.md`.
+
 **Comparison with JD-Core 1.3.0** (official engine via jd-cli, same strict recompile test): construct
-matrix 57/57 vs 44/57 (JD-Core produces no output at all for 6 classes: records, sealed, pattern
+matrix 55/55 at default debug vs 44/55 (JD-Core produces no output at all for 6 classes: records, sealed, pattern
 switch, unnamed); 13-class Java 8–21 corpus 7 total errors vs 39 plus 4 classes with no output.
 JD-Core produces a better result on zero classes.
 
@@ -666,7 +683,7 @@ Recorded event types:
 
 ## Test Suite
 
-38 automated tests (37 passing, 1 known pre-existing failure) covering:
+45 automated tests (44 passing, 1 known stale expectation) covering:
 - Basic classes, constructors, field initialization
 - Annotations (`@Deprecated`, custom)
 - Generics (`<T extends Comparable<T>>`, `List<String>`)

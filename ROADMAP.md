@@ -2,9 +2,16 @@
 
 Planning document for optimizations, structural improvements, stability, compatibility and maintainability.
 
-Current state: **v1.10.0** — construct matrix (Java 1.0–25) **57/57** recompile-clean, 0 known silent
-miscompilations, JDK 25 breadth 1,674 classes 99.7% marker-clean with 0 crashes, java.base 99.88%
-compilable, ~4,000 classes/sec, 38 automated tests.
+Current state: **v1.11.0 (in development)** — construct matrix (Java 1.0–25, 55 top-level classes)
+**55/55** at javac-default debug, **53/55** at `-g`, **54/55** at `-g:none`; JDK 25 `java.base`
+3,376 classes with 0 errors; ~900 classes/sec single-thread (2,300/s at 4 threads); 45 automated tests.
+Java 26+ class files decompile on a best-effort basis rather than being refused.
+
+The v1.10.0 claim of "57/57, 0 known silent miscompilations" was measured only at javac's default
+debug settings and only with a recompile oracle. The 2026-09-05 audit
+(`docs/reports/report-java25-plus-audit.md`) measured the other two debug shapes and a structural
+census, and found three silent-semantics defects — all fixed in v1.11.0 — plus a backlog of 30 items.
+**Always quote which debug mode a number refers to.**
 
 ---
 
@@ -25,7 +32,24 @@ compilable, ~4,000 classes/sec, 38 automated tests.
   control flow, branch declaration hoisting. Verified dominance over official JD-Core 1.3.0
   (57/57 vs 44/57; corpus 7 vs 39+4-no-output errors).
 
+## 1b. v1.11.0 (in development)
+
+Fixed: handlers deleted without a LineNumberTable (BUG-2026-0100, `catch` 0 -> 15/15 at `-g:none`);
+`synchronized` nested in a compound statement dropped (BUG-2026-0101, `java.base` leaked markers
+98 -> 0 files, locks 720 -> 932); duplicate declarations with a LocalVariableTable (BUG-2026-0106,
+matrix `-g` 44/55 -> 53/55, `java.base` locals re-declared in scope 1,120 -> 15 files, 8,055 -> 28 sites, with BUG-2026-0107); LocalVariableTable scope ranges ignored
+so slot-sharing variables collapsed (BUG-2026-0103); the category-2 `dup` family
+(BUG-2026-0104, `java.base` STACK_UNDERFLOW 16 -> 7 files); lambda bodies truncated to
+`/* inline stmt */` (BUG-2026-0102, `java.base` 36 files -> 0); Java 26+ class files refused outright
+(BUG-2026-0118); unconditional per-method disassembly (OPT-0007, batch ~25% faster).
+
 ## 2. Known residual imperfections (candidate next items)
+
+Highest value first, from the audit backlog (`docs/tracking/track-bugs.md`):
+
+- **BUG-2026-0109** statement-form pattern switches still fall back to raw `typeSwitch`: 27 of the 31
+  java.base classes that use it.
+- **BUG-2026-0122** try-region membership still uses source lines when they exist.
 
 - **J21SwitchPattern statement-form fallback** (4 corpus errors): statement-form guarded pattern
   switches with stack-carried arm values fall back to raw typeSwitch in rare shapes.

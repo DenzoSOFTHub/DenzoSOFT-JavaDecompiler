@@ -54,6 +54,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         if (classFile == null) {
             throw new IllegalStateException("No classFile in message - deserializer must run first");
         }
+        // START_CHANGE: OPT-0007-20260905-1 - Read the showBytecode flag here so the per-method
+        // disassembly can be skipped when nothing will print it (about 12% of batch CPU time).
+        java.util.Map<String, Object> config0007 = message.getHeader("configuration");
+        this.showBytecodeRequested = config0007 != null
+            && Boolean.TRUE.equals(config0007.get("showBytecode"));
+        // END_CHANGE: OPT-0007-1
 
         JavaSyntaxResult result = convert(classFile);
 
@@ -639,6 +645,9 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         currentDecodePc = -1;
         currentDecodeOpcode = -1;
         // END_CHANGE: IMP-2026-0002-9
+        // START_CHANGE: BUG-2026-0100-20260905-2 - Per-method statement/pc map.
+        statementPcs = new java.util.IdentityHashMap<Statement, Integer>();
+        // END_CHANGE: BUG-2026-0100-2
 
         // Decompile method body
         List<Statement> bodyStatements = new ArrayList<Statement>();
@@ -757,8 +766,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 if (!lvNames.containsKey(pSlot)) lvNames.put(pSlot, "arg" + pi2);
                 pSlot += ("D".equals(pDescs[pi2]) || "J".equals(pDescs[pi2])) ? 2 : 1;
             }
-            md.bytecodeInstructions = BytecodeDisassembler.disassemble(
-                code.getCode(), classFile.getConstantPool(), lnt, lvNames);
+            // START_CHANGE: OPT-0007-20260905-2 - Only the --show-bytecode output consumes this.
+            if (showBytecodeRequested) {
+                md.bytecodeInstructions = BytecodeDisassembler.disassemble(
+                    code.getCode(), classFile.getConstantPool(), lnt, lvNames);
+            }
+            // END_CHANGE: OPT-0007-2
         }
         // END_CHANGE: IMP-LINES-6
         // START_CHANGE: LIM-0004-20260326-9 - Populate method return type annotations
@@ -1252,6 +1265,51 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 }
             }
         }
+        // START_CHANGE: BUG-2026-0103-20260905-2 - Index the LVT by slot, keeping the scope of each
+        // entry, and retain only slots that genuinely hold more than one variable.
+        sharedSlotRanges = null;
+        {
+            Map<Integer, List<LvtRange>> bySlot103 = new HashMap<Integer, List<LvtRange>>();
+            for (Attribute attr103 : codeAttr.getAttributes()) {
+                if (!(attr103 instanceof LocalVariableTableAttribute)) continue;
+                LocalVariableTableAttribute lvt103 = (LocalVariableTableAttribute) attr103;
+                for (LocalVariableTableAttribute.LocalVariable lv103 : lvt103.getLocalVariables()) {
+                    Integer key103 = Integer.valueOf(lv103.index);
+                    List<LvtRange> list103 = bySlot103.get(key103);
+                    if (list103 == null) {
+                        list103 = new ArrayList<LvtRange>();
+                        bySlot103.put(key103, list103);
+                    }
+                    list103.add(new LvtRange(lv103.startPc, lv103.startPc + lv103.length,
+                                             lv103.name, lv103.descriptor));
+                }
+            }
+            // Attach the generic signature of the LVTT entry covering the same slot and start.
+            for (Attribute attr103 : codeAttr.getAttributes()) {
+                if (!(attr103 instanceof LocalVariableTypeTableAttribute)) continue;
+                LocalVariableTypeTableAttribute lvtt103 = (LocalVariableTypeTableAttribute) attr103;
+                for (LocalVariableTypeTableAttribute.LocalVariableType lt103 : lvtt103.getLocalVariableTypes()) {
+                    List<LvtRange> list103 = bySlot103.get(Integer.valueOf(lt103.index));
+                    if (list103 == null) continue;
+                    for (int i103 = 0; i103 < list103.size(); i103++) {
+                        if (list103.get(i103).startPc == lt103.startPc) {
+                            list103.get(i103).signature = lt103.signature;
+                        }
+                    }
+                }
+            }
+            for (Map.Entry<Integer, List<LvtRange>> e103 : bySlot103.entrySet()) {
+                Set<String> distinct103 = new HashSet<String>();
+                for (int i103 = 0; i103 < e103.getValue().size(); i103++) {
+                    distinct103.add(e103.getValue().get(i103).name);
+                }
+                if (distinct103.size() > 1) {
+                    if (sharedSlotRanges == null) sharedSlotRanges = new HashMap<Integer, List<LvtRange>>();
+                    sharedSlotRanges.put(e103.getKey(), e103.getValue());
+                }
+            }
+        }
+        // END_CHANGE: BUG-2026-0103-2
 
         // Store bytecode for block-level decoding
         currentBytecode = bytecode;
@@ -1377,6 +1435,15 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     continue;
                 }
                 // END_CHANGE: ISS-2026-0005-2
+                // START_CHANGE: BUG-2026-0103-20260905-6 - A slot holding several variables cannot
+                // be pre-declared once: the stores now carry each variable's OWN name (resolved by
+                // scope), so a single slot-keyed declaration would name only one of them and leave
+                // the others undeclared. Let promoteUndeclaredAssignments give each distinct name
+                // its declaration at its first assignment instead.
+                if (sharedSlotRanges != null && sharedSlotRanges.containsKey(Integer.valueOf(idx))) {
+                    continue;
+                }
+                // END_CHANGE: BUG-2026-0103-6
                 Set<Integer> assignBlocks = varAssignBlocks.get(idx);
                 if (assignBlocks != null && assignBlocks.size() >= 2) {
                     String desc = (String) localVarDescriptors.get(idx);
@@ -1476,6 +1543,9 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         withDecls.addAll(jdResult);
                         jdResult = withDecls;
                     }
+                    // START_CHANGE: BUG-2026-0107-20260905-3 - Same pass on the JD output.
+                    jdResult = it.denzosoft.javadecompiler.service.converter.transform.DuplicateDeclarationDemoter.reconstruct(jdResult);
+                    // END_CHANGE: BUG-2026-0107-3
                     mergeDeclarationsWithAssignments(jdResult);
                     // BUG-2026-0079: a record-pattern switch method is only routed to JD when the
                     // TypeSwitchRecordFolder actually produced a record-deconstruction switch expression
@@ -1579,6 +1649,10 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 // of walking their blocks linearly, which dropped conditions and else-branches.
                 tryCatchReconstructor.setFlowBuilder(builder);
                 // END_CHANGE: BUG-2026-0056-14
+                // START_CHANGE: BUG-2026-0100-20260905-8 - Hand over the statement/pc map so
+                // try-region membership no longer depends on the LineNumberTable.
+                tryCatchReconstructor.setStatementPcs(statementPcs);
+                // END_CHANGE: BUG-2026-0100-8
                 result = tryCatchReconstructor.reconstruct(result, codeAttr.getExceptionTable());
                 // BUG-2026-0068: collapse the Java 9+ try-with-resources desugar into `try (res) {...}`.
                 result = it.denzosoft.javadecompiler.service.converter.transform.ModernTwrReconstructor.reconstruct(result);
@@ -1598,6 +1672,19 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         pslot077 += ("D".equals(pds077[pi077]) || "J".equals(pds077[pi077])) ? 2 : 1;
                     }
                 }
+                // START_CHANGE: BUG-2026-0106-20260905-1 - Seed the "already declared" set with the
+                // LVT-driven pre-declarations that are prepended only AFTER this pass (see below).
+                // Without them promoteUndeclaredAssignments treats `sum = 0` as undeclared and
+                // promotes it to `int sum = 0;`; prepending `int sum;` then yields the illegal
+                // `int sum; int sum = 0;` (mergeDeclarationsWithAssignments cannot merge two
+                // declarations). Leaving the assignment bare lets that merge produce `int sum = 0;`.
+                for (int pdi106 = 0; pdi106 < preDeclarations.size(); pdi106++) {
+                    Statement pd106 = preDeclarations.get(pdi106);
+                    if (pd106 instanceof VariableDeclarationStatement) {
+                        paramNames077.add(((VariableDeclarationStatement) pd106).getName());
+                    }
+                }
+                // END_CHANGE: BUG-2026-0106-1
                 promoteUndeclaredAssignments(result, paramNames077);
                 // END_CHANGE: BUG-2026-0077-1
                 // START_CHANGE: BUG-2026-0069-20260610-22 - Re-run the for-each signature
@@ -1647,6 +1734,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     result = withDecls;
                 }
                 // Post-process: merge separate declaration + assignment into single declaration
+                // START_CHANGE: BUG-2026-0107-20260905-2 - Drop re-declarations left in scope by
+                // slot reuse (two consecutive `for (int i = ...)` loops whose declarations were
+                // hoisted out of their headers). Runs last, so it sees the final block structure.
+                result = it.denzosoft.javadecompiler.service.converter.transform.DuplicateDeclarationDemoter.reconstruct(result);
+                // END_CHANGE: BUG-2026-0107-2
                 mergeDeclarationsWithAssignments(result);
                 return result;
             }
@@ -1720,6 +1812,75 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     private List<String> currentMethodDiagnostics = new ArrayList<String>();
     private int currentDecodePc = -1;
     private int currentDecodeOpcode = -1;
+    // START_CHANGE: OPT-0007-20260905-3 - Mirrors the writer's showBytecode configuration flag.
+    private boolean showBytecodeRequested;
+    // END_CHANGE: OPT-0007-3
+    // START_CHANGE: BUG-2026-0100-20260905-1 - Bytecode position per decoded statement.
+    // Statements carry only a line number, so try/catch membership used to be decided by
+    // comparing source lines. Without a LineNumberTable that comparison cannot run at all and
+    // every handler was dropped; with one, statements sharing a line with the region boundary
+    // were displaced out of the try. This identity map records the pc each top-level statement
+    // was decoded at, giving the reconstructor an exact, debug-info-independent criterion.
+    private java.util.IdentityHashMap<Statement, Integer> statementPcs =
+        new java.util.IdentityHashMap<Statement, Integer>();
+    // END_CHANGE: BUG-2026-0100-1
+
+    // START_CHANGE: BUG-2026-0103-20260905-1 - Range-aware LocalVariableTable lookup.
+    // The LVT is otherwise flattened to one name/descriptor per SLOT (last entry wins), so two
+    // distinct variables that javac assigned to the same slot collapse into one: a Future and a
+    // Throwable sharing a slot produced `throw f;`, and a `List<String>` iteration variable was
+    // typed from an unrelated `Integer` entry. Only slots carrying MORE THAN ONE distinct name are
+    // resolved by range, so every single-entry slot keeps its previous behaviour exactly.
+    private Map<Integer, List<LvtRange>> sharedSlotRanges;
+
+    /** One LocalVariableTable entry: the scope [startPc, endPc) of one variable in one slot. */
+    private static final class LvtRange {
+        final int startPc;
+        final int endPc;
+        final String name;
+        final String descriptor;
+        String signature;
+        LvtRange(int startPc, int endPc, String name, String descriptor) {
+            this.startPc = startPc;
+            this.endPc = endPc;
+            this.name = name;
+            this.descriptor = descriptor;
+        }
+    }
+
+    /**
+     * The variable occupying {@code slot} at {@code pc}, or null when the slot is not shared or
+     * the position is unknown. A store lands a few bytes BEFORE its variable's start_pc (javac
+     * opens the scope after the storing instruction), so a near-miss just ahead of pc counts.
+     */
+    private LvtRange resolveSlotRange(int slot, int pc) {
+        if (sharedSlotRanges == null || pc < 0) return null;
+        List<LvtRange> ranges = sharedSlotRanges.get(Integer.valueOf(slot));
+        if (ranges == null) return null;
+        for (int i = 0; i < ranges.size(); i++) {
+            LvtRange r = ranges.get(i);
+            if (pc >= r.startPc && pc < r.endPc) return r;
+        }
+        LvtRange best = null;
+        for (int i = 0; i < ranges.size(); i++) {
+            LvtRange r = ranges.get(i);
+            int delta = r.startPc - pc;
+            if (delta > 0 && delta <= 4 && (best == null || r.startPc < best.startPc)) best = r;
+        }
+        return best;
+    }
+    // END_CHANGE: BUG-2026-0103-1
+
+    // START_CHANGE: BUG-2026-0104-20260905-2 - JVMS 2.11.1 computational type category.
+    /** True for long and double, the only values occupying two JVM operand-stack slots. */
+    private static boolean isCategory2(Expression e) {
+        if (e == null) return false;
+        it.denzosoft.javadecompiler.model.javasyntax.type.Type t = e.getType();
+        if (t == null) return false;
+        String d = t.getDescriptor();
+        return "J".equals(d) || "D".equals(d);
+    }
+    // END_CHANGE: BUG-2026-0104-2
 
     private void recordDiagnostic(String note) {
         currentMethodDiagnostics.add(note);
@@ -1851,8 +2012,21 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 currentDecodePc = pc;
                 currentDecodeOpcode = opcode;
                 // END_CHANGE: IMP-2026-0002-3
+                // START_CHANGE: BUG-2026-0100-20260905-3 - Tag every statement this opcode emits
+                // with the pc it came from, so try/catch membership can be decided on bytecode
+                // ranges instead of source lines.
+                int pcTagBefore100 = stmts.size();
+                // END_CHANGE: BUG-2026-0100-3
                 decodeOpcode(opcode, reader, stack, stmts, pool, localVarNames,
                              localVarDescriptors, currentLine, method, currentBytecode, pc);
+                // START_CHANGE: BUG-2026-0100-20260905-4
+                for (int pcTag100 = pcTagBefore100; pcTag100 < stmts.size(); pcTag100++) {
+                    Statement tagged100 = stmts.get(pcTag100);
+                    if (!statementPcs.containsKey(tagged100)) {
+                        statementPcs.put(tagged100, Integer.valueOf(pc));
+                    }
+                }
+                // END_CHANGE: BUG-2026-0100-4
             } catch (Exception e) {
                 // START_CHANGE: IMP-2026-0002-20260420-4 - Record decoder exceptions too
                 recordDiagnostic("DECODE_ERROR pc=" + pc
@@ -2209,10 +2383,21 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                             List<Statement> statements, Map<Integer, String> localVarNames, int line) {
         String name = localVarNames.containsKey(varIdx) ? (String) localVarNames.get(varIdx) : "var" + varIdx;
         // START_CHANGE: BUG-2026-0096-20260610-5 - iinc on a split slot targets the fresh variable
-        if (slotRenames != null && slotRenames.containsKey(Integer.valueOf(varIdx))) {
+        boolean iincRenamed = slotRenames != null && slotRenames.containsKey(Integer.valueOf(varIdx));
+        if (iincRenamed) {
             name = (String) slotRenames.get(Integer.valueOf(varIdx));
         }
         // END_CHANGE: BUG-2026-0096-5
+        // START_CHANGE: BUG-2026-0103-20260905-8 - The increment must target the variable live at
+        // this position too. Resolving only loads and stores left the `iinc` bound to the slot's
+        // flattened name, so a loop counter in a shared slot was incremented under a DIFFERENT name
+        // than the one its loads used: the update was orphaned and the loop no longer folded to a
+        // `for` (java/lang/Package.versionFromArray emitted a stray `da++;`).
+        if (!iincRenamed) {
+            LvtRange lvr103i = resolveSlotRange(varIdx, currentDecodePc);
+            if (lvr103i != null) name = lvr103i.name;
+        }
+        // END_CHANGE: BUG-2026-0103-8
         if ((incr == 1 || incr == -1) && !stack.isEmpty()
                 && stack.peek() instanceof LocalVariableExpression
                 && ((LocalVariableExpression) stack.peek()).getIndex() == varIdx) {
@@ -2531,18 +2716,27 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 }
                 break;
             }
+            // START_CHANGE: BUG-2026-0104-20260905-1 - Full JVMS 6.5 dup family.
+            // The modeled stack holds ONE entry per value, while the JVM counts computational
+            // slots (long/double occupy two). The forms of dup_x2/dup2/dup2_x1/dup2_x2 therefore
+            // have to be selected on the operand's category, not on how deep the stack happens to
+            // be. dup2_x1 and dup2_x2 used to be plain no-ops, which lost the duplicated value and
+            // surfaced later as STACK_UNDERFLOW (or, when the stack was deep enough, as a silently
+            // wrong duplication): `long nextState = null;` in StampedLock.releaseWrite, and the
+            // dastore pair in FdLibm$RemPio2.
             case 0x5B: { // dup_x2
-                if (stack.size() >= 3) {
-                    Expression v1 = stack.pop();
-                    Expression v2 = stack.pop();
+                if (stack.size() < 2) break;
+                Expression v1 = stack.pop();
+                Expression v2 = stack.pop();
+                if (!isCategory2(v2) && !stack.isEmpty()) {
+                    // Form 1: v1, v2, v3 all category 1 -> ..., v1, v3, v2, v1
                     Expression v3 = stack.pop();
                     stack.push(v1);
                     stack.push(v3);
                     stack.push(v2);
                     stack.push(v1);
-                } else if (stack.size() >= 2) {
-                    Expression v1 = stack.pop();
-                    Expression v2 = stack.pop();
+                } else {
+                    // Form 2: v2 is category 2 -> ..., v1, v2, v1
                     stack.push(v1);
                     stack.push(v2);
                     stack.push(v1);
@@ -2550,20 +2744,88 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 break;
             }
             case 0x5C: { // dup2
-                if (stack.size() >= 2) {
+                if (stack.isEmpty()) break;
+                if (isCategory2(stack.peek()) || stack.size() < 2) {
+                    // Form 2: a single category-2 value is duplicated whole
+                    stack.push(stack.peek());
+                } else {
+                    // Form 1: two category-1 values
                     Expression v1 = stack.pop();
                     Expression v2 = stack.pop();
                     stack.push(v2);
                     stack.push(v1);
                     stack.push(v2);
                     stack.push(v1);
-                } else if (!stack.isEmpty()) {
-                    stack.push(stack.peek());
                 }
                 break;
             }
-            case 0x5D: case 0x5E: // dup2_x1, dup2_x2
+            case 0x5D: { // dup2_x1
+                if (stack.isEmpty()) break;
+                Expression v1 = stack.pop();
+                if (isCategory2(v1)) {
+                    // Form 2: v1 category 2, v2 category 1 -> ..., v1, v2, v1
+                    if (stack.isEmpty()) { stack.push(v1); break; }
+                    Expression v2 = stack.pop();
+                    stack.push(v1);
+                    stack.push(v2);
+                    stack.push(v1);
+                } else {
+                    // Form 1: v1, v2, v3 all category 1 -> ..., v2, v1, v3, v2, v1
+                    if (stack.size() < 2) { stack.push(v1); break; }
+                    Expression v2 = stack.pop();
+                    Expression v3 = stack.pop();
+                    stack.push(v2);
+                    stack.push(v1);
+                    stack.push(v3);
+                    stack.push(v2);
+                    stack.push(v1);
+                }
                 break;
+            }
+            case 0x5E: { // dup2_x2
+                if (stack.isEmpty()) break;
+                Expression v1 = stack.pop();
+                if (isCategory2(v1)) {
+                    if (stack.isEmpty()) { stack.push(v1); break; }
+                    Expression v2 = stack.pop();
+                    if (isCategory2(v2) || stack.isEmpty()) {
+                        // Form 4: v1 and v2 both category 2 -> ..., v1, v2, v1
+                        stack.push(v1);
+                        stack.push(v2);
+                        stack.push(v1);
+                    } else {
+                        // Form 2: v1 category 2, v2 and v3 category 1 -> ..., v1, v3, v2, v1
+                        Expression v3 = stack.pop();
+                        stack.push(v1);
+                        stack.push(v3);
+                        stack.push(v2);
+                        stack.push(v1);
+                    }
+                } else {
+                    if (stack.size() < 2) { stack.push(v1); break; }
+                    Expression v2 = stack.pop();
+                    Expression v3 = stack.pop();
+                    if (isCategory2(v3) || stack.isEmpty()) {
+                        // Form 3: v1, v2 category 1, v3 category 2 -> ..., v2, v1, v3, v2, v1
+                        stack.push(v2);
+                        stack.push(v1);
+                        stack.push(v3);
+                        stack.push(v2);
+                        stack.push(v1);
+                    } else {
+                        // Form 1: v1..v4 all category 1 -> ..., v2, v1, v4, v3, v2, v1
+                        Expression v4 = stack.pop();
+                        stack.push(v2);
+                        stack.push(v1);
+                        stack.push(v4);
+                        stack.push(v3);
+                        stack.push(v2);
+                        stack.push(v1);
+                    }
+                }
+                break;
+            }
+            // END_CHANGE: BUG-2026-0104-1
             case 0x5F: { // swap
                 if (stack.size() >= 2) {
                     Expression a = stack.pop();
@@ -2817,6 +3079,17 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 Expression field = new FieldAccessExpression(line, fieldType, obj, className, fieldName, desc);
                 statements.add(new ExpressionStatement(
                     new AssignmentExpression(line, fieldType, field, "=", value)));
+                // START_CHANGE: BUG-2026-0104-20260905-3 - Same aliasing rule as the dup;store pair
+                // (BUG-2026-0087), for the dup;putfield;store shape that the category-2 dup forms
+                // produce (`long nextState = state = unlockWriteState(s);`). The duplicate left on
+                // the stack is the SAME expression object that was just written to the field;
+                // re-materializing it would evaluate the right-hand side a second time. Replace it
+                // with a read of the field just assigned.
+                if (value != null && !stack.isEmpty() && stack.peek() == value) {
+                    stack.pop();
+                    stack.push(new FieldAccessExpression(line, fieldType, obj, className, fieldName, desc));
+                }
+                // END_CHANGE: BUG-2026-0104-3
                 break;
             }
 
@@ -3547,9 +3820,24 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             name = (String) slotRenames.get(Integer.valueOf(index));
         }
         // END_CHANGE: BUG-2026-0096-6
+        // START_CHANGE: BUG-2026-0103-20260905-3 - On a slot shared by several variables, the one
+        // live at this pc decides the name and type, instead of whichever LVT entry happened to be
+        // written last into the flattened map.
+        LvtRange lvr103 = slotRenamed ? null : resolveSlotRange(index, currentDecodePc);
+        if (lvr103 != null) {
+            name = lvr103.name;
+        }
+        // END_CHANGE: BUG-2026-0103-3
         // Prefer generic signature type over erased descriptor
         Type type = defaultType;
-        if (!slotRenamed && currentLocalVarSignatures != null) {
+        // START_CHANGE: BUG-2026-0103-20260905-4 - Prefer the resolved entry's own signature/descriptor.
+        if (lvr103 != null) {
+            Type t103 = null;
+            if (lvr103.signature != null) t103 = parseSignatureType(lvr103.signature);
+            if (t103 == null && lvr103.descriptor != null) t103 = parseType(lvr103.descriptor);
+            if (t103 != null) type = t103;
+        }
+        if (lvr103 == null && !slotRenamed && currentLocalVarSignatures != null) {
             String sig = (String) currentLocalVarSignatures.get(index);
             if (sig != null) {
                 Type sigType = parseSignatureType(sig);
@@ -3558,7 +3846,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 }
             }
         }
-        if (!slotRenamed && type == defaultType) {
+        // END_CHANGE: BUG-2026-0103-4
+        if (lvr103 == null && !slotRenamed && type == defaultType) {
             String desc = descriptors.get(index);
             type = desc != null ? parseType(desc) : defaultType;
         }
@@ -3584,6 +3873,13 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         if (slotRenamed) {
             name = (String) slotRenames.get(Integer.valueOf(index));
         }
+        // START_CHANGE: BUG-2026-0103-20260905-5 - Store into a shared slot names the variable whose
+        // scope this store opens, not the last LVT entry for the slot.
+        LvtRange lvr103s = slotRenamed ? null : resolveSlotRange(index, currentDecodePc);
+        if (lvr103s != null) {
+            name = lvr103s.name;
+        }
+        // END_CHANGE: BUG-2026-0103-5
         int storeCat = storeCategory(defaultType);
         // Never split on the synthetic `$exception` handler seed (BUG-2026-0050): the handler's
         // opening astore is consumed by the try/catch reconstruction, which names the catch
@@ -3612,7 +3908,17 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         // END_CHANGE: BUG-2026-0096-7
         // Prefer generic signature type (e.g., "TT;" -> GenericType "T") over erased descriptor
         Type type = defaultType;
-        if (!slotRenamed && currentLocalVarSignatures != null) {
+        // START_CHANGE: BUG-2026-0103-20260905-7 - On a shared slot the declaration must take the
+        // type of the variable live here, not of whichever LVT entry was flattened into the map
+        // last: that is what produced `Integer label = "yes";` for a String local.
+        if (lvr103s != null) {
+            Type t103 = null;
+            if (lvr103s.signature != null) t103 = parseSignatureType(lvr103s.signature);
+            if (t103 == null && lvr103s.descriptor != null) t103 = parseType(lvr103s.descriptor);
+            if (t103 != null) type = t103;
+        }
+        // END_CHANGE: BUG-2026-0103-7
+        if (lvr103s == null && !slotRenamed && currentLocalVarSignatures != null) {
             String sig = (String) currentLocalVarSignatures.get(index);
             if (sig != null) {
                 Type sigType = parseSignatureType(sig);
@@ -3622,7 +3928,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             }
         }
         boolean typeFromDebugInfo = type != defaultType;
-        if (!slotRenamed && type == defaultType) {
+        if (lvr103s == null && !slotRenamed && type == defaultType) {
             String desc = (String) descriptors.get(index);
             if (desc != null) {
                 type = parseType(desc);
@@ -4774,7 +5080,20 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
      * and unwraps try-finally blocks whose finally body is only a monitorexit marker.
      */
     private List<Statement> reconstructSynchronized(List<Statement> statements) {
-        if (statements == null || statements.size() < 2) return statements;
+        // START_CHANGE: BUG-2026-0101-20260905-1 - This pass used to run only on the top-level
+        // statement list, so a monitor region nested inside an if/loop/try/switch/label kept its
+        // raw `/* __MONITORENTER__ */` marker: the lock silently disappeared from the output while
+        // the body still compiled (98 of 3,376 java.base classes). Nested bodies are now processed
+        // too, but ONLY AFTER this list has consumed its own markers -- descending first would eat
+        // the `__MONITOREXIT__` inside an enclosing region's try-body and leave that region with no
+        // end, yielding an empty `synchronized {}` with the body hoisted out of the lock.
+        if (statements == null) return statements;
+        if (statements.size() < 2) {
+            // A lone if/loop/try can still contain a complete nested region.
+            for (int ri101 = 0; ri101 < statements.size(); ri101++) recurseSynchronized(statements.get(ri101));
+            return statements;
+        }
+        // END_CHANGE: BUG-2026-0101-1
         // First pass: strip monitor markers from inside try-finally and unwrap synthetic try-finally
         List<Statement> cleaned = stripMonitorFromTryFinally(statements);
         // START_CHANGE: BUG-2026-0092-20260610-1 - Balanced __MONITORENTER__/__MONITOREXIT__ pairing:
@@ -4821,8 +5140,63 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             result.add(cleaned.get(i));
             i++;
         }
+        // START_CHANGE: BUG-2026-0101-20260905-3 - Now that this list's own MONITORENTER/EXIT pairs
+        // are consumed, reconstruct the regions nested inside the statements that survived.
+        for (int ri101 = 0; ri101 < result.size(); ri101++) {
+            recurseSynchronized(result.get(ri101));
+        }
+        // END_CHANGE: BUG-2026-0101-3
         return result;
     }
+
+    // START_CHANGE: BUG-2026-0101-20260905-2 - Recursion helpers for nested monitor regions.
+    /**
+     * Reconstruct synchronized regions inside every body reachable from {@code s}.
+     * Mirrors {@code BranchVarHoister.recurse}; bodies are rewritten in place because
+     * {@link #reconstructSynchronized} returns a new list.
+     */
+    private void recurseSynchronized(Statement s) {
+        if (s == null) return;
+        if (s instanceof BlockStatement) rebuildSynchronizedBody(((BlockStatement) s).getStatements());
+        else if (s instanceof IfStatement) recurseSynchronized(((IfStatement) s).getThenBody());
+        else if (s instanceof IfElseStatement) {
+            recurseSynchronized(((IfElseStatement) s).getThenBody());
+            recurseSynchronized(((IfElseStatement) s).getElseBody());
+        }
+        else if (s instanceof WhileStatement) recurseSynchronized(((WhileStatement) s).getBody());
+        else if (s instanceof DoWhileStatement) recurseSynchronized(((DoWhileStatement) s).getBody());
+        else if (s instanceof ForStatement) recurseSynchronized(((ForStatement) s).getBody());
+        else if (s instanceof ForEachStatement) recurseSynchronized(((ForEachStatement) s).getBody());
+        else if (s instanceof LabelStatement) recurseSynchronized(((LabelStatement) s).getBody());
+        else if (s instanceof SynchronizedStatement) recurseSynchronized(((SynchronizedStatement) s).getBody());
+        else if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            recurseSynchronized(t.getTryBody());
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) recurseSynchronized(cc.body);
+            if (t.getFinallyBody() != null) recurseSynchronized(t.getFinallyBody());
+        }
+        else if (s instanceof SwitchStatement) {
+            for (SwitchStatement.SwitchCase c : ((SwitchStatement) s).getCases()) {
+                rebuildSynchronizedBody(c.getStatements());
+            }
+        }
+    }
+
+    /**
+     * Run {@link #reconstructSynchronized} over a body list, replacing its contents in place.
+     * A nested body gets exactly the same treatment as the top-level list (unwrap the synthetic
+     * monitor try-finally, then pair the markers); running it after the enclosing list has been
+     * reconstructed guarantees any marker still present here belongs to this body.
+     */
+    private void rebuildSynchronizedBody(List<Statement> body) {
+        if (body == null || body.isEmpty()) return;
+        List<Statement> rebuilt = reconstructSynchronized(body);
+        if (rebuilt != body) {
+            body.clear();
+            body.addAll(rebuilt);
+        }
+    }
+    // END_CHANGE: BUG-2026-0101-2
 
     /**
      * Extract the lock expression from the trailing statement of {@code list}
