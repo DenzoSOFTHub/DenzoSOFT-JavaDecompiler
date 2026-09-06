@@ -91,6 +91,11 @@ public class DecompilerTest {
         testQualifiedEnumCaseLabel();  // BUG-2026-0108: condy label -> case Enum.CONSTANT
         testStatementPatternSwitch();  // BUG-2026-0109: statement-form pattern switch rebuilt
         // END_CHANGE: v1.12.0-1
+        // START_CHANGE: v1.13.0-20260907-1 - Remaining pattern-switch label shapes.
+        testConstantLabelSwitch();       // BUG-2026-0123: string labels + case null
+        testArrayClassPatternSwitch();   // BUG-2026-0123: `case byte[] _`
+        testThreadSafetyDeterminism();   // BUG-2026-0124: shared instance, many threads, same output
+        // END_CHANGE: v1.13.0-1
 
         // Summary
         System.out.println("\n=====================================");
@@ -857,6 +862,154 @@ public class DecompilerTest {
             new String[]{"SwitchBootstraps", "PATTERN_SWITCH_NOT_RECONSTRUCTED"});
     }
     // END_CHANGE: v1.12.0-2
+
+    // START_CHANGE: v1.13.0-20260907-2 - Constant and array-class case labels.
+    /**
+     * BUG-2026-0123: javac routes an ordinary constant switch through SwitchBootstraps as soon as it
+     * has a `case null`, so STRING labels arrive on the pattern path. They were rejected, leaving the
+     * raw dispatch with every arm value dropped — the method returned an unconditional value.
+     */
+    private static void testConstantLabelSwitch() {
+        runTestFull("KonstSw",
+            "public class KonstSw {\n" +
+            "    static boolean f(String flag) {\n" +
+            "        return switch (flag) {\n" +
+            "            case \"true\" -> true;\n" +
+            "            case \"false\" -> false;\n" +
+            "            case null -> false;\n" +
+            "            default -> throw new RuntimeException(\"bad\");\n" +
+            "        };\n" +
+            "    }\n" +
+            "}",
+            new String[]{"case \"true\"", "case \"false\"", "case null"},
+            new String[]{"SwitchBootstraps", "PATTERN_SWITCH_NOT_RECONSTRUCTED"});
+    }
+
+    /**
+     * BUG-2026-0123: an array-class bootstrap label (`[I`, `[Ljava/lang/String;`) is an ordinary type
+     * pattern once its descriptor is parsed; rejecting it left whole dispatches raw.
+     */
+    private static void testArrayClassPatternSwitch() {
+        runTestFull("ArrSw",
+            "public class ArrSw {\n" +
+            "    static String f(Object o) {\n" +
+            "        return switch (o) {\n" +
+            // Unnamed bindings are the shape that actually failed: with named bindings the arm
+            // matched a different path and already worked.
+            "            case byte[] _ -> \"byte\";\n" +
+            "            case int[] _ -> \"int\";\n" +
+            "            case String[] _ -> \"str\";\n" +
+            "            default -> \"?\";\n" +
+            "        };\n" +
+            "    }\n" +
+            "}",
+            new String[]{"case byte[]", "case int[]", "case String[]"},
+            new String[]{"SwitchBootstraps", "PATTERN_SWITCH_NOT_RECONSTRUCTED"});
+    }
+    /**
+     * BUG-2026-0124: `BooleanSimplifier` kept the "this method returns boolean" flag in a plain
+     * STATIC field, written at the start of each simplify() and reset at the end. Two threads
+     * decompiling different methods raced on it, so a boolean method's `return 0` was sometimes left
+     * as an int -- output that does not compile. Batch decompilation was therefore non-deterministic:
+     * the same build over JDK 25 java.base differed in 211 of 3,376 files run to run.
+     *
+     * This test decompiles the same classes sequentially and then concurrently through ONE SHARED
+     * DenzoDecompiler, and requires the results to be identical. On the pre-fix build it diverges
+     * (11-21 of 400 classes in measured runs, varying per run).
+     */
+    private static void testThreadSafetyDeterminism() {
+        total++;
+        try {
+            java.io.File tmpDir = new java.io.File(System.getProperty("java.io.tmpdir"), "decompiler-test-conc");
+            tmpDir.mkdirs();
+            // Boolean-returning shapes are what the racy flag governed; mix in non-boolean ones so a
+            // stale flag from a neighbouring class is observable.
+            final String[] names = new String[]{"TsA", "TsB", "TsC", "TsD"};
+            String[] sources = new String[]{
+                "public class TsA { boolean f(int x) { return x > 1; } boolean g() { return true; } }",
+                "public class TsB { int f(int x) { return x > 1 ? 1 : 0; } int g() { return 0; } }",
+                "public class TsC { boolean f(Object o) { if (o == null) return false; return o.hashCode() > 0; } }",
+                "public class TsD { int f(boolean b) { return b ? 1 : 0; } boolean g(int i) { return i == 0; } }"
+            };
+            final java.util.Map<String, byte[]> data = new java.util.LinkedHashMap<String, byte[]>();
+            for (int i = 0; i < names.length; i++) {
+                java.io.File src = new java.io.File(tmpDir, names[i] + ".java");
+                java.io.FileWriter fw = new java.io.FileWriter(src);
+                fw.write(sources[i]);
+                fw.close();
+                ProcessBuilder pb = new ProcessBuilder(javacPath, "-d", tmpDir.getAbsolutePath(), src.getAbsolutePath());
+                pb.redirectErrorStream(true);
+                if (pb.start().waitFor() != 0) {
+                    System.out.println("[SKIP] ThreadSafety - compilation failed");
+                    return;
+                }
+                java.io.FileInputStream fis = new java.io.FileInputStream(new java.io.File(tmpDir, names[i] + ".class"));
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = fis.read(buf)) != -1) baos.write(buf, 0, n);
+                fis.close();
+                data.put(names[i], baos.toByteArray());
+                src.delete();
+            }
+
+            // Sequential reference through one instance.
+            DenzoDecompiler seq = new DenzoDecompiler();
+            final java.util.Map<String, String> ref = new java.util.LinkedHashMap<String, String>();
+            for (int r = 0; r < 40; r++) {
+                for (java.util.Iterator<String> it = data.keySet().iterator(); it.hasNext(); ) {
+                    String k = it.next();
+                    if (!ref.containsKey(k)) ref.put(k, decompileOne(seq, k, data.get(k)));
+                }
+            }
+
+            // Concurrent through ONE SHARED instance.
+            final DenzoDecompiler shared = new DenzoDecompiler();
+            final java.util.Map<String, String> mismatches = new java.util.concurrent.ConcurrentHashMap<String, String>();
+            java.util.concurrent.ExecutorService ex = java.util.concurrent.Executors.newFixedThreadPool(8);
+            java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+            for (int r = 0; r < 40; r++) {
+                for (java.util.Iterator<String> it = data.keySet().iterator(); it.hasNext(); ) {
+                    final String k = it.next();
+                    final byte[] bytes = data.get(k);
+                    futures.add(ex.submit(new Runnable() {
+                        public void run() {
+                            try {
+                                String out = decompileOne(shared, k, bytes);
+                                if (!ref.get(k).equals(out)) mismatches.put(k, out);
+                            } catch (Exception e) {
+                                mismatches.put(k, "EXCEPTION " + e);
+                            }
+                        }
+                    }));
+                }
+            }
+            for (int i = 0; i < futures.size(); i++) futures.get(i).get();
+            ex.shutdown();
+
+            if (mismatches.isEmpty()) {
+                System.out.println("[PASS] ThreadSafety");
+                passed++;
+            } else {
+                System.out.println("[FAIL] ThreadSafety - " + mismatches.size()
+                    + " class(es) decompiled differently under concurrency: " + mismatches.keySet());
+                failed++;
+            }
+        } catch (Exception e) {
+            System.out.println("[FAIL] ThreadSafety - " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            failed++;
+        }
+    }
+
+    private static String decompileOne(DenzoDecompiler d, final String name, final byte[] bytes) throws Exception {
+        StringPrinter p = new StringPrinter();
+        d.decompile(new Loader() {
+            public boolean canLoad(String internalName) { return name.equals(internalName); }
+            public byte[] load(String internalName) { return bytes; }
+        }, p, name);
+        return p.getResult();
+    }
+    // END_CHANGE: v1.13.0-2
 
     private static void runTestFull(String className, String sourceCode,
                                     String[] mustContain, String[] mustNotContain) {

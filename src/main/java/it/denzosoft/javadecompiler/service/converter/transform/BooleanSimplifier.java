@@ -25,8 +25,23 @@ public final class BooleanSimplifier {
 
     private BooleanSimplifier() {}
 
-    /** Whether the current method has a boolean return type. */
-    private static boolean methodReturnIsBoolean = false;
+    // START_CHANGE: BUG-2026-0124-20260907-1 - This flag used to be a plain static field, written
+    // at the start of simplify() and reset at the end. Under BatchDecompiler's thread pool two
+    // threads simplify different methods at the same time, so one thread's `false` reset landed
+    // while another was still simplifying a boolean-returning method: its `return 0` was left as an
+    // int and the class no longer compiled. That made batch output non-deterministic -- the same
+    // build over JDK 25 java.base differed in 211 of 3,376 files run to run, and roughly 86 classes
+    // gained a wrong `return 0;` purely from concurrency. The flag is per-method state, so it now
+    // lives per thread.
+    /** Whether the method currently being simplified on THIS thread has a boolean return type. */
+    private static final ThreadLocal<Boolean> METHOD_RETURN_IS_BOOLEAN = new ThreadLocal<Boolean>() {
+        @Override protected Boolean initialValue() { return Boolean.FALSE; }
+    };
+
+    private static boolean methodReturnIsBoolean() {
+        return METHOD_RETURN_IS_BOOLEAN.get().booleanValue();
+    }
+    // END_CHANGE: BUG-2026-0124-1
 
     public static List<Statement> simplify(List<Statement> statements) {
         return simplifyBooleanComparisons(statements);
@@ -38,10 +53,16 @@ public final class BooleanSimplifier {
      * When false, {@code return 1} stays as-is to avoid incorrect type conversion.
      */
     public static List<Statement> simplify(List<Statement> statements, boolean returnIsBoolean) {
-        methodReturnIsBoolean = returnIsBoolean;
-        List<Statement> result = simplifyBooleanComparisons(statements);
-        methodReturnIsBoolean = false;
-        return result;
+        // START_CHANGE: BUG-2026-0124-20260907-2 - Save/restore rather than reset to a constant, so
+        // a nested simplify() cannot clobber the enclosing method's flag either.
+        Boolean previous = METHOD_RETURN_IS_BOOLEAN.get();
+        METHOD_RETURN_IS_BOOLEAN.set(returnIsBoolean ? Boolean.TRUE : Boolean.FALSE);
+        try {
+            return simplifyBooleanComparisons(statements);
+        } finally {
+            METHOD_RETURN_IS_BOOLEAN.set(previous);
+        }
+        // END_CHANGE: BUG-2026-0124-2
     }
 
     public static List<Statement> simplifyBooleanComparisons(List<Statement> statements) {
@@ -164,12 +185,12 @@ public final class BooleanSimplifier {
             if (rs.hasExpression()) {
                 Expression expr = rs.getExpression();
                 // Only convert return 1/0 to true/false when method returns boolean
-                if (methodReturnIsBoolean && expr instanceof IntegerConstantExpression) {
+                if (methodReturnIsBoolean() && expr instanceof IntegerConstantExpression) {
                     int val = ((IntegerConstantExpression) expr).getValue();
                     if (val == 1) return new ReturnStatement(rs.getLineNumber(), BooleanExpression.TRUE);
                     if (val == 0) return new ReturnStatement(rs.getLineNumber(), BooleanExpression.FALSE);
                 }
-                if (methodReturnIsBoolean && expr instanceof TernaryExpression) {
+                if (methodReturnIsBoolean() && expr instanceof TernaryExpression) {
                     TernaryExpression te = (TernaryExpression) expr;
                     // condition ? 1 : 0 -> condition (boolean return)
                     if (isIntConstant(te.getTrueExpression(), 1) && isIntConstant(te.getFalseExpression(), 0)) {

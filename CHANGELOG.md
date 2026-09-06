@@ -2,6 +2,31 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.13.0] - 2026-09-07
+
+### Fixed
+- **The library is now thread-safe and decompilation is deterministic** (BUG-2026-0124, CRITICAL).
+  `BooleanSimplifier` kept "does this method return boolean" — per-METHOD state — in a plain static
+  field, written and reset around each call. Under the batch thread pool two tasks raced on it, so a
+  boolean method's `return 0` was sometimes never converted to `return false`: output that does not
+  compile. The same build over JDK 25 `java.base` produced **211 differing files out of 3,376 run to
+  run**. The flag moved to a `ThreadLocal` with save/restore. Separately `DenzoDecompiler` shared one
+  stateful `JavaSourceWriter` across calls; it now creates one per call, so **a single instance is
+  safe to use from several threads** — previously the documentation warned against exactly that.
+  After the fix three multi-threaded batches are byte-identical to each other and to the
+  single-threaded reference, and a shared instance driven by 8 threads over 400 classes matches the
+  sequential output exactly.
+- **Constant-label and array-class pattern switches** (BUG-2026-0123, partial). javac routes an
+  ordinary constant switch through `SwitchBootstraps` as soon as it has a `case null`, so string and
+  numeric labels arrive on the pattern path; and an array-class label is an ordinary type pattern once
+  its descriptor is parsed. Both were rejected by an over-broad guard, leaving the raw dispatch with
+  every arm value dropped. `java.base` raw dispatches: 7 -> 5. The guarded form remains open.
+
+### Added
+- `testThreadSafetyDeterminism`: decompiles the same classes sequentially and then 160 times across 8
+  threads through one shared `DenzoDecompiler`, requiring identical output. Suite is 49/50.
+- Two pattern-switch regression tests (`testConstantLabelSwitch`, `testArrayClassPatternSwitch`).
+
 ## [1.12.0] - 2026-09-06
 
 Pattern switch (Java 21+) on real-world bytecode.

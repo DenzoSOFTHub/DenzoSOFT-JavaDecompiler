@@ -2084,6 +2084,52 @@ public class StructuredFlowBuilder {
     // (load constant/expression, goto merge). The pattern type comes from the typeSwitch
     // bootstrap label at the arm's switch key; the `_` binding is the CORRECT reconstruction
     // because the class file cannot carry an unnamed binding in the LVT (Java 21+ output).
+    // START_CHANGE: BUG-2026-0123-20260906-4 - Array-class bootstrap label -> Type.
+    /** Parse a JVM array descriptor (`[I`, `[[Ljava/lang/String;`) into a Type, or null. */
+    private Type parseArrayLabel(String desc) {
+        int dim = 0;
+        while (dim < desc.length() && desc.charAt(dim) == '[') dim++;
+        if (dim == 0 || dim >= desc.length()) return null;
+        String base = desc.substring(dim);
+        Type elem;
+        if (base.length() == 1) {
+            switch (base.charAt(0)) {
+                case 'I': elem = PrimitiveType.INT; break;
+                case 'J': elem = PrimitiveType.LONG; break;
+                case 'D': elem = PrimitiveType.DOUBLE; break;
+                case 'F': elem = PrimitiveType.FLOAT; break;
+                case 'S': elem = PrimitiveType.SHORT; break;
+                case 'B': elem = PrimitiveType.BYTE; break;
+                case 'C': elem = PrimitiveType.CHAR; break;
+                case 'Z': elem = PrimitiveType.BOOLEAN; break;
+                default: return null;
+            }
+        } else if (base.charAt(0) == 'L' && base.charAt(base.length() - 1) == ';') {
+            elem = new ObjectType(base.substring(1, base.length() - 1));
+        } else {
+            return null;
+        }
+        return new ArrayType(elem, dim);
+    }
+    // END_CHANGE: BUG-2026-0123-4
+
+    // START_CHANGE: BUG-2026-0123-20260906-2 - Numeric case label from a bootstrap constant.
+    /** Parse an int/long/float/double bootstrap label into a constant expression, or null. */
+    private Expression parseNumericLabel(String label, int line) {
+        try {
+            char last = label.charAt(label.length() - 1);
+            String body = label.substring(0, label.length() - 1);
+            if (last == 'L' || last == 'l') return new LongConstantExpression(line, Long.parseLong(body));
+            if (last == 'F' || last == 'f') return new FloatConstantExpression(line, Float.parseFloat(body));
+            if (last == 'D' || last == 'd') return new DoubleConstantExpression(line, Double.parseDouble(body));
+            if (label.indexOf('.') >= 0) return new DoubleConstantExpression(line, Double.parseDouble(label));
+            return IntegerConstantExpression.valueOf(line, Integer.parseInt(label));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+    // END_CHANGE: BUG-2026-0123-2
+
     private SwitchExpression.SwitchCase unnamedPatternArm(BasicBlock tb, int mergePc,
                                                           StaticMethodInvocationExpression typeSwitchCall,
                                                           List<Integer> keys) {
@@ -2107,7 +2153,39 @@ public class StructuredFlowBuilder {
         // classes (`[Ljava/lang/String;`) would need descriptor parsing — leave to fallback.
         if (label == null || label.length() == 0) return null;
         char c0 = label.charAt(0);
-        if (c0 == '"' || c0 == '-' || c0 == '[' || (c0 >= '0' && c0 <= '9')) return null;
+        // START_CHANGE: BUG-2026-0123-20260906-3 - Array-class labels (`[I`, `[Ljava/lang/String;`)
+        // are ordinary type patterns once the descriptor is parsed. Rejecting them left whole
+        // dispatches raw (jdk/internal/foreign/Utils.BaseAndScale.of switches over eight array
+        // types), with every arm value dropped.
+        if (c0 == '[') {
+            Type arrType = parseArrayLabel(label);
+            if (arrType == null) return null;
+            SwitchExpression.SwitchCase asc = new SwitchExpression.SwitchCase(null, tb.stackTopExpression);
+            asc.setPatternType(arrType);
+            asc.setPatternBinding("_");
+            return asc;
+        }
+        // END_CHANGE: BUG-2026-0123-3
+        // START_CHANGE: BUG-2026-0123-20260906-1 - Constant labels on a typeSwitch. javac routes a
+        // plain constant switch through SwitchBootstraps as soon as it has a `case null`, so
+        // `switch (s) { case "true" -> ...; case null -> ...; }` arrives here with STRING labels.
+        // Rejecting them left the raw dispatch with every arm value dropped -- the method returned
+        // an unconditional value instead of the arm's. Numeric labels arrive the same way.
+        if (c0 == '"') {
+            String text = label.length() >= 2 && label.charAt(label.length() - 1) == '"'
+                ? label.substring(1, label.length() - 1) : label;
+            List<Expression> strLabels = new ArrayList<Expression>();
+            strLabels.add(new StringConstantExpression(typeSwitchCall.getLineNumber(), text));
+            return new SwitchExpression.SwitchCase(strLabels, tb.stackTopExpression);
+        }
+        if (c0 == '-' || (c0 >= '0' && c0 <= '9')) {
+            Expression numLabel = parseNumericLabel(label, typeSwitchCall.getLineNumber());
+            if (numLabel == null) return null;
+            List<Expression> numLabels = new ArrayList<Expression>();
+            numLabels.add(numLabel);
+            return new SwitchExpression.SwitchCase(numLabels, tb.stackTopExpression);
+        }
+        // END_CHANGE: BUG-2026-0123-1
         // START_CHANGE: BUG-2026-0108-20260906-3 - Labels resolved from a CONSTANT_Dynamic entry are
         // CONSTANTS, not type patterns: a qualified enum constant carries a '.' after its internal
         // class name, and boolean labels are literally true/false. Emitting them as a pattern type

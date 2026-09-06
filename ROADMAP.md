@@ -2,10 +2,10 @@
 
 Planning document for optimizations, structural improvements, stability, compatibility and maintainability.
 
-Current state: **v1.12.0** — construct matrix (Java 1.0–25, 55 top-level
+Current state: **v1.13.0 (ready, not yet tagged)** — construct matrix (Java 1.0–25, 55 top-level
 classes) **55/55** at javac-default debug, **53/55** at `-g`, **54/55** at `-g:none`; JDK 25
 `java.base` 3,376 classes with 0 errors; ~900 classes/sec single-thread (2,300/s at 4 threads);
-47 automated tests. Java 26+ class files decompile on a best-effort basis rather than being refused.
+50 automated tests. Decompilation is thread-safe and deterministic. Java 26+ class files decompile on a best-effort basis rather than being refused.
 
 The v1.10.0 claim of "57/57, 0 known silent miscompilations" was measured only at javac's default
 debug settings and only with a recompile oracle. The 2026-09-05 audit
@@ -32,7 +32,14 @@ census, and found three silent-semantics defects — all fixed in v1.11.0 — pl
   control flow, branch declaration hoisting. Verified dominance over official JD-Core 1.3.0
   (57/57 vs 44/57; corpus 7 vs 39+4-no-output errors).
 
-## 1b. v1.12.0
+## 1b. v1.13.0 (ready, not yet tagged)
+
+Thread safety and determinism (BUG-2026-0124): a single static field in `BooleanSimplifier` held
+per-method state, so concurrent decompilation raced on it and batch output differed in 211 of 3,376
+java.base classes run to run, sometimes emitting `return 0;` from a boolean method. Also constant and
+array-class pattern-switch labels (BUG-2026-0123, partial; raw dispatches 7 -> 5).
+
+## 1c. v1.12.0
 
 Pattern switch (Java 21+). Statement-form pattern switches kept the raw `SwitchBootstraps.typeSwitch`
 dispatch instead of a real `switch` (BUG-2026-0109, `java.base` 28 raw bodies -> 7, all 7 remaining
@@ -44,7 +51,7 @@ form failed only for want of a value merge (its arm bodies were intact, so an AS
 and the guarded / multi-label form loses its arm values on the operand stack — that half is
 BUG-2026-0123 and needs flow-builder work.
 
-## 1c. v1.11.0
+## 1d. v1.11.0
 
 Fixed: handlers deleted without a LineNumberTable (BUG-2026-0100, `catch` 0 -> 15/15 at `-g:none`);
 `synchronized` nested in a compound statement dropped (BUG-2026-0101, `java.base` leaked markers
@@ -94,4 +101,4 @@ Highest value first, from the audit backlog (`docs/tracking/track-bugs.md`):
 
 ---
 
-*Last updated: 2026-09-06 (v1.12.0)*
+*Last updated: 2026-09-07 (v1.13.0)*

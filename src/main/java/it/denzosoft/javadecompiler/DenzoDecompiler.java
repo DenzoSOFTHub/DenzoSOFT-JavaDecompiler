@@ -27,8 +27,13 @@ import java.util.Map;
  */
 public class DenzoDecompiler implements Decompiler {
 
+    // START_CHANGE: BUG-2026-0124-20260907-3 - Thread safety. The deserializer is stateless and can
+    // be shared, but JavaSourceWriter carries per-call state (the configuration flags, the inlined
+    // static-field set, anonymous-class display names, the compilation-unit type index). Sharing one
+    // across concurrent decompile() calls on the SAME DenzoDecompiler corrupted that state, so a
+    // writer is now created per call exactly as the converter already was. With this,
+    // a single DenzoDecompiler instance is safe to use from several threads.
     private final ClassFileDeserializer deserializer = new ClassFileDeserializer();
-    private final JavaSourceWriter writer = new JavaSourceWriter();
     private DecompilerTrace trace = new DecompilerTrace(); // disabled by default
 
     /**
@@ -121,6 +126,8 @@ public class DenzoDecompiler implements Decompiler {
 
         try {
             trace.log("writer", "Generating Java source code");
+            // A fresh writer per call: it holds per-class mutable state (BUG-2026-0124).
+            JavaSourceWriter writer = new JavaSourceWriter();
             writer.process(message);
             trace.log("writer", "Source generation completed");
         } catch (Exception e) {
@@ -137,7 +144,7 @@ public class DenzoDecompiler implements Decompiler {
      * Get the version string of this decompiler.
      */
     public static String getVersion() {
-        return "1.12.0";
+        return "1.13.0";
     }
 
     /**

@@ -1,4 +1,4 @@
-# DenzoSOFT Java Decompiler v1.12.0
+# DenzoSOFT Java Decompiler v1.13.0
 
 A Java bytecode decompiler supporting **Java 1.0 through Java 25**, with zero external dependencies.
 
@@ -468,7 +468,21 @@ The decompiler transforms binary `.class` files into Java source code through a 
 
 ### Thread Safety
 
-`DenzoDecompiler` is the main entry point and is thread-safe. Each `decompile()` call creates a fresh `ClassFileToJavaSyntaxConverter` (which holds mutable state) and a fresh `Message` context. The `Deserializer` and `Writer` are stateless singletons. `BatchDecompiler` uses a thread pool with a shared `Loader` that provides class data to all threads.
+`DenzoDecompiler` is the main entry point. A single instance is safe to use from several threads, and
+decompilation is **deterministic**: the same input always produces byte-identical output, whatever the
+thread count.
+
+Each `decompile()` call creates a fresh `ClassFileToJavaSyntaxConverter`, a fresh `JavaSourceWriter`
+and a fresh `Message` context, because the converter and the writer both hold per-class mutable state.
+The deserializer is genuinely stateless and is shared. `BatchDecompiler` uses a thread pool with a
+shared `Loader` that provides class data to all threads.
+
+Until v1.13.0 this section claimed the writer was a stateless singleton; it was not, and a separate
+static field in `BooleanSimplifier` held per-method state. Together they made batch output differ in
+211 of 3,376 JDK 25 `java.base` classes from one run to the next, sometimes emitting `return 0;` from
+a boolean method — output that does not compile. Both are fixed, and `testThreadSafetyDeterminism`
+guards the property by decompiling the same classes sequentially and then across 8 threads through one
+shared instance, requiring identical results.
 
 ### Package Structure
 
@@ -532,7 +546,7 @@ it.denzosoft.javadecompiler
 mvn clean package
 ```
 
-The resulting JAR will be in `target/java-decompiler-1.12.0.jar`.
+The resulting JAR will be in `target/java-decompiler-1.13.0.jar`.
 
 Source compatibility: **Java 1.6** (runs on any JVM 1.6+).
 Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
@@ -572,6 +586,11 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 - **Extreme bytecode patterns**: A handful of JDK-internal classes (Panama FFI `BindingSpecializer`, `FallbackLinker`, `ForkJoinPool`, `DirectMethodHandleDescImpl`) use bytecode patterns the decoder still can't fully reconstruct. When this happens the output contains explicit `// === DECOMPILATION NOTES ===` comment blocks identifying the pc and opcode of each unresolved site.
 
 ### Resolved in Previous Versions
+- **v1.13.0 — thread safety and determinism**: a static field holding per-method state made
+  concurrent decompilation race, so batch output differed in 211 of 3,376 JDK 25 `java.base` classes
+  run to run and sometimes emitted `return 0;` from a boolean method. `DenzoDecompiler` is now safe to
+  share across threads and the same input always yields byte-identical output. Also: constant-label
+  and array-class pattern switches reconstruct (raw dispatches 7 → 5).
 - **v1.12.0 — pattern switch (Java 21+)**: statement-form pattern switches kept the raw
   `SwitchBootstraps.typeSwitch` dispatch with integer indices instead of a real `switch` (JDK 25
   `java.base`: 28 bodies → 7, and all 7 remaining now announce themselves with a diagnostic);
@@ -688,7 +707,7 @@ Recorded event types:
 
 ## Test Suite
 
-47 automated tests (46 passing, 1 known stale expectation) covering:
+50 automated tests (49 passing, 1 known stale expectation) covering:
 - Basic classes, constructors, field initialization
 - Annotations (`@Deprecated`, custom)
 - Generics (`<T extends Comparable<T>>`, `List<String>`)

@@ -29,7 +29,7 @@ java -cp target/classes:target/test-classes it.denzosoft.javadecompiler.Decompil
 
 Each test compiles a source snippet with the given javac, decompiles the result, and asserts that
 expected substrings appear in the output. To run a single case, comment out the other calls in
-`DecompilerTest.main()` — there is no test selector. Current baseline: **46/47**; `BasicClass` fails
+`DecompilerTest.main()` — there is no test selector. Current baseline: **49/50**; `BasicClass` fails
 on a stale expectation (it asserts an explicit `super()` that the decompiler now correctly elides).
 Do not treat that one as a regression, and do not "fix" it by re-emitting implicit `super()`.
 
@@ -293,7 +293,7 @@ When an item reaches RESOLVED status:
 
 **Build and verify:**
 1. `JAVA_HOME=<jdk8> mvn clean compile` (must succeed)
-2. Run `DecompilerTest` with the JDK 25 javac path (46/47 — only the known `BasicClass` expectation may fail)
+2. Run `DecompilerTest` with the JDK 25 javac path (49/50 — only the known `BasicClass` expectation may fail)
 3. Run the all-class decompilation test (0 errors required)
 4. Run the construct-matrix round trip (compile → decompile → recompile clean)
 5. `JAVA_HOME=<jdk8> mvn clean package` to produce the JAR
@@ -345,7 +345,7 @@ docs/
 
 - **Java 1.6 source compatibility**: No diamond operator `<>`, no lambda, no try-with-resources, no switch on String, no `getOrDefault`, no `List.of`, no `String.repeat`, no `@Override` on interface methods
 - **Zero dependencies**: No external libraries. Only JDK classes.
-- **Thread safety**: `ClassFileToJavaSyntaxConverter` and `JavaSourceWriter` hold mutable per-call state. `DenzoDecompiler.decompile()` creates a fresh converter each call; the writer is a shared instance field, so use one `DenzoDecompiler` per thread (this is what `BatchDecompiler` does — one per class task).
+- **Thread safety**: `DenzoDecompiler` is safe to share across threads, and decompilation is deterministic — the same input always yields byte-identical output. `decompile()` builds a fresh `ClassFileToJavaSyntaxConverter` AND a fresh `JavaSourceWriter` per call, because both hold per-class mutable state. Keep it that way: **per-method or per-class state must never live in a static field**. One such field (`BooleanSimplifier.methodReturnIsBoolean`) made batch output differ in 211 of 3,376 `java.base` classes run to run, sometimes emitting `return 0;` from a boolean method (BUG-2026-0124). `testThreadSafetyDeterminism` guards this; if you add per-call state, put it on the instance or in a `ThreadLocal` with save/restore.
 - **GPLv3 license header** on all source files
 
 ## Architecture
