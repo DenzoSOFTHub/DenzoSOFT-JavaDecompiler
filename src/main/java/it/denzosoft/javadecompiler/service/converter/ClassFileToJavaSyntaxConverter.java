@@ -1535,6 +1535,10 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     jdResult = StringSwitchReconstructor.reconstruct(jdResult);
                     if (patternSwitchLabels != null && !patternSwitchLabels.isEmpty()) {
                         jdResult = PatternSwitchReconstructor.reconstruct(jdResult, patternSwitchLabels);
+                        // START_CHANGE: BUG-2026-0109-20260906-8 - Same pass on the JD output.
+                        jdResult = it.denzosoft.javadecompiler.service.converter.transform
+                            .PatternSwitchStatementReconstructor.reconstruct(jdResult, patternSwitchLabels);
+                        // END_CHANGE: BUG-2026-0109-8
                     }
                     // END_CHANGE: IMP-2026-0062-28
                     if (!preDeclarations.isEmpty()) {
@@ -1725,6 +1729,13 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 // START_CHANGE: LIM-0005-20260326-4 - Reconstruct pattern switch from typeSwitch bootstrap
                 if (patternSwitchLabels != null && !patternSwitchLabels.isEmpty()) {
                     result = PatternSwitchReconstructor.reconstruct(result, patternSwitchLabels);
+                    // START_CHANGE: BUG-2026-0109-20260906-7 - Statement-form pattern switches the
+                    // expression-form reconstruction above cannot handle (no value merge). Their
+                    // arm bodies ARE present, so the raw dispatch can be rebuilt into a real
+                    // `switch (sel) { case Type b: ... }`.
+                    result = it.denzosoft.javadecompiler.service.converter.transform
+                        .PatternSwitchStatementReconstructor.reconstruct(result, patternSwitchLabels);
+                    // END_CHANGE: BUG-2026-0109-7
                 }
                 // END_CHANGE: LIM-0005-4
                 // BUG-2026-0080: hoist a var declared in a switch case but used in another case / after.

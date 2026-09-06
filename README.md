@@ -1,4 +1,4 @@
-# DenzoSOFT Java Decompiler v1.11.0
+# DenzoSOFT Java Decompiler v1.12.0
 
 A Java bytecode decompiler supporting **Java 1.0 through Java 25**, with zero external dependencies.
 
@@ -532,7 +532,7 @@ it.denzosoft.javadecompiler
 mvn clean package
 ```
 
-The resulting JAR will be in `target/java-decompiler-1.11.0.jar`.
+The resulting JAR will be in `target/java-decompiler-1.12.0.jar`.
 
 Source compatibility: **Java 1.6** (runs on any JVM 1.6+).
 Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
@@ -572,6 +572,11 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 - **Extreme bytecode patterns**: A handful of JDK-internal classes (Panama FFI `BindingSpecializer`, `FallbackLinker`, `ForkJoinPool`, `DirectMethodHandleDescImpl`) use bytecode patterns the decoder still can't fully reconstruct. When this happens the output contains explicit `// === DECOMPILATION NOTES ===` comment blocks identifying the pc and opcode of each unresolved site.
 
 ### Resolved in Previous Versions
+- **v1.12.0 — pattern switch (Java 21+)**: statement-form pattern switches kept the raw
+  `SwitchBootstraps.typeSwitch` dispatch with integer indices instead of a real `switch` (JDK 25
+  `java.base`: 28 bodies → 7, and all 7 remaining now announce themselves with a diagnostic);
+  qualified enum constants used as case labels (`case DayOfWeek.MONDAY`) were lost and rendered as
+  the uncompilable `case  _`. Full list: `docs/releases/v1.12.0/release-notes.md`.
 - **v1.11.0 — correctness on real-world debug shapes**: exception handlers were silently deleted from
   every class without a LineNumberTable (`catch` 0 → 15 of 15 at `-g:none`); `synchronized` nested in
   any compound statement was dropped, removing the lock (`java.base` 98 files → 0, locks 720 → 933);
@@ -683,7 +688,7 @@ Recorded event types:
 
 ## Test Suite
 
-45 automated tests (44 passing, 1 known stale expectation) covering:
+47 automated tests (46 passing, 1 known stale expectation) covering:
 - Basic classes, constructors, field initialization
 - Annotations (`@Deprecated`, custom)
 - Generics (`<T extends Comparable<T>>`, `List<String>`)

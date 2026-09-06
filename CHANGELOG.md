@@ -2,6 +2,34 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
+## [1.12.0] - 2026-09-06
+
+Pattern switch (Java 21+) on real-world bytecode.
+
+### Fixed
+- **Statement-form pattern switches are reconstructed** (BUG-2026-0109). A pattern switch used as a
+  statement has no value merge, so the flow builder left the raw
+  `switch (SwitchBootstraps.typeSwitch(sel, idx))` dispatch with integer indices — uncompilable.
+  Its arm bodies were all present though, so `SwitchStatement` now carries pattern labels and a new
+  `PatternSwitchStatementReconstructor` rebuilds the switch from the bootstrap labels and each arm's
+  own cast. JDK 25 `java.base` raw dispatches: 28 -> 7, and all 7 remaining are flagged.
+- **Pattern-switch labels stored as CONSTANT_Dynamic** (BUG-2026-0108). Qualified enum constants
+  (`case DayOfWeek.MONDAY`, a finalized Java 21 feature) and the JEP 507 boolean previews were lost,
+  rendering the arm as the uncompilable `case  _`. The condy is now walked through its bootstrap
+  (`ConstantBootstraps.invoke` + `Enum$EnumDesc.of`, with a nested `ClassDesc.of`), and constant
+  labels are emitted as genuine constant cases instead of type patterns with a binding.
+
+### Added
+- `PATTERN_SWITCH_NOT_RECONSTRUCTED` diagnostic: a surviving raw `typeSwitch` dispatch is detected on
+  both flow paths and announced, instead of the body being silently wrong (3 of 29 affected
+  `java.base` files carried any diagnostic before).
+- Two regression tests (`testQualifiedEnumCaseLabel`, `testStatementPatternSwitch`). Suite is 46/47.
+
+### Known issues
+- BUG-2026-0123: guarded, multi-label and constant-label pattern switches still lose their arm values
+  (they travel on the operand stack to a merge the flow builder does not rebuild). 7 `java.base`
+  bodies, all flagged.
+
 ## [1.11.0] - 2026-09-05
 
 Correctness release driven by an evidence-based audit of the decompilation process. The v1.10.0
