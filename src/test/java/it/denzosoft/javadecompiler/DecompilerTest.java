@@ -934,6 +934,7 @@ public class DecompilerTest {
             failed++;
         }
     }
+    // END_CHANGE: BUG-2026-0100-9
 
     // START_CHANGE: BUG-2026-0071-20260610-8 - Variant of runTestFull whose loader serves every
     // class file produced in the temp dir, so nested/inner classes are decompiled too (the

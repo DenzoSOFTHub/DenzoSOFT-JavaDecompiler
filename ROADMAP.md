@@ -2,10 +2,10 @@
 
 Planning document for optimizations, structural improvements, stability, compatibility and maintainability.
 
-Current state: **v1.11.0 (in development)** — construct matrix (Java 1.0–25, 55 top-level classes)
-**55/55** at javac-default debug, **53/55** at `-g`, **54/55** at `-g:none`; JDK 25 `java.base`
-3,376 classes with 0 errors; ~900 classes/sec single-thread (2,300/s at 4 threads); 45 automated tests.
-Java 26+ class files decompile on a best-effort basis rather than being refused.
+Current state: **v1.12.0 (ready, not yet tagged)** — construct matrix (Java 1.0–25, 55 top-level
+classes) **55/55** at javac-default debug, **53/55** at `-g`, **54/55** at `-g:none`; JDK 25
+`java.base` 3,376 classes with 0 errors; ~900 classes/sec single-thread (2,300/s at 4 threads);
+47 automated tests. Java 26+ class files decompile on a best-effort basis rather than being refused.
 
 The v1.10.0 claim of "57/57, 0 known silent miscompilations" was measured only at javac's default
 debug settings and only with a recompile oracle. The 2026-09-05 audit
@@ -32,7 +32,19 @@ census, and found three silent-semantics defects — all fixed in v1.11.0 — pl
   control flow, branch declaration hoisting. Verified dominance over official JD-Core 1.3.0
   (57/57 vs 44/57; corpus 7 vs 39+4-no-output errors).
 
-## 1b. v1.11.0 (in development)
+## 1b. v1.12.0 (ready, not yet tagged)
+
+Pattern switch (Java 21+). Statement-form pattern switches kept the raw `SwitchBootstraps.typeSwitch`
+dispatch instead of a real `switch` (BUG-2026-0109, `java.base` 28 raw bodies -> 7, all 7 remaining
+now flagged with `PATTERN_SWITCH_NOT_RECONSTRUCTED`); qualified enum constants used as case labels
+were lost and rendered as the uncompilable `case  _` (BUG-2026-0108).
+
+The audit had filed 0109 as one defect; it was two. The expression form already worked, the statement
+form failed only for want of a value merge (its arm bodies were intact, so an AST pass rebuilds it),
+and the guarded / multi-label form loses its arm values on the operand stack — that half is
+BUG-2026-0123 and needs flow-builder work.
+
+## 1c. v1.11.0
 
 Fixed: handlers deleted without a LineNumberTable (BUG-2026-0100, `catch` 0 -> 15/15 at `-g:none`);
 `synchronized` nested in a compound statement dropped (BUG-2026-0101, `java.base` leaked markers
@@ -47,8 +59,8 @@ so slot-sharing variables collapsed (BUG-2026-0103); the category-2 `dup` family
 
 Highest value first, from the audit backlog (`docs/tracking/track-bugs.md`):
 
-- **BUG-2026-0109** statement-form pattern switches still fall back to raw `typeSwitch`: 27 of the 31
-  java.base classes that use it.
+- **BUG-2026-0123** guarded / multi-label / constant-label pattern switches lose their arm values
+  (7 java.base bodies, all flagged). Needs the flow builder to rebuild the stack-carried merge.
 - **BUG-2026-0122** try-region membership still uses source lines when they exist.
 
 - **J21SwitchPattern statement-form fallback** (4 corpus errors): statement-form guarded pattern
@@ -82,4 +94,4 @@ Highest value first, from the audit backlog (`docs/tracking/track-bugs.md`):
 
 ---
 
-*Last updated: 2026-06-10 (v1.10.0)*
+*Last updated: 2026-09-06 (v1.12.0)*
