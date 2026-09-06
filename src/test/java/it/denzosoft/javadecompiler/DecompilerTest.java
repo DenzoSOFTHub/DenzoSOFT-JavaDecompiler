@@ -87,6 +87,9 @@ public class DecompilerTest {
         testSharedSlotScopes();        // BUG-2026-0103: LVT scope ranges give each variable its name/type
         testNoReDeclaration();         // BUG-2026-0107: same name never declared twice in one scope
         // END_CHANGE: v1.11.0-1
+        // START_CHANGE: v1.12.0-20260906-1 - Pattern switch (Java 21+).
+        testQualifiedEnumCaseLabel();  // BUG-2026-0108: condy label -> case Enum.CONSTANT
+        // END_CHANGE: v1.12.0-1
 
         // Summary
         System.out.println("\n=====================================");
@@ -804,6 +807,31 @@ public class DecompilerTest {
             new String[]{"int total;"});
     }
     // END_CHANGE: v1.11.0-2
+
+    // START_CHANGE: v1.12.0-20260906-2 - Pattern-switch regression tests.
+    /**
+     * BUG-2026-0108: a qualified enum constant used as a pattern-switch label is stored by javac as
+     * a CONSTANT_Dynamic entry (ConstantBootstraps.invoke + Enum$EnumDesc.of). The decoder read only
+     * Class/String/Integer bootstrap arguments, so the label was lost and the arm was rendered as the
+     * uncompilable `case  _ ->`.
+     */
+    private static void testQualifiedEnumCaseLabel() {
+        runTestFull("QualEnum",
+            "import java.time.DayOfWeek;\n" +
+            "public class QualEnum {\n" +
+            "    static String f(Object o) {\n" +
+            "        return switch (o) {\n" +
+            "            case DayOfWeek.MONDAY -> \"mon\";\n" +
+            "            case DayOfWeek d -> \"day\";\n" +
+            "            case String s -> s;\n" +
+            "            default -> \"?\";\n" +
+            "        };\n" +
+            "    }\n" +
+            "}",
+            new String[]{"case DayOfWeek.MONDAY"},
+            new String[]{"case  _", "MONDAY _"});
+    }
+    // END_CHANGE: v1.12.0-2
 
     private static void runTestFull(String className, String sourceCode,
                                     String[] mustContain, String[] mustNotContain) {

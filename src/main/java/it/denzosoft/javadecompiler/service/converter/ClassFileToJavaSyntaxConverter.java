@@ -1553,6 +1553,13 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     // deconstruction) and guarded arms do not fold — for those the legacy path is better, so
                     // fall through. This keeps selective activation from regressing area/classify-style methods.
                     if (!recordSwitchMethod || foldedRecordPatternSwitch(jdResult)) {
+                        // START_CHANGE: BUG-2026-0109-20260906-3 - Same annotation on the JD path.
+                        if (containsRawTypeSwitch(jdResult)) {
+                            recordDiagnostic("PATTERN_SWITCH_NOT_RECONSTRUCTED -- raw SwitchBootstraps.typeSwitch"
+                                + " dispatch emitted; arm values were carried on the operand stack and are"
+                                + " missing from this body");
+                        }
+                        // END_CHANGE: BUG-2026-0109-3
                         return jdResult;
                     }
                 }
@@ -1740,6 +1747,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 result = it.denzosoft.javadecompiler.service.converter.transform.DuplicateDeclarationDemoter.reconstruct(result);
                 // END_CHANGE: BUG-2026-0107-2
                 mergeDeclarationsWithAssignments(result);
+                // START_CHANGE: BUG-2026-0109-20260906-2 - Never leave an unreconstructed pattern
+                // switch unannounced: the arm values are missing and the body does not compile.
+                if (containsRawTypeSwitch(result)) {
+                    recordDiagnostic("PATTERN_SWITCH_NOT_RECONSTRUCTED -- raw SwitchBootstraps.typeSwitch"
+                        + " dispatch emitted; arm values were carried on the operand stack and are"
+                        + " missing from this body");
+                }
+                // END_CHANGE: BUG-2026-0109-2
                 return result;
             }
         } catch (Exception e) {
@@ -1881,6 +1896,157 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         return "J".equals(d) || "D".equals(d);
     }
     // END_CHANGE: BUG-2026-0104-2
+
+    // START_CHANGE: BUG-2026-0108-20260906-2 - CONSTANT_Dynamic case-label resolution.
+    /**
+     * Render a {@code CONSTANT_Dynamic} pattern-switch label as Java source, or null when the shape
+     * is not recognised. javac encodes several label kinds this way:
+     * <ul>
+     *   <li>{@code ConstantBootstraps.invoke} + {@code Enum$EnumDesc.of(ClassDesc, name)} —
+     *       a qualified enum constant, e.g. {@code case DayOfWeek.MONDAY}</li>
+     *   <li>{@code ConstantBootstraps.invoke} + {@code ClassDesc.of(name)} — the class itself,
+     *       used as the nested argument of the entry above</li>
+     *   <li>{@code ConstantBootstraps.getStaticFinal} — {@code Boolean.TRUE} / {@code FALSE},
+     *       emitted for {@code case true} / {@code case false} (JEP 507 preview)</li>
+     *   <li>{@code ConstantBootstraps.primitiveClass} — a primitive type pattern</li>
+     * </ul>
+     */
+    private String resolveCondyLabel(int argIdx, ConstantPool pool,
+                                     BootstrapMethodsAttribute bsmAttr, int depth) {
+        if (depth > 4 || bsmAttr == null) return null;
+        if (pool.getTag(argIdx) != ConstantPool.CONSTANT_Dynamic) return null;
+        Object raw = pool.getValue(argIdx);
+        if (!(raw instanceof int[])) return null;
+        int[] dyn = (int[]) raw;
+        if (dyn.length < 1) return null;
+        int bsmIdx = dyn[0];
+        BootstrapMethodsAttribute.BootstrapMethod[] all = bsmAttr.getBootstrapMethods();
+        if (bsmIdx < 0 || bsmIdx >= all.length) return null;
+        BootstrapMethodsAttribute.BootstrapMethod bsm = all[bsmIdx];
+        String factory = methodHandleTargetName(bsm.bootstrapMethodRef, pool);
+        int[] a = bsm.bootstrapArguments;
+
+        if ("getStaticFinal".equals(factory)) {
+            // args: [owner class] with the field name in the NameAndType of the condy itself
+            String field = dyn.length > 1 ? pool.getNameFromNameAndType(dyn[1]) : null;
+            if ("TRUE".equals(field)) return "true";
+            if ("FALSE".equals(field)) return "false";
+            return field;
+        }
+        if ("primitiveClass".equals(factory)) {
+            String nm = dyn.length > 1 ? pool.getNameFromNameAndType(dyn[1]) : null;
+            return primitiveNameFromDescriptor(nm);
+        }
+        if (!"invoke".equals(factory) || a == null || a.length < 1) return null;
+
+        String target = methodHandleTargetName(a[0], pool);
+        String owner = methodHandleOwnerName(a[0], pool);
+        if ("of".equals(target) && owner != null && owner.endsWith("ClassDesc")) {
+            // ClassDesc.of("java.time.DayOfWeek") -> the class name
+            return a.length > 1 ? pool.getStringConstant(a[1]) : null;
+        }
+        if ("of".equals(target) && owner != null && owner.endsWith("EnumDesc")) {
+            // EnumDesc.of(<ClassDesc condy>, "MONDAY") -> Enum.CONSTANT
+            String cls = a.length > 1 ? resolveCondyLabel(a[1], pool, bsmAttr, depth + 1) : null;
+            String constant = a.length > 2 ? pool.getStringConstant(a[2]) : null;
+            if (constant == null) return null;
+            if (cls == null) return constant;
+            // Keep the INTERNAL class name so the switch-arm builder can emit a real static field
+            // access (and the import collector sees the class): `java/time/DayOfWeek.MONDAY`.
+            return cls.replace('.', '/') + "." + constant;
+        }
+        return null;
+    }
+
+    /** Method name a CONSTANT_MethodHandle points at, or null. */
+    private String methodHandleTargetName(int mhIndex, ConstantPool pool) {
+        if (pool.getTag(mhIndex) != ConstantPool.CONSTANT_MethodHandle) return null;
+        Object raw = pool.getValue(mhIndex);
+        if (!(raw instanceof int[])) return null;
+        int[] mh = (int[]) raw;
+        return mh.length > 1 ? pool.getMemberName(mh[1]) : null;
+    }
+
+    /** Owner class of the member a CONSTANT_MethodHandle points at, or null. */
+    private String methodHandleOwnerName(int mhIndex, ConstantPool pool) {
+        if (pool.getTag(mhIndex) != ConstantPool.CONSTANT_MethodHandle) return null;
+        Object raw = pool.getValue(mhIndex);
+        if (!(raw instanceof int[])) return null;
+        int[] mh = (int[]) raw;
+        return mh.length > 1 ? pool.getMemberClassName(mh[1]) : null;
+    }
+
+    private String primitiveNameFromDescriptor(String d) {
+        if (d == null || d.length() != 1) return null;
+        switch (d.charAt(0)) {
+            case 'I': return "int";
+            case 'J': return "long";
+            case 'D': return "double";
+            case 'F': return "float";
+            case 'S': return "short";
+            case 'B': return "byte";
+            case 'C': return "char";
+            case 'Z': return "boolean";
+            default: return null;
+        }
+    }
+    // END_CHANGE: BUG-2026-0108-2
+
+    // START_CHANGE: BUG-2026-0109-20260906-1 - Detect an unreconstructed pattern switch.
+    /**
+     * True when the emitted body still dispatches on a raw {@code SwitchBootstraps.typeSwitch}
+     * call. Such a body is structurally degraded: the arm VALUES were carried on the operand stack
+     * to a merge the flow builder did not rebuild, so they are missing (a `return switch(...)`
+     * method can end up with no return at all). The output does not compile, but nothing in it said
+     * so -- 26 of the 29 affected JDK 25 java.base classes carried no diagnostic whatsoever.
+     */
+    private boolean containsRawTypeSwitch(List<Statement> stmts) {
+        if (stmts == null) return false;
+        for (int i = 0; i < stmts.size(); i++) {
+            if (containsRawTypeSwitch(stmts.get(i))) return true;
+        }
+        return false;
+    }
+
+    private boolean containsRawTypeSwitch(Statement s) {
+        if (s == null) return false;
+        if (s instanceof SwitchStatement) {
+            SwitchStatement sw = (SwitchStatement) s;
+            if (isTypeSwitchCall(sw.getSelector())) return true;
+            for (int i = 0; i < sw.getCases().size(); i++) {
+                if (containsRawTypeSwitch(sw.getCases().get(i).getStatements())) return true;
+            }
+            return false;
+        }
+        if (s instanceof BlockStatement) return containsRawTypeSwitch(((BlockStatement) s).getStatements());
+        if (s instanceof IfStatement) return containsRawTypeSwitch(((IfStatement) s).getThenBody());
+        if (s instanceof IfElseStatement) {
+            return containsRawTypeSwitch(((IfElseStatement) s).getThenBody())
+                || containsRawTypeSwitch(((IfElseStatement) s).getElseBody());
+        }
+        if (s instanceof WhileStatement) return containsRawTypeSwitch(((WhileStatement) s).getBody());
+        if (s instanceof DoWhileStatement) return containsRawTypeSwitch(((DoWhileStatement) s).getBody());
+        if (s instanceof ForStatement) return containsRawTypeSwitch(((ForStatement) s).getBody());
+        if (s instanceof ForEachStatement) return containsRawTypeSwitch(((ForEachStatement) s).getBody());
+        if (s instanceof LabelStatement) return containsRawTypeSwitch(((LabelStatement) s).getBody());
+        if (s instanceof SynchronizedStatement) return containsRawTypeSwitch(((SynchronizedStatement) s).getBody());
+        if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            if (containsRawTypeSwitch(t.getTryBody())) return true;
+            for (int i = 0; i < t.getCatchClauses().size(); i++) {
+                if (containsRawTypeSwitch(t.getCatchClauses().get(i).body)) return true;
+            }
+            return containsRawTypeSwitch(t.getFinallyBody());
+        }
+        return false;
+    }
+
+    private boolean isTypeSwitchCall(Expression e) {
+        if (!(e instanceof StaticMethodInvocationExpression)) return false;
+        StaticMethodInvocationExpression c = (StaticMethodInvocationExpression) e;
+        return "java/lang/runtime/SwitchBootstraps".equals(c.getOwnerInternalName());
+    }
+    // END_CHANGE: BUG-2026-0109-1
 
     private void recordDiagnostic(String note) {
         currentMethodDiagnostics.add(note);
@@ -3398,6 +3564,24 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                             } else if (tag == ConstantPool.CONSTANT_Integer) {
                                 Object val = pool.getValue(argIdx);
                                 caseLabels.add(String.valueOf(val));
+                            // START_CHANGE: BUG-2026-0108-20260906-1 - Resolve the remaining label
+                            // shapes instead of falling back to a comment (which the arm builders
+                            // then rendered as a bare `case  _`): CONSTANT_Dynamic labels, which
+                            // javac uses for qualified enum constants (`case DayOfWeek.MONDAY`, a
+                            // Java 21 GA feature) and for the JEP 507 primitive-pattern previews,
+                            // plus the long/float/double constant tags.
+                            } else if (tag == ConstantPool.CONSTANT_Long
+                                       || tag == ConstantPool.CONSTANT_Float
+                                       || tag == ConstantPool.CONSTANT_Double) {
+                                Object val = pool.getValue(argIdx);
+                                String lit = String.valueOf(val);
+                                if (tag == ConstantPool.CONSTANT_Long) lit = lit + "L";
+                                else if (tag == ConstantPool.CONSTANT_Float) lit = lit + "F";
+                                caseLabels.add(lit);
+                            } else if (tag == ConstantPool.CONSTANT_Dynamic) {
+                                String condy = resolveCondyLabel(argIdx, pool, bootstrapMethodsAttr, 0);
+                                caseLabels.add(condy != null ? condy : "/* case " + bi + " */");
+                            // END_CHANGE: BUG-2026-0108-1
                             } else {
                                 String utf8 = pool.getUtf8(argIdx);
                                 caseLabels.add(utf8 != null ? utf8 : "/* case " + bi + " */");
