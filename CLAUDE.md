@@ -29,7 +29,7 @@ java -cp target/classes:target/test-classes it.denzosoft.javadecompiler.Decompil
 
 Each test compiles a source snippet with the given javac, decompiles the result, and asserts that
 expected substrings appear in the output. To run a single case, comment out the other calls in
-`DecompilerTest.main()` — there is no test selector. Current baseline: **45/46**; `BasicClass` fails
+`DecompilerTest.main()` — there is no test selector. Current baseline: **46/47**; `BasicClass` fails
 on a stale expectation (it asserts an explicit `super()` that the decompiler now correctly elides).
 Do not treat that one as a regression, and do not "fix" it by re-emitting implicit `super()`.
 
@@ -243,7 +243,7 @@ When an item reaches RESOLVED status:
 
 **Build and verify:**
 1. `JAVA_HOME=<jdk8> mvn clean compile` (must succeed)
-2. Run `DecompilerTest` with the JDK 25 javac path (45/46 — only the known `BasicClass` expectation may fail)
+2. Run `DecompilerTest` with the JDK 25 javac path (46/47 — only the known `BasicClass` expectation may fail)
 3. Run the all-class decompilation test (0 errors required)
 4. Run the construct-matrix round trip (compile → decompile → recompile clean)
 5. `JAVA_HOME=<jdk8> mvn clean package` to produce the JAR

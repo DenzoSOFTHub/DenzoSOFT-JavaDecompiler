@@ -2866,6 +2866,8 @@ public class JavaSourceWriter implements Processor {
             if (switchSel.getType() instanceof ObjectType) {
                 boolean allIntLabels = !ss.getCases().isEmpty();
                 for (SwitchStatement.SwitchCase sc : ss.getCases()) {
+                    // BUG-2026-0109: a pattern case has no int labels and must not force .ordinal()
+                    if (sc.isPattern() || sc.isNullLabel()) { allIntLabels = false; break; }
                     if (sc.isDefault()) continue;
                     for (Expression lab : sc.getLabels()) {
                         if (!(lab instanceof IntegerConstantExpression)) {
@@ -2888,6 +2890,30 @@ public class JavaSourceWriter implements Processor {
             printer.indent();
             for (SwitchStatement.SwitchCase sc : ss.getCases()) {
                 printer.startLine(lineNumber++);
+                // START_CHANGE: BUG-2026-0109-20260906-5 - Pattern and null labels on a
+                // statement switch (`case Integer i:`, `case Integer _, Long _:`, `case null:`).
+                if (sc.isPattern() || sc.isNullLabel()) {
+                    printer.printKeyword("case");
+                    printer.printText(" ");
+                    if (sc.isNullLabel() && !sc.isPattern()) {
+                        printer.printKeyword("null");
+                    } else {
+                        for (int pi = 0; pi < sc.getPatternTypes().size(); pi++) {
+                            if (pi > 0) printer.printText(", ");
+                            writeType(printer, sc.getPatternTypes().get(pi), ownerInternalName);
+                            String bind = sc.getPatternBindings() != null && pi < sc.getPatternBindings().size()
+                                ? sc.getPatternBindings().get(pi) : null;
+                            printer.printText(" ");
+                            printer.printText(bind != null ? bind : "_");
+                        }
+                        if (sc.isNullLabel()) {
+                            printer.printText(", ");
+                            printer.printKeyword("null");
+                        }
+                    }
+                    printer.printText(":");
+                } else
+                // END_CHANGE: BUG-2026-0109-5
                 if (sc.isDefault()) {
                     printer.printKeyword("default");
                     printer.printText(":");

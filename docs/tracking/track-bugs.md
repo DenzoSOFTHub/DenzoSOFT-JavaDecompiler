@@ -18,7 +18,7 @@ Full evidence, root causes and file:line anchors for all of these are in
 
 | ID | Severity | Summary |
 |---|---|---|
-| BUG-2026-0109 | HIGH | Statement-form, unnamed-component and multi-label pattern switches fall back to raw `typeSwitch`, losing arm values (87% of real java.base sites). IN_PROGRESS: degraded bodies are now flagged, reconstruction still to do | [BUG-2026-0109.md](items/BUG-2026-0109.md) |
+| BUG-2026-0123 | HIGH | Guarded / multi-label / constant-label pattern switches lose their arm values (flow-builder work; 7 java.base bodies, all flagged) | [BUG-2026-0123.md](items/BUG-2026-0123.md) |
 | BUG-2026-0110 | HIGH | Anonymous classes: fields and initializers dropped, generic supertype arguments lost, anon inside a lambda not inlined |
 | BUG-2026-0111 | MEDIUM | try-with-resources combinations: multi-resource effectively-final, TWR + catch + finally, TWR body locals |
 | BUG-2026-0112 | MEDIUM | `boolean ok = a > b ? 1 : 0;` instead of the boolean expression |

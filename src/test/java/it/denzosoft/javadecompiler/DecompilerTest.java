@@ -89,6 +89,7 @@ public class DecompilerTest {
         // END_CHANGE: v1.11.0-1
         // START_CHANGE: v1.12.0-20260906-1 - Pattern switch (Java 21+).
         testQualifiedEnumCaseLabel();  // BUG-2026-0108: condy label -> case Enum.CONSTANT
+        testStatementPatternSwitch();  // BUG-2026-0109: statement-form pattern switch rebuilt
         // END_CHANGE: v1.12.0-1
 
         // Summary
@@ -830,6 +831,30 @@ public class DecompilerTest {
             "}",
             new String[]{"case DayOfWeek.MONDAY"},
             new String[]{"case  _", "MONDAY _"});
+    }
+    /**
+     * BUG-2026-0109: a pattern switch used as a STATEMENT has no value merge, so the flow builder
+     * left the raw `switch (SwitchBootstraps.typeSwitch(sel, idx))` dispatch with integer indices —
+     * uncompilable. Unlike the expression form the arm bodies are all present, so the switch can be
+     * rebuilt by mapping each index to its bootstrap label and folding the arm's leading cast into
+     * the pattern binding.
+     */
+    private static void testStatementPatternSwitch() {
+        runTestFull("StmtPat",
+            "public class StmtPat {\n" +
+            "    static void f(Object o) {\n" +
+            "        switch (o) {\n" +
+            "            case Integer i -> System.out.println(\"i\" + i);\n" +
+            "            case String s -> System.out.println(\"s\" + s);\n" +
+            "            default -> System.out.println(\"?\");\n" +
+            "        }\n" +
+            "    }\n" +
+            "}",
+            // -g so the LocalVariableTable supplies the real binding names; without it the
+            // reconstruction is identical but the bindings read `var3`/`var4`.
+            "-g",
+            new String[]{"case Integer i", "case String s", "default"},
+            new String[]{"SwitchBootstraps", "PATTERN_SWITCH_NOT_RECONSTRUCTED"});
     }
     // END_CHANGE: v1.12.0-2
 
