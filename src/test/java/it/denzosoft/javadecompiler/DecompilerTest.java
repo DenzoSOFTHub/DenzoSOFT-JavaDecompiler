@@ -95,6 +95,7 @@ public class DecompilerTest {
         testConstantLabelSwitch();       // BUG-2026-0123: string labels + case null
         testArrayClassPatternSwitch();   // BUG-2026-0123: `case byte[] _`
         testThreadSafetyDeterminism();   // BUG-2026-0124: shared instance, many threads, same output
+        testTryBodyNotDisplaced();       // BUG-2026-0122: synthesised statement stays inside the try
         // END_CHANGE: v1.13.0-1
 
         // Summary
@@ -1008,6 +1009,33 @@ public class DecompilerTest {
             public byte[] load(String internalName) { return bytes; }
         }, p, name);
         return p.getResult();
+    }
+    /**
+     * BUG-2026-0122: without a LineNumberTable, a statement the flow builder SYNTHESISED (a merged
+     * ternary is the common case) carries neither a recorded pc nor a line, so it could not be
+     * classified and was pushed past the catch — `r = o == null ? 1 : 2;`, whose bytecode sits inside
+     * the protected range, was emitted after the handler along with the declaration it depends on.
+     */
+    private static void testTryBodyNotDisplaced() {
+        runTestFull("TryPos",
+            "public class TryPos {\n" +
+            "    int f(String s) {\n" +
+            "        int r = 0;\n" +
+            "        try {\n" +
+            "            Object o = null;\n" +
+            "            r = o == null ? 1 : 2;\n" +
+            "        } catch (RuntimeException e) {\n" +
+            "            r = -1;\n" +
+            "        }\n" +
+            "        return r;\n" +
+            "    }\n" +
+            "}",
+            "-g:none",
+            // Containment alone cannot express "before": both substrings are present in the broken
+            // output too. Assert a single substring SPANNING the ternary and the closing brace of the
+            // try, which only holds when the ternary is the last statement inside it.
+            new String[]{"? 1 : 2;\n        } catch (RuntimeException"},
+            new String[]{});
     }
     // END_CHANGE: v1.13.0-2
 

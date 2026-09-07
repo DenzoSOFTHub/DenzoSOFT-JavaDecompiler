@@ -207,6 +207,10 @@ public final class ModernTwrReconstructor {
             } else if (s instanceof IfStatement) {
                 // `if (r != null) r.close();` form — accept as a close.
                 sawClose = true;
+            } else if (suppressedCloseVar(s) != null) {
+                // BUG-2026-0122: `try { r.close(); } catch (Throwable t2) { ... }` — javac's
+                // suppression handler around the exceptional-path close.
+                sawClose = true;
             } else {
                 return false;
             }
@@ -219,10 +223,35 @@ public final class ModernTwrReconstructor {
         if (!(body instanceof BlockStatement)) return out;
         for (Statement s : ((BlockStatement) body).getStatements()) {
             String v = closeCallVar(s);
+            // START_CHANGE: BUG-2026-0122-20260907-4 - The close on the exceptional path may be
+            // wrapped in javac's suppression handler, `try { v.close(); } catch (Throwable t2) {}`.
+            // Only the bare form was recognised, so once try-region membership was decided on
+            // bytecode positions (which puts the resource declaration before the try, where it
+            // belongs) the wrapper became visible here and the whole try-with-resources stopped
+            // collapsing.
+            if (v == null) v = suppressedCloseVar(s);
+            // END_CHANGE: BUG-2026-0122-4
             if (v != null) out.add(v);
         }
         return out;
     }
+
+    // START_CHANGE: BUG-2026-0122-20260907-5
+    /** Matches {@code try { v.close(); } catch (Throwable t) { ... }} and returns {@code v}. */
+    private static String suppressedCloseVar(Statement s) {
+        if (!(s instanceof TryCatchStatement)) return null;
+        TryCatchStatement t = (TryCatchStatement) s;
+        if (t.getResources() != null && !t.getResources().isEmpty()) return null;
+        if (t.getCatchClauses() == null || t.getCatchClauses().size() != 1) return null;
+        Statement inner = t.getTryBody();
+        if (inner instanceof BlockStatement) {
+            List<Statement> body = ((BlockStatement) inner).getStatements();
+            if (body.size() != 1) return null;
+            inner = body.get(0);
+        }
+        return closeCallVar(inner);
+    }
+    // END_CHANGE: BUG-2026-0122-5
 
     // START_CHANGE: BUG-2026-0068-20260610-5 - Helpers for the effectively-final resource form:
     // guarded normal-path close recognition and a conservative variable-reference scanner

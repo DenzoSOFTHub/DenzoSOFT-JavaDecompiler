@@ -59,10 +59,46 @@ public class TryCatchReconstructor {
      * by the flow builder are not themselves in the map, so their position is the minimum of the
      * decoded statements they wrap.
      */
+    // START_CHANGE: BUG-2026-0122-20260907-2 - Reverse index of the LineNumberTable.
+    private Map<Integer, Integer> lineToLowestPc;
+
+    /** Lowest bytecode pc mapping to {@code line}, or -1 when unknown. */
+    private int lowestPcForLine(int line) {
+        if (line <= 0 || pcToLine == null || pcToLine.isEmpty()) return -1;
+        if (lineToLowestPc == null) {
+            lineToLowestPc = new HashMap<Integer, Integer>();
+            for (Map.Entry<Integer, Integer> e : pcToLine.entrySet()) {
+                Integer prev = lineToLowestPc.get(e.getValue());
+                if (prev == null || e.getKey().intValue() < prev.intValue()) {
+                    lineToLowestPc.put(e.getValue(), e.getKey());
+                }
+            }
+        }
+        Integer pc = lineToLowestPc.get(Integer.valueOf(line));
+        return pc == null ? -1 : pc.intValue();
+    }
+
+    /** True when the statement wraps other statements (its position is their minimum). */
+    private boolean hasChildStatements(Statement s) {
+        return s instanceof BlockStatement || s instanceof IfStatement || s instanceof IfElseStatement
+            || s instanceof WhileStatement || s instanceof DoWhileStatement || s instanceof ForStatement
+            || s instanceof ForEachStatement || s instanceof LabelStatement
+            || s instanceof SynchronizedStatement || s instanceof TryCatchStatement
+            || s instanceof SwitchStatement;
+    }
+    // END_CHANGE: BUG-2026-0122-2
+
     private int minPcOf(Statement s) {
         if (s == null || statementPcs == null) return -1;
         Integer direct = statementPcs.get(s);
         if (direct != null) return direct.intValue();
+        // START_CHANGE: BUG-2026-0122-20260907-1 - Statements SYNTHESISED by the flow builder (a
+        // ternary merge, a folded condition) are new objects that never passed through the decoder,
+        // so they carry no recorded pc and used to fall back to the line comparison -- which is the
+        // very thing the pc criterion exists to replace. Recover a position from the statement's
+        // line instead, taking the lowest pc that maps to it.
+        int viaLine = lowestPcForLine(s.getLineNumber());
+        if (viaLine >= 0 && !hasChildStatements(s)) return viaLine;
         int best = -1;
         if (s instanceof BlockStatement) best = minPcOf(((BlockStatement) s).getStatements());
         else if (s instanceof IfStatement) best = minPcOf(((IfStatement) s).getThenBody());
@@ -247,6 +283,13 @@ public class TryCatchReconstructor {
             // downstream reconstructors (notably ModernTwrReconstructor) are tuned against, and
             // switching it wholesale regressed try-with-resources collapse. The displacement class
             // of line-based defects is tracked separately as BUG-2026-0122.
+            // BUG-2026-0122: the pc criterion stays restricted to regions WITHOUT line information.
+            // Enabling it for line-bearing classes fixes the displacement it was meant to fix (and
+            // takes the -g:none matrix to 55/55), but on JDK 25 java.base it also changes the emitted
+            // `catch (` count by 756. Part of that is removing genuine FABRICATIONS -- v1.12.0 emitted
+            // 19 catch clauses for sun/security/ec/SunEC$ProviderService, which has exactly ONE
+            // exception region -- but at least one real handler is lost with them, and losing a
+            // handler is the gravest defect class here. Not shipped until the two can be separated.
             boolean usePc100 = tryStartLine < 0 && statementPcs != null && !statementPcs.isEmpty();
             if (tryStartLine < 0 && !usePc100) return null;
             // END_CHANGE: BUG-2026-0100-6
@@ -279,14 +322,48 @@ public class TryCatchReconstructor {
             // END_CHANGE: BUG-2026-0056-1
 
             boolean inTryRegion = false;
+            // BUG-2026-0122: set once a positioned statement past the try region is seen, so a later
+            // unpositioned statement is not pulled back into the try.
+            boolean leftTryRegion122 = false;
+            int groupEndPc122 = tryEndPc;
+            for (int gi = 0; gi < groupEntries.size(); gi++) {
+                if (groupEntries.get(gi).endPc > groupEndPc122) groupEndPc122 = groupEntries.get(gi).endPc;
+            }
             for (Statement s : statements) {
                 int sLine = s.getLineNumber();
                 // START_CHANGE: BUG-2026-0100-20260905-7 - Prefer the exact bytecode range.
                 // A statement decoded at pc P belongs to the try region iff P is inside
                 // [startPc, endPc) of the exception entry -- exactly the JVM's own rule.
                 int sPc100 = usePc100 ? minPcOf(s) : -1;
+                // START_CHANGE: BUG-2026-0122-20260907-6 - A group can hold SEVERAL protected
+                // ranges sharing one handler (javac splits a single source `try` whose body has
+                // gaps: sun/security/ec/SunEC$ProviderService.newInstance has three, [46,71)
+                // [72,88) [89,105), all targeting handler 817). Testing membership against
+                // firstEntry alone shrank the try body to the first fragment and the group was then
+                // rejected, dropping the handler entirely. Membership is the UNION of the group's
+                // ranges.
+                boolean inAnyRange122 = false;
                 if (sPc100 >= 0) {
-                    if (sPc100 >= tryStartPc && sPc100 < tryEndPc) {
+                    for (int gi = 0; gi < groupEntries.size(); gi++) {
+                        CodeAttribute.ExceptionEntry ge = groupEntries.get(gi);
+                        if (sPc100 >= ge.startPc && sPc100 < ge.endPc) { inAnyRange122 = true; break; }
+                    }
+                }
+                // END_CHANGE: BUG-2026-0122-6
+                // START_CHANGE: BUG-2026-0122-20260907-3 - A statement the flow builder SYNTHESISED
+                // (a merged ternary is the common one) carries neither a recorded pc nor a line: it
+                // is a new object built from several blocks, so `pc=-1 line=0`. Classifying it by
+                // line then always failed and it was pushed past the catch -- `r = o == null ? 1 : 2;`
+                // whose bytecode sits at pc 5..15, inside the try range [2,16), was emitted after the
+                // handler. Statement ORDER is preserved from the decode, so an unpositioned statement
+                // belongs wherever its predecessor went.
+                if (usePc100 && sPc100 < 0 && sLine <= 0 && inTryRegion && !leftTryRegion122) {
+                    tryBody.add(s);
+                    continue;
+                }
+                if (sPc100 >= 0 && !inAnyRange122 && sPc100 >= groupEndPc122) leftTryRegion122 = true;
+                if (sPc100 >= 0) {
+                    if (inAnyRange122) {
                         inTryRegion = true;
                         tryBody.add(s);
                     } else if (!inTryRegion) {
