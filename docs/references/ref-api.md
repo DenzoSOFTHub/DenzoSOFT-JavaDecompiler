@@ -1,6 +1,6 @@
 # API Reference
 
-This document covers the Javassist-like class inspection API provided by DenzoSOFT Java Decompiler. All classes are in the `it.denzosoft.javadecompiler.api.classmodel` package.
+This document covers the class inspection API, inspired by Javassist, provided by DenzoSOFT Java Decompiler. All classes are in the `it.denzosoft.javadecompiler.api.classmodel` package.
 
 ---
 

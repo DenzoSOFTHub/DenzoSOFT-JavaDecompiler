@@ -8,11 +8,11 @@ DenzoSOFT Java Decompiler is an open-source Java decompiler that reconstructs Ja
 
 ## Acknowledgements
 
-This project is based on and extends the work of **[JD-Core](https://github.com/java-decompiler/jd-core)**, the Java Decompiler core library originally created by **Emmanuel Dupuy**.
+This project is inspired by **[JD-Core](https://github.com/java-decompiler/jd-core)**, the Java Decompiler core library created by **Emmanuel Dupuy**.
 
-JD-Core is a standalone Java library that reconstructs Java source code from compiled bytecode. It is the engine behind the popular [JD-GUI](https://github.com/java-decompiler/jd-gui) graphical decompiler. The original project is distributed under the **GPLv3 license**.
+JD-Core is a standalone Java library that reconstructs Java source code from compiled bytecode. It is the engine behind the [JD-GUI](https://github.com/java-decompiler/jd-gui) graphical decompiler. JD-Core is distributed under the **GPLv3 license**.
 
-DenzoSOFT Java Decompiler takes the architectural concepts of JD-Core (pipeline-based decompilation with deserializer, converter, and writer stages) and extends them with a clean-room implementation under `it.denzosoft.javadecompiler`.
+DenzoSOFT Java Decompiler draws on the architectural concepts of JD-Core (pipeline-based decompilation with deserializer, converter, and writer stages) with its own clean-room implementation under `it.denzosoft.javadecompiler`.
 
 We gratefully acknowledge the contributions of Emmanuel Dupuy and all JD-Core contributors for laying the groundwork that made this project possible.
 
@@ -97,7 +97,7 @@ This is a Copyleft license that gives the user the right to use, copy and modify
 - **Security limits**: Max bytecode size, max recursion depth, max AST nodes
 
 ### Tools
-- **Swing GUI**: JD-GUI style graphical interface with tabbed JAR browsing, package tree, syntax-highlighted source viewer, drag-and-drop, find (Ctrl+F)
+- **Swing GUI**: graphical interface, inspired by JD-GUI, with tabbed JAR browsing, package tree, syntax-highlighted source viewer, drag-and-drop, find (Ctrl+F)
 - **CLI**: Single-class and JAR decompilation
 - **Batch mode**: Parallel decompilation of entire JARs/directories with thread pool
 - **Line number alignment**: Preserves original source line numbers by default (use `--compact` for dense output)
@@ -105,7 +105,7 @@ This is a Copyleft license that gives the user the right to use, copy and modify
 - **Native method info**: Optional `--show-native-info` displays JNI function names and parameter types
 - **Trace mode**: Per-class diagnostic trace file for troubleshooting (see below)
 - **Library API**: Simple `Loader`/`Printer` interfaces for embedding
-- **Class inspection API**: Javassist-like ClassPool/CtClass/CtMethod/CtField for programmatic navigation
+- **Class inspection API**: ClassPool/CtClass/CtMethod/CtField, inspired by Javassist, for programmatic navigation
 - **Benchmark tool**: Built-in performance measurement
 
 ## Usage
@@ -128,7 +128,7 @@ java -jar denzosoft-decompiler.jar --show-native-info NativeLib.class
 # Decompile a class from a .jar
 java -jar denzosoft-decompiler.jar myapp.jar com/example/MyClass
 
-# Launch graphical interface (JD-GUI style)
+# Launch graphical interface
 java -jar denzosoft-decompiler.jar --gui
 java -jar denzosoft-decompiler.jar --gui myapp.jar
 
@@ -317,9 +317,9 @@ BatchDecompiler.BatchResult result = batch.decompileJar(jarFile);
 System.out.println("Decompiled " + result.successCount + "/" + result.totalClasses);
 ```
 
-### Class Inspection API (Javassist-like)
+### Class Inspection API
 
-A read-only API for programmatic inspection of `.class` files, similar to Javassist's `CtClass`/`CtMethod`/`CtField`. No bytecode modification, only navigation and analysis.
+A read-only API for programmatic inspection of `.class` files, inspired by Javassist's `CtClass`/`CtMethod`/`CtField`. No bytecode modification, only navigation and analysis.
 
 ```java
 import it.denzosoft.javadecompiler.api.classmodel.*;
@@ -475,7 +475,7 @@ The decompiler transforms binary `.class` files into Java source code through a 
 ```
 it.denzosoft.javadecompiler
 ├── api/
-│   ├── classmodel/                # Javassist-like class inspection API
+│   ├── classmodel/                # Class inspection API
 │   │   ├── ClassPool              #   Class loader and cache
 │   │   ├── CtClass                #   Class metadata and navigation
 │   │   ├── CtField                #   Field metadata
