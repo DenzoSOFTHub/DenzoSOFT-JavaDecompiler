@@ -28,8 +28,8 @@ single JAR that works three ways:
 
 - a **Swing GUI** for browsing archives (`.jar`, `.war`, `.ear`, `.apk`) and reading classes,
 - a **command line** for one class at a time or for parallel batch runs over a whole archive or directory,
-- a **library API** (`DenzoDecompiler`, `Loader`, `Printer`), plus a read-only, Javassist-like
-  **class inspection API** (`ClassPool`, `CtClass`, ...).
+- a **library API** (`DenzoDecompiler`, `Loader`, `Printer`), plus a read-only **class inspection
+  API** (`ClassPool`, `CtClass`, ...), inspired by Javassist.
 
 | Property | Value |
 |---|---|
@@ -37,7 +37,7 @@ single JAR that works three ways:
 | Runtime required | Java 6 or later (the JAR is compiled to Java 6 bytecode) |
 | Dependencies | None. Only JDK classes are used. |
 | License | GPLv3 |
-| Lineage | Based on the architecture of JD-Core by Emmanuel Dupuy, extended as a clean-room implementation in `it.denzosoft.javadecompiler` |
+| Lineage | Inspired by JD-Core by Emmanuel Dupuy; its own clean-room implementation in `it.denzosoft.javadecompiler` |
 
 Language features it reconstructs include generics, enums, annotations, lambdas and method references,
 string switch, try-with-resources, records, sealed types, switch expressions, pattern matching for
@@ -768,7 +768,7 @@ As of v1.13.0:
 
 ## 8. Class inspection API
 
-Package `it.denzosoft.javadecompiler.api.classmodel` is a read-only, Javassist-like view of class files:
+Package `it.denzosoft.javadecompiler.api.classmodel` is a read-only view of class files, inspired by Javassist:
 metadata, members, annotations, generics, records and sealed types. It cannot modify bytecode. The
 full method list is in [ref-api.md](../references/ref-api.md).
 
