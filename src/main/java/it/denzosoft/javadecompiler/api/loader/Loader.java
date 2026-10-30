@@ -1,6 +1,6 @@
 /*
  * DenzoSOFT Java Decompiler
- * Copyright (c) 2024-2026 DenzoSOFT. All rights reserved.
+ * Copyright (c) 2024-2026 DenzoSOFT. Distributed under the GNU GPLv3 (see LICENSE).
  */
 package it.denzosoft.javadecompiler.api.loader;
 

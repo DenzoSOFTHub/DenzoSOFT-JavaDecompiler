@@ -59,8 +59,13 @@ We gratefully acknowledge the contributions of Emmanuel Dupuy and all JD-Core co
 
 ## License
 
-This project is distributed under the **GPLv3 license**.
-This is a Copyleft license that gives the user the right to use, copy and modify the code freely for non-commercial purposes.
+This project is distributed under the **GNU General Public License v3.0** (GPLv3); the full text is in
+[LICENSE](LICENSE).
+
+GPLv3 is a copyleft license. You may use, study, copy, modify and distribute the software, **including
+for commercial purposes**. If you distribute the program or a work based on it, you must do so under
+the GPLv3 and make the corresponding source code available. The software is provided without
+warranty.
 
 ## Features
 

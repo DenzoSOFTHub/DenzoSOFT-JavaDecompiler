@@ -36,7 +36,7 @@ single JAR that works three ways:
 | Class file versions read | Java 1.0 to Java 25 (major versions 45 to 69). Newer class files are read on a best-effort basis: a class that uses no new construct decompiles; an unknown constant-pool entry is still an error. |
 | Runtime required | Java 6 or later (the JAR is compiled to Java 6 bytecode) |
 | Dependencies | None. Only JDK classes are used. |
-| License | GPLv3 |
+| License | GNU GPLv3 ([LICENSE](../../LICENSE)): free to use, modify and distribute, including commercially; distributed derivative works must also be GPLv3 with source |
 | Lineage | Inspired by JD-Core by Emmanuel Dupuy; its own clean-room implementation in `it.denzosoft.javadecompiler` |
 
 Language features it reconstructs include generics, enums, annotations, lambdas and method references,

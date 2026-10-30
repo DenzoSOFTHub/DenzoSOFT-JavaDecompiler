@@ -12,6 +12,14 @@
     <name>DenzoSOFT Java Decompiler</name>
     <description>A Java bytecode decompiler supporting Java 1.0 through Java 25, with no external dependencies.</description>
 
+    <licenses>
+        <license>
+            <name>GNU General Public License v3.0</name>
+            <url>https://www.gnu.org/licenses/gpl-3.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.source>1.6</maven.compiler.source>
