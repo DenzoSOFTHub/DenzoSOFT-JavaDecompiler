@@ -2,10 +2,10 @@
 
 Planning document for optimizations, structural improvements, stability, compatibility and maintainability.
 
-Current state: **v1.13.0 (ready, not yet tagged)** — construct matrix (Java 1.0–25, 55 top-level
-classes) **55/55** at javac-default debug, **53/55** at `-g`, **54/55** at `-g:none`; JDK 25
+Current state: **v1.13.0 (released 2026-10-30)** — construct matrix (Java 1.0–25, 55 top-level
+classes) **55/55** at javac-default debug, **53/55** at `-g`, **55/55** at `-g:none`; JDK 25
 `java.base` 3,376 classes with 0 errors; ~900 classes/sec single-thread (2,300/s at 4 threads);
-50 automated tests. Decompilation is thread-safe and deterministic. Java 26+ class files decompile on a best-effort basis rather than being refused.
+81 automated tests (80 passing; the stale `BasicClass` expectation is the known failure). Decompilation is thread-safe and deterministic. Java 26+ class files decompile on a best-effort basis rather than being refused.
 
 The v1.10.0 claim of "57/57, 0 known silent miscompilations" was measured only at javac's default
 debug settings and only with a recompile oracle. The 2026-09-05 audit
@@ -32,12 +32,19 @@ census, and found three silent-semantics defects — all fixed in v1.11.0 — pl
   control flow, branch declaration hoisting. Verified dominance over official JD-Core 1.3.0
   (57/57 vs 44/57; corpus 7 vs 39+4-no-output errors).
 
-## 1b. v1.13.0 (ready, not yet tagged)
+## 1b. v1.13.0 (released 2026-10-30)
 
 Thread safety and determinism (BUG-2026-0124): a single static field in `BooleanSimplifier` held
 per-method state, so concurrent decompilation raced on it and batch output differed in 211 of 3,376
 java.base classes run to run, sometimes emitting `return 0;` from a boolean method. Also constant and
-array-class pattern-switch labels (BUG-2026-0123, partial; raw dispatches 7 -> 5).
+array-class pattern-switch labels (BUG-2026-0127; raw dispatches 7 -> 5), the nested `finally` copy
+that made a `finally` run twice (BUG-2026-0129), and the 65-item `rt.jar` correctness campaign
+(BUG-2026-0136..0200) whose item files were reconstructed from the code at release time.
+
+**Owed by v1.14.0, before new feature work:** dedicated regression tests for the 40 campaign items that
+have none; re-verification of the open audit items (BUG-2026-0110..0120, 0130..0135) against the
+campaign code; BUG-2026-0132, whose fixture now recompiles but runs the loop tail inside the lock
+(the silent class); BUG-2026-0203 (record-pattern switch expressions, no diagnostic).
 
 ## 1c. v1.12.0
 
@@ -48,8 +55,8 @@ were lost and rendered as the uncompilable `case  _` (BUG-2026-0108).
 
 The audit had filed 0109 as one defect; it was two. The expression form already worked, the statement
 form failed only for want of a value merge (its arm bodies were intact, so an AST pass rebuilds it),
-and the guarded / multi-label form loses its arm values on the operand stack — that half is
-BUG-2026-0123 and needs flow-builder work.
+and the guarded form loses its arm values on the operand stack — that half is
+BUG-2026-0128 and needs flow-builder work.
 
 ## 1d. v1.11.0
 
@@ -66,9 +73,10 @@ so slot-sharing variables collapsed (BUG-2026-0103); the category-2 `dup` family
 
 Highest value first, from the audit backlog (`docs/tracking/track-bugs.md`):
 
-- **BUG-2026-0123** guarded / multi-label / constant-label pattern switches lose their arm values
-  (7 java.base bodies, all flagged). Needs the flow builder to rebuild the stack-carried merge.
-- **BUG-2026-0122** try-region membership still uses source lines when they exist.
+- **BUG-2026-0128** guarded pattern switches with an index restart lose their arm values
+  (5 java.base bodies, all flagged). Needs the flow builder to rebuild the stack-carried merge.
+- **BUG-2026-0126** try-region membership still uses source lines when they exist, so output depends
+  on source formatting.
 
 - **J21SwitchPattern statement-form fallback** (4 corpus errors): statement-form guarded pattern
   switches with stack-carried arm values fall back to raw typeSwitch in rare shapes.
@@ -86,12 +94,22 @@ Highest value first, from the audit backlog (`docs/tracking/track-bugs.md`):
 
 ## 3. Structural / maintainability
 
-- **JD pipeline (cfg/jd/, flag `-Ddenzo.jd.pipeline`)**: now strictly behind the legacy path on every
-  corpus class (30 vs 8 errors). Decide: invest to parity or retire to reduce maintenance surface.
-- **ClassFileToJavaSyntaxConverter size** (~4k lines): extract decode helpers (iinc/indy/concat,
+- **JD pipeline (cfg/jd/, flag `-Ddenzo.jd.pipeline`)**: **DECIDED 2026-09-07 — retire.** Tracked as
+  IMP-2026-0072. The 2026-09-07 analysis measured it losing control flow outright: with the flag on, a
+  `for` becomes a single `if`/`else return` with the back-edge dropped (which COMPILES in a `void`
+  method and is silently wrong), 36/55 on the construct matrix in all three debug modes against
+  legacy's 55/53/55, and 19 `while (` / 8 `for (` across `java.base` against legacy's 4,707 / 2,819.
+  Its one live contribution is the record-deconstruction fold on the selective route — and measurement
+  showed that covers **two** shapes, not the four previously believed. Order: freeze the working shapes
+  (done, runtime-verified), port the value merge to the legacy builder (BUG-2026-0128), route
+  record-switch methods to legacy, then delete `cfg/jd/` (~3,800 lines). Do not invest in parity.
+- **ClassFileToJavaSyntaxConverter size** (5,610 lines as of 2026-09-07): extract decode helpers (iinc/indy/concat,
   synchronized reconstruction) into focused collaborators.
-- **Automated semantic-diff harness**: promote the runtime original-vs-recompiled comparison used in
-  v1.10.0 verification into a standing test stage (currently matrix classes have only one run() harness).
+- **Automated semantic-diff harness**: promote the runtime original-vs-recompiled comparison into a
+  standing test stage (currently matrix classes have only one run() harness). **The rule is already in
+  force** — CLAUDE.md now makes the original source the oracle and rejects "it recompiles" as a
+  verification on its own; what remains is automating the `original → run` vs `decompile → recompile →
+  run` comparison instead of doing it by hand per fixture.
 
 ## 4. Performance / tooling opportunities
 

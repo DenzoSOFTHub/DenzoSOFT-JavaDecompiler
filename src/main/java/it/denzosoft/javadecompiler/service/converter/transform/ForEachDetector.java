@@ -405,7 +405,14 @@ public final class ForEachDetector {
         // BUG-2026-0080 (RC-6): the element type of an array foreach is the array's component type, not the
         // (sometimes mis-decoded) type of the synthetic element-copy local.
         if (arrayExpr != null && arrayExpr.getType() instanceof it.denzosoft.javadecompiler.model.javasyntax.type.ArrayType) {
-            elementType = ((it.denzosoft.javadecompiler.model.javasyntax.type.ArrayType) arrayExpr.getType()).getElementType();
+            // START_CHANGE: BUG-2026-0186-20261018-1 - getElementType() is the BASE type; the
+            // component of a String[][] is String[], not String (`for (String c : cs)` with cs a
+            // String[][] did not compile).
+            it.denzosoft.javadecompiler.model.javasyntax.type.ArrayType at186 =
+                (it.denzosoft.javadecompiler.model.javasyntax.type.ArrayType) arrayExpr.getType();
+            elementType = at186.getDimension() <= 1 ? at186.getElementType()
+                : new it.denzosoft.javadecompiler.model.javasyntax.type.ArrayType(at186.getElementType(), at186.getDimension() - 1);
+            // END_CHANGE: BUG-2026-0186-1
         }
 
         Statement lastBodyStmt = bodyStmts.get(bodyStmts.size() - 1);

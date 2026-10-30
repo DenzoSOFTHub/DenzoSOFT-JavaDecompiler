@@ -99,7 +99,16 @@ public abstract class AstLocalRewriter {
                 catches.add(new TryCatchStatement.CatchClause(cc.exceptionTypes, cc.variableName, rewrite(cc.body)));
             }
             Statement fin = t.hasFinally() ? rewrite(t.getFinallyBody()) : null;
-            return new TryCatchStatement(t.getLineNumber(), rewrite(t.getTryBody()), catches, fin, t.getResources());
+            // START_CHANGE: BUG-2026-0180-20261018-7 - Resources are statements too: a local
+            // rename (e.g. a captured variable getting its val$ source name) must reach the
+            // try-with-resources header, or the header and the body disagree on the name.
+            List<Statement> res = null;
+            if (t.getResources() != null) {
+                res = new ArrayList<Statement>();
+                for (Statement r : t.getResources()) res.add(rewrite(r));
+            }
+            return new TryCatchStatement(t.getLineNumber(), rewrite(t.getTryBody()), catches, fin, res);
+            // END_CHANGE: BUG-2026-0180-7
         }
         if (s instanceof SwitchStatement) {
             SwitchStatement sw = (SwitchStatement) s;

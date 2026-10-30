@@ -415,3 +415,13 @@ ClassPool pool = new ClassPool();
 CtClass cls = pool.makeClass(bytecode);
 System.out.println("Loaded: " + cls.getName());
 ```
+
+---
+
+## Thread Safety
+
+- **`DenzoDecompiler`** (the decompilation entry point behind `CtClass.decompile()`): since v1.13.0
+  one instance is safe to share across threads, and the same input always yields byte-identical
+  output. Each `decompile()` call builds its own converter and writer.
+- **`ClassPool`** is **not** thread-safe: its class and byte caches are plain `HashMap`s. Use one
+  pool per thread, or populate it from one thread and synchronize access externally.

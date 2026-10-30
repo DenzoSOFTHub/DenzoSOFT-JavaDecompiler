@@ -392,19 +392,17 @@ public final class BooleanSimplifier {
         // START_CHANGE: ISS-2026-0009-20260323-1 - Simplify lcmp/fcmp/dcmp patterns: (a <=> b) OP 0 -> a OP b
         if (left instanceof BinaryOperatorExpression) {
             BinaryOperatorExpression inner = (BinaryOperatorExpression) left;
-            if ("<=>".equals(inner.getOperator()) && isZeroConstant(right)) {
-                return new BinaryOperatorExpression(boe.getLineNumber(), PrimitiveType.BOOLEAN,
-                    inner.getLeft(), op, inner.getRight());
+            if (inner.getOperator().startsWith("<=>") && isZeroConstant(right)) {
+                return compare177(boe.getLineNumber(), inner, op); // BUG-2026-0177
             }
         }
         if (right instanceof BinaryOperatorExpression) {
             BinaryOperatorExpression inner = (BinaryOperatorExpression) right;
-            if ("<=>".equals(inner.getOperator()) && isZeroConstant(left)) {
+            if (inner.getOperator().startsWith("<=>") && isZeroConstant(left)) {
                 // 0 OP (a <=> b) -> flip: a FLIPPED_OP b
                 String flipped = flipOperator(op);
                 if (flipped != null) {
-                    return new BinaryOperatorExpression(boe.getLineNumber(), PrimitiveType.BOOLEAN,
-                        inner.getLeft(), flipped, inner.getRight());
+                    return compare177(boe.getLineNumber(), inner, flipped); // BUG-2026-0177
                 }
             }
         }
@@ -515,6 +513,47 @@ public final class BooleanSimplifier {
     }
 
     // START_CHANGE: ISS-2026-0009-20260323-2 - Flip comparison operator for reversed operands
+    // START_CHANGE: BUG-2026-0177-20261018-2 - `(a <=> b) OP 0` as a source comparison. For lcmp
+    // (no NaN) it is `a OP b`. fcmpg/dcmpg yield 1 for NaN, so the comparisons that are TRUE on 1
+    // (`>`, `>=`) are the negation of the opposite source test; fcmpl/dcmpl yield -1, so `<`, `<=`
+    // are. javac emits exactly these shapes for `!(x < y)` and friends.
+    private static Expression compare177(int line, BinaryOperatorExpression cmp, String op) {
+        String v = cmp.getOperator();
+        String src = op;
+        boolean negate = false;
+        if ("<=>g".equals(v)) {
+            if (">".equals(op)) { src = "<="; negate = true; }
+            else if (">=".equals(op)) { src = "<"; negate = true; }
+        } else if ("<=>l".equals(v)) {
+            if ("<".equals(op)) { src = ">="; negate = true; }
+            else if ("<=".equals(op)) { src = ">"; negate = true; }
+        }
+        Expression r = new BinaryOperatorExpression(line, PrimitiveType.BOOLEAN, cmp.getLeft(), src, cmp.getRight());
+        return negate ? new UnaryOperatorExpression(line, PrimitiveType.BOOLEAN, "!", r, true) : r;
+    }
+    // END_CHANGE: BUG-2026-0177-2
+
+    // START_CHANGE: BUG-2026-0185-20261018-1 - Entry point for the writer: `(a <=> b) OP 0` /
+    // `0 OP (a <=> b)` built by a pass that runs after this simplifier (a negated if condition)
+    // must still not reach the output as `Double.compare(a, b) OP 0`, which differs from
+    // dcmp/fcmp for -0.0 and NaN. Returns the exact source comparison, or null.
+    public static Expression compareAsSource(BinaryOperatorExpression boe) {
+        String op = boe.getOperator();
+        if (!"<".equals(op) && !"<=".equals(op) && !">".equals(op) && !">=".equals(op)
+                && !"==".equals(op) && !"!=".equals(op)) return null;
+        if (boe.getLeft() instanceof BinaryOperatorExpression && isZeroConstant(boe.getRight())
+                && ((BinaryOperatorExpression) boe.getLeft()).getOperator().startsWith("<=>")) {
+            return compare177(boe.getLineNumber(), (BinaryOperatorExpression) boe.getLeft(), op);
+        }
+        if (boe.getRight() instanceof BinaryOperatorExpression && isZeroConstant(boe.getLeft())
+                && ((BinaryOperatorExpression) boe.getRight()).getOperator().startsWith("<=>")) {
+            String f = flipOperator(op);
+            if (f != null) return compare177(boe.getLineNumber(), (BinaryOperatorExpression) boe.getRight(), f);
+        }
+        return null;
+    }
+    // END_CHANGE: BUG-2026-0185-1
+
     private static String flipOperator(String op) {
         if ("<".equals(op)) return ">";
         if (">".equals(op)) return "<";

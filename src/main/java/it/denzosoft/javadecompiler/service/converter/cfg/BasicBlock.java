@@ -79,6 +79,16 @@ public class BasicBlock {
      *  reuses this to reconstruct its entry stack. Null = not yet decoded. */
     public java.util.List<Expression> exitStack;
     // END_CHANGE: BUG-2026-0051-1
+    // START_CHANGE: BUG-2026-0147-20261017-1 - The object seeded on top of this block's entry
+    // stack by its last decode (null when nothing was seeded). A ternary merge locates its
+    // arm-value reference by identity with THIS object: the arm blocks may have been re-decoded
+    // since, so their own stack tops are no longer the objects the merge block consumed.
+    public Expression entryStackTop;
+    // END_CHANGE: BUG-2026-0147-1
+    // START_CHANGE: BUG-2026-0152-20261017-1 - Explicit entry stack for the SafeStructurer's
+    // decode (bottom first); when non-null it replaces the predecessor-based seeding.
+    public java.util.List<Expression> forcedEntryStack;
+    // END_CHANGE: BUG-2026-0152-1
 
     // START_CHANGE: BUG-2026-0050-20260420-1 - Mark blocks reached via the exception handler
     // mechanism. The JVM pushes the caught exception onto the operand stack before branching

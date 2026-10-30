@@ -53,6 +53,17 @@ public class StructuredFlowBuilder {
     // turning `continue` into loop exit. while(true) loops push a -1 sentinel (their continue is
     // a backward goto, already handled) so a nested goto can never match an OUTER loop's entry.
     private List<Integer> loopContinueTargets = new ArrayList<Integer>();
+    // BUG-2026-0138: header PCs of the enclosing loops being built (while(true) and
+    // while(cond)), and the `continue` statements synthesised from backward gotos to them.
+    private List<Integer> whileTrueHeaderStack = new ArrayList<Integer>();
+    private final Set<Statement> backEdgeContinues = Collections.newSetFromMap(new IdentityHashMap<Statement, Boolean>());
+
+    /** Drop a synthesised trailing `continue` (the loop's own closing back-edge). */
+    private void stripTrailingBackEdgeContinue(List<Statement> body) {
+        if (!body.isEmpty() && backEdgeContinues.contains(body.get(body.size() - 1))) {
+            body.remove(body.size() - 1);
+        }
+    }
     // END_CHANGE: BUG-2026-0086-3
     // START_CHANGE: BUG-2026-0083-20260610-3 - Ternaries whose merge block carries the merged
     // value onward on the operand stack (e.g. the first of two ternary call arguments: the
@@ -80,6 +91,12 @@ public class StructuredFlowBuilder {
     private boolean methodReturnsBoolean = false;
 
     public void setMethodReturnsBoolean(boolean b) { this.methodReturnsBoolean = b; }
+
+    // START_CHANGE: BUG-2026-0140-20261017-6 - Class-file language level gate for pattern bindings.
+    private boolean allowPatternBinding = true;
+
+    public void setAllowPatternBinding(boolean b) { this.allowPatternBinding = b; }
+    // END_CHANGE: BUG-2026-0140-6
     // END_CHANGE: BUG-2026-0066-15
 
     // START_CHANGE: BUG-2026-0067-20260610-53 - Bootstrap label lookup for unnamed pattern arms.
@@ -113,16 +130,39 @@ public class StructuredFlowBuilder {
 
         // Pre-scan: identify do-while headers (targets of backward conditional branches)
         doWhileHeaders.clear();
+        // START_CHANGE: BUG-2026-0138-20261015-1 - A conditional back-jump is a do-while
+        // condition only when it is the LAST back-edge into its target. When a later block also
+        // jumps back there (`while ((c = read()) != -1) { ..; if (c == '\n') ..; }` compiles the
+        // inner `if` to a conditional jump straight to the header, followed by the body's
+        // `goto header`), the conditional is a `continue`-shaped branch inside a while loop.
+        // Taking it for a do-while condition wrapped the whole method in a bogus
+        // `do { ... } while (var1 != 10);` that referenced an out-of-scope local.
+        Map<Integer, Integer> lastBackEdgeSrc138 = new HashMap<Integer, Integer>();
+        for (BasicBlock block : blocks) {
+            BasicBlock[] succ138 = { block.trueSuccessor, block.falseSuccessor };
+            for (int k = 0; k < 2; k++) {
+                BasicBlock t = succ138[k];
+                if (t == null || t.startPc > block.startPc) continue;
+                if (k == 1 && !block.isConditional()) continue;
+                Integer prev = lastBackEdgeSrc138.get(Integer.valueOf(t.startPc));
+                if (prev == null || block.startPc > prev.intValue()) {
+                    lastBackEdgeSrc138.put(Integer.valueOf(t.startPc), Integer.valueOf(block.startPc));
+                }
+            }
+        }
         for (BasicBlock block : blocks) {
             if (block.isConditional()) {
-                if (block.trueSuccessor != null && block.trueSuccessor.startPc <= block.startPc) {
+                if (block.trueSuccessor != null && block.trueSuccessor.startPc <= block.startPc
+                        && lastBackEdgeSrc138.get(Integer.valueOf(block.trueSuccessor.startPc)).intValue() == block.startPc) {
                     doWhileHeaders.add(block.trueSuccessor.startPc);
                 }
-                if (block.falseSuccessor != null && block.falseSuccessor.startPc <= block.startPc) {
+                if (block.falseSuccessor != null && block.falseSuccessor.startPc <= block.startPc
+                        && lastBackEdgeSrc138.get(Integer.valueOf(block.falseSuccessor.startPc)).intValue() == block.startPc) {
                     doWhileHeaders.add(block.falseSuccessor.startPc);
                 }
             }
         }
+        // END_CHANGE: BUG-2026-0138-1
 
         // START_CHANGE: BUG-2026-0026-20260325-2 - Pre-scan: identify while(true) headers (targets of unconditional backward gotos)
         // Only mark as while(true) if the header is NOT already a while(condition) header
@@ -140,6 +180,15 @@ public class StructuredFlowBuilder {
                     if (trueSucc != null && hasBackEdgeTo(header.startPc, trueSucc)) {
                         isWhileCondition = true;
                     }
+                    // START_CHANGE: BUG-2026-0138-20261015-2 - When BOTH successors of the header
+                    // conditional lead back to it, neither is the loop exit: the header's test is
+                    // an `if` at the top of a `for (;;)` body, not a while condition.
+                    if (isWhileCondition && header.trueSuccessor != null
+                            && header.trueSuccessor.startPc > header.startPc
+                            && hasBackEdgeTo(header.startPc, header.trueSuccessor)) {
+                        isWhileCondition = false;
+                    }
+                    // END_CHANGE: BUG-2026-0138-2
                 }
                 if (isWhileCondition) continue;
                 int headerPc = header.startPc;
@@ -364,7 +413,12 @@ public class StructuredFlowBuilder {
                 // backward goto (already handled); the sentinel keeps a nested goto from matching
                 // an OUTER loop's continue target as a plain `continue`.
                 loopContinueTargets.add(Integer.valueOf(-1));
+                // BUG-2026-0138: a backward goto to this header from inside the body is `continue`.
+                whileTrueHeaderStack.add(Integer.valueOf(block.startPc));
                 buildFromBlock(block, bodyStmts, visited, bodyStopPc);
+                whileTrueHeaderStack.remove(whileTrueHeaderStack.size() - 1);
+                // The loop's own closing back-edge needs no statement.
+                stripTrailingBackEdgeContinue(bodyStmts);
                 loopContinueTargets.remove(loopContinueTargets.size() - 1);
                 // END_CHANGE: BUG-2026-0086-8
                 if (pushedExit078) whileTrueExitStack.remove(whileTrueExitStack.size() - 1);
@@ -654,6 +708,19 @@ public class StructuredFlowBuilder {
             } else if (block.isGoto()) {
                 BasicBlock target = block.trueSuccessor;
                 if (target != null && target.startPc <= block.startPc) {
+                    // START_CHANGE: BUG-2026-0138-20261015-4 - A backward goto to the innermost
+                    // while(true) header is a `continue`. Emitting nothing was right only for the
+                    // loop's physically last goto at the END of the body; nested in an if with code
+                    // after it (`if (c) { pos++; continue; } return cb[pos++];`) the loop-back was
+                    // silently lost and execution fell into the following code. A trailing
+                    // `continue` of the body is removed again by the while(true) builder.
+                    if (!whileTrueHeaderStack.isEmpty()
+                            && whileTrueHeaderStack.get(whileTrueHeaderStack.size() - 1).intValue() == target.startPc) {
+                        ContinueStatement cs138 = new ContinueStatement(block.lineNumber);
+                        backEdgeContinues.add(cs138);
+                        output.add(cs138);
+                    }
+                    // END_CHANGE: BUG-2026-0138-4
                     // Backward goto = loop back-edge (while loop detected)
                     // The loop was already handled in matchConditionalPattern
                     return;
@@ -747,10 +814,39 @@ public class StructuredFlowBuilder {
         }
     }
 
+    // START_CHANGE: BUG-2026-0187-20261018-1 - The merge point a pattern decides is handed to the
+    // caller through lastEffectiveMergePoint, but the if-then/else patterns set it BEFORE building
+    // their bodies, and every nested conditional built inside those bodies consumes and resets the
+    // same field. The caller then fell back to findMergePoint, landed on an already-visited block
+    // and stopped: `if (a == null || !a.equals(b)) { if (dbg) log(); return; } tail();` lost
+    // tail() silently (javax.security FileLoginModule.attemptAuthentication). Each level now
+    // records its decision in its own frame, published to the caller only when it returns.
+    private final List<int[]> mergeFrames187 = new ArrayList<int[]>();
+
+    private void setEffectiveMerge187(int pc) {
+        lastEffectiveMergePoint = pc;
+        if (!mergeFrames187.isEmpty()) mergeFrames187.get(mergeFrames187.size() - 1)[0] = pc;
+    }
+
     /**
      * Match a conditional block to a structured pattern.
      */
     private Statement matchConditionalPattern(BasicBlock condBlock,
+                                                Set<Integer> visited, int stopPc) {
+        int[] frame = new int[]{-1};
+        mergeFrames187.add(frame);
+        Statement r;
+        try {
+            r = matchConditionalPattern0(condBlock, visited, stopPc);
+        } finally {
+            mergeFrames187.remove(mergeFrames187.size() - 1);
+        }
+        lastEffectiveMergePoint = frame[0];
+        return r;
+    }
+    // END_CHANGE: BUG-2026-0187-1
+
+    private Statement matchConditionalPattern0(BasicBlock condBlock,
                                                 Set<Integer> visited, int stopPc) {
         int line = condBlock.lineNumber > 0 ? condBlock.lineNumber : 0;
 
@@ -875,6 +971,10 @@ public class StructuredFlowBuilder {
                 (trueTarget.isGoto() || trueTarget.type == BasicBlock.FALL_THROUGH);
             boolean falseIsValueOnly = falseValue != null &&
                 (falseTarget.statements == null || falseTarget.statements.isEmpty());
+            // BUG-2026-0172: a conditional arm passing the pending receiver through is a nested
+            // ternary, not a value-only arm.
+            if (trueIsValueOnly && isPendingPassThrough(condBlock, trueTarget)) trueIsValueOnly = false;
+            if (falseIsValueOnly && isPendingPassThrough(condBlock, falseTarget)) falseIsValueOnly = false;
 
             // Check if false branch is a nested ternary (conditional block that produces a value)
             boolean falseIsNestedTernary = false;
@@ -977,10 +1077,28 @@ public class StructuredFlowBuilder {
                                 // regular machinery emits it exactly once.
                                 Expression receiver = condBlock.stackTopExpression;
                                 List<Statement> rewritten = new ArrayList<Statement>();
+                                // START_CHANGE: BUG-2026-0147-20261017-4 - Match the merge block's own
+                                // seeded entry value first (exact identity of what it consumed).
+                                Statement seeded147 = null;
+                                int seededIdx147 = -1;
+                                if (mergeBlock.entryStackTop != null) {
+                                    for (int si147 = 0; si147 < mergeBlock.statements.size() && seeded147 == null; si147++) {
+                                        seeded147 = substituteTernaryInStatement(mergeBlock.statements.get(si147), ternary,
+                                            mergeBlock.entryStackTop, mergeBlock.entryStackTop, true);
+                                        if (seeded147 != null) seededIdx147 = si147;
+                                    }
+                                }
+                                if (seeded147 != null) {
+                                    for (int sj147 = 0; sj147 < mergeBlock.statements.size(); sj147++) {
+                                        rewritten.add(sj147 == seededIdx147 ? seeded147 : mergeBlock.statements.get(sj147));
+                                    }
+                                    applyPendingStackTernaries(rewritten);
+                                } else
+                                // END_CHANGE: BUG-2026-0147-4
                                 replaceTernaryInMergeStatements(rewritten, mergeBlock.statements, ternary, trueValue, falseValue, receiver);
                                 mergeBlock.statements.clear();
                                 mergeBlock.statements.addAll(rewritten);
-                                lastEffectiveMergePoint = mergeBlock.startPc;
+                                setEffectiveMerge187(mergeBlock.startPc);
                             } else if (mergeBlock.isConditional() && !visited.contains(mergeBlock.startPc)) {
                                 // No statements: the merged value stays on the operand stack and the
                                 // merge block immediately starts the next condition (chained ternary
@@ -989,7 +1107,7 @@ public class StructuredFlowBuilder {
                                 // references this ternary's arm value via the seeded stack — and
                                 // continue INTO the merge block so the chain keeps being processed.
                                 pendingStackTernaries.add(new Expression[] { trueValue, falseValue, ternary });
-                                lastEffectiveMergePoint = mergeBlock.startPc;
+                                setEffectiveMerge187(mergeBlock.startPc);
                             } else {
                                 visited.add(mergeBlock.startPc);
                                 preStatements.add(new ExpressionStatement(ternary));
@@ -1008,7 +1126,15 @@ public class StructuredFlowBuilder {
 
         // Pattern 1: While loop - condition branches forward, body loops back
         // Header: if (!cond) goto exit; body...; goto header;
-        if (hasBackEdgeTo(condBlock.startPc, trueTarget)) {
+        // START_CHANGE: BUG-2026-0138-20261015-3 - Not a while(cond) loop when the branch
+        // target ALSO returns to the header (see BUG-2026-0138-2): `for (;;) { if (pos >= lim)
+        // {..} if (skipLF) {.. continue; } return cb[pos++]; }` was emitted as
+        // `while (pos >= lim) {..}` followed by the rest OUTSIDE the loop, silently losing the
+        // loop-back of the `continue` path. The while(true) machinery owns such headers.
+        if (hasBackEdgeTo(condBlock.startPc, trueTarget)
+                && !(falseTarget.startPc > condBlock.startPc
+                     && hasBackEdgeTo(condBlock.startPc, falseTarget))) {
+        // END_CHANGE: BUG-2026-0138-3
             // START_CHANGE: ISS-2026-0007-20260324-2 - Push outer loop merge point for labeled break
             int loopExitPc = falseTarget != null ? falseTarget.startPc : -1;
             if (loopExitPc >= 0) {
@@ -1029,7 +1155,11 @@ public class StructuredFlowBuilder {
             // END_CHANGE: BUG-2026-0086-5
             // while(condition) { body }
             List<Statement> body = new ArrayList<Statement>();
+            // BUG-2026-0138: backward gotos to this header inside the body are `continue`.
+            whileTrueHeaderStack.add(Integer.valueOf(condBlock.startPc));
             buildFromBlock(trueTarget, body, visited, condBlock.startPc);
+            whileTrueHeaderStack.remove(whileTrueHeaderStack.size() - 1);
+            stripTrailingBackEdgeContinue(body);
 
             // START_CHANGE: ISS-2026-0007-20260324-3 - Pop outer loop merge point
             // START_CHANGE: BUG-2026-0086-20260610-6 - and the continue target.
@@ -1173,7 +1303,7 @@ public class StructuredFlowBuilder {
         // END_CHANGE: BUG-2026-0014-1
 
         if (mergePoint >= 0) {
-            lastEffectiveMergePoint = mergePoint;
+            setEffectiveMerge187(mergePoint);
             // Check if it's if-then (no else) or if-then-else
             boolean hasElse = false;
             BasicBlock trueEnd = findBlockEnd(trueTarget, mergePoint);
@@ -1182,6 +1312,26 @@ public class StructuredFlowBuilder {
                 falseTarget.startPc != mergePoint) {
                 hasElse = true;
             }
+            // START_CHANGE: BUG-2026-0171-20261018-1 - findBlockEnd's nested-conditional scan is not
+            // bounded by the then-region: when the then-body ends with a loop, the scan picked up the
+            // ELSE body's loop back-edge as a merge, walked into the else region and returned its
+            // header. hasElse came out false and the if-then path built the ELSE body as the
+            // (negated) then-body, silently dropping the whole then-branch
+            // (`if (t == 4) { r = false; for(..){..} } else { r = true; for(..){..} }` printed as
+            // `if (t != 4) { r = true; for .. }`; xerces RangeToken.match). The block that physically
+            // closes the then-region being a `goto merge` is the definitive if/else shape.
+            if (!hasElse && falseTarget.startPc != mergePoint
+                    && falseTarget.startPc > trueTarget.startPc && mergePoint > falseTarget.startPc) {
+                for (BasicBlock b171 : cfg.getBlocks()) {
+                    if (b171.startPc >= trueTarget.startPc && b171.endPc == falseTarget.startPc) {
+                        if (b171.isGoto() && b171.branchTargetPc == mergePoint) {
+                            hasElse = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            // END_CHANGE: BUG-2026-0171-1
 
             List<Statement> preStatements = new ArrayList<Statement>();
             preStatements.addAll(condBlock.statements);
@@ -1220,6 +1370,23 @@ public class StructuredFlowBuilder {
                 if (falseTarget.startPc == mergePoint) {
                     // Branch target is merge → fall-through is then-body
                     buildFromBlock(trueTarget, thenBody, visited, mergePoint);
+                    // START_CHANGE: BUG-2026-0136-20261015-2 - Inside a while(true) body the
+                    // region bound IS the loop exit, which is reachable only by a jump: a
+                    // conditional whose branch target is that exit is a loop `break`, not an
+                    // if-then merge. Without it `for (x : list) { try { return f(x); } catch
+                    // (E e) {} } throw ...;` (handler back-edge => while(true)) lost its exit
+                    // test and became an infinite loop. `if (!c) break; <then>` is equivalent to
+                    // `if (c) { <then> } else break;`.
+                    if (stopPc >= 0 && mergePoint == stopPc && !whileTrueExitStack.isEmpty()
+                            && whileTrueExitStack.get(whileTrueExitStack.size() - 1).intValue() == mergePoint) {
+                        List<Statement> brk = new ArrayList<Statement>();
+                        brk.add(new BreakStatement(line));
+                        preStatements.add(new IfStatement(line, negateCondition(condition, line),
+                            new BlockStatement(line, brk)));
+                        preStatements.addAll(thenBody);
+                        return new BlockStatement(line, preStatements);
+                    }
+                    // END_CHANGE: BUG-2026-0136-2
                 } else {
                     // Fall-through goes to merge → branch target is then-body (condition inverted)
                     buildFromBlock(falseTarget, thenBody, visited, mergePoint);
@@ -1235,7 +1402,7 @@ public class StructuredFlowBuilder {
 
         // Pattern 3: Simple if-then with return in body
         if (trueTarget != null && (isTerminalBlock(trueTarget) || trueTarget.isReturn())) {
-            lastEffectiveMergePoint = falseTarget != null ? falseTarget.startPc : -1;
+            setEffectiveMerge187(falseTarget != null ? falseTarget.startPc : -1);
             List<Statement> thenBody = new ArrayList<Statement>();
             buildFromBlock(trueTarget, thenBody, visited, stopPc);
 
@@ -1266,6 +1433,9 @@ public class StructuredFlowBuilder {
     private Expression bindPatternCastIntoRightmostConjunct(Expression condition,
                                                             List<Statement> stmts) {
         if (stmts == null || stmts.size() != 1) return null;
+        // START_CHANGE: BUG-2026-0140-20261017-5 - A binding pattern does not exist before Java 16.
+        if (!allowPatternBinding) return null;
+        // END_CHANGE: BUG-2026-0140-5
 
         // Recognize the binding cast: `T v = (T) opnd;` or `v = (T) opnd;`.
         String varName = null;
@@ -1457,9 +1627,28 @@ public class StructuredFlowBuilder {
                 }
             }
             // END_CHANGE: BUG-2026-0032-2
-            if (endOfTrue != null && endOfTrue.isGoto()) {
+            // START_CHANGE: BUG-2026-0136-20261015-1 - The physically last goto of the true region
+            // is the if/else merge jump only when it leaves the region forward. A goto whose target
+            // lies before falseTarget is internal to the then-body: typically the back-edge of a loop
+            // that ends the then-body (`if (c) { a = ..; it = ..; while (it.hasNext()) {..} }`).
+            // Taking that back-edge target (the loop header) as the merge made the caller emit the
+            // then-body as the negated `if (!c) return;` and resume AT the loop header, silently
+            // dropping every statement between the condition and the loop (rt.jar
+            // BaseRowSet.notifyCursorMoved lost its event and iterator construction).
+            // A goto back to condBlock itself is the back-edge of the loop this conditional heads
+            // (Fx3: catch handler `goto header` inside a while(true)). A goto BEFORE the region to
+            // an ENCLOSING loop header (`if (c) { a; continue; } b`) still means the then-branch never falls into falseTarget and keeps the old meaning.
+            if (endOfTrue != null && endOfTrue.isGoto()
+                    && !(endOfTrue.branchTargetPc >= trueTarget.startPc
+                         && endOfTrue.branchTargetPc < falseTarget.startPc)
+                    && endOfTrue.branchTargetPc != condBlock.startPc
+                    // BUG-2026-0138: a backward target is a loop `continue` (emitted as such by
+                    // the goto handling), never a merge: resuming AT an enclosing loop header lost
+                    // the whole then-branch (`if (skipLF) {..}` printed as `if (!skipLF)`).
+                    && endOfTrue.branchTargetPc > condBlock.startPc) {
                 return endOfTrue.branchTargetPc;
             }
+            // END_CHANGE: BUG-2026-0136-1
 
             // START_CHANGE: ISS-2026-0001-20260323-1 - Follow goto chains for nested if-else merge detection
             // For nested structures: scan all blocks in the true-path region
@@ -2414,6 +2603,43 @@ public class StructuredFlowBuilder {
             }
         }
 
+        // START_CHANGE: BUG-2026-0188-20261018-1 - Arms that leave the switch only through
+        // CONDITIONAL jumps (`case 0: if (d != 0 && d != 1) throw ..; break;` compiles to
+        // `if_icmpeq merge` + athrow, no goto) gave no candidate: the switch had no merge, the
+        // post-switch code was built inside the first arm (followed by `return`) and the other
+        // arms fell through into each other (ConfirmationCallback). Count conditional jump targets
+        // at/after the last arm entry, and accept one reached from at least two different arms.
+        if (bestTarget < 0) {
+            List<Integer> armStarts188 = new ArrayList<Integer>(casePcs);
+            if (switchBlock.switchDefaultTarget >= 0) armStarts188.add(Integer.valueOf(switchBlock.switchDefaultTarget));
+            Collections.sort(armStarts188);
+            Map<Integer, Set<Integer>> condArms188 = new HashMap<Integer, Set<Integer>>();
+            for (BasicBlock b : cfg.getBlocks()) {
+                if (regionStopPc >= 0 && regionStopPc > switchBlock.startPc && b.startPc >= regionStopPc) continue;
+                if (b.startPc <= switchBlock.startPc || !b.isConditional()) continue;
+                int arm = -1;
+                for (Integer as : armStarts188) if (as.intValue() <= b.startPc) arm = as.intValue();
+                if (arm < 0) continue;
+                BasicBlock[] succs = {b.trueSuccessor, b.falseSuccessor};
+                for (BasicBlock t : succs) {
+                    if (t == null || t.startPc <= b.startPc || t.startPc < maxTargetPc) continue;
+                    if (t.startPc != switchBlock.switchDefaultTarget && casePcs.contains(t.startPc)) continue;
+                    Set<Integer> arms = condArms188.get(t.startPc);
+                    if (arms == null) { arms = new HashSet<Integer>(); condArms188.put(t.startPc, arms); }
+                    arms.add(Integer.valueOf(arm));
+                }
+            }
+            for (Map.Entry<Integer, Set<Integer>> e : condArms188.entrySet()) {
+                int n = e.getValue().size();
+                if (n < 2) continue;
+                if (n > bestCount || (n == bestCount && (bestTarget < 0 || e.getKey().intValue() < bestTarget))) {
+                    bestTarget = e.getKey().intValue();
+                    bestCount = n;
+                }
+            }
+        }
+        // END_CHANGE: BUG-2026-0188-1
+
         // Fallback: if all non-default case targets eventually reach the default target,
         // then the default target IS the merge point (e.g., string switch hashCode phase)
         if (bestTarget < 0 && switchBlock.switchDefaultTarget >= 0) {
@@ -2468,6 +2694,15 @@ public class StructuredFlowBuilder {
             int line = endBlock.lineNumber > 0 ? endBlock.lineNumber : 0;
             caseStmts.add(new BreakStatement(line));
         }
+        // START_CHANGE: BUG-2026-0188-20261018-2 - The region's last block ends in throw/return,
+        // so nothing falls physically into the next arm: a built body that can still complete
+        // normally does so by jumping out of the switch (`if (bad) throw ..;` exits through the
+        // conditional's jump to the merge). Without the break the source would fall through.
+        else if (endBlock != null && (endBlock.isThrow() || endBlock.isReturn())) {
+            int line = endBlock.lineNumber > 0 ? endBlock.lineNumber : 0;
+            caseStmts.add(new BreakStatement(line));
+        }
+        // END_CHANGE: BUG-2026-0188-2
     }
 
     /** Conservative: true only when the statement provably completes abruptly on every path. */
@@ -2586,6 +2821,13 @@ public class StructuredFlowBuilder {
             (tTrue.isGoto() || tTrue.type == BasicBlock.FALL_THROUGH);
         boolean falseOk = tFalse.stackTopExpression != null &&
             (tFalse.statements == null || tFalse.statements.isEmpty());
+        // START_CHANGE: BUG-2026-0172-20261018-1 - A conditional arm whose stack top is the value
+        // the outer condition block left pending (the `this` of `this.f = c ? a : d ? b : e`) does
+        // not PRODUCE an arm value: it is a nested ternary carrying the pending receiver through.
+        // Taking that stack top as the arm emitted `this.op = this.op == 2 ? 3 : this;`.
+        if (trueOk && isPendingPassThrough(condBlock, tTrue)) trueOk = false;
+        if (falseOk && isPendingPassThrough(condBlock, tFalse)) falseOk = false;
+        // END_CHANGE: BUG-2026-0172-1
 
         // Nested ternary: a branch is itself a conditional that forms a ternary
         // Only recurse on FORWARD conditionals (target PC > current PC) to prevent loops
@@ -2604,6 +2846,15 @@ public class StructuredFlowBuilder {
     }
     // END_CHANGE: BUG-2026-0057-1
     // END_CHANGE: BUG-2026-0032-3
+
+    // START_CHANGE: BUG-2026-0172-20261018-3 - The arm is itself a conditional and the value on
+    // its stack top at exit is the same object the outer condition block left pending, so it is
+    // carried through, not produced by the arm.
+    private boolean isPendingPassThrough(BasicBlock condBlock, BasicBlock arm) {
+        return arm != null && arm.isConditional() && arm.stackTopExpression != null
+            && arm.stackTopExpression == condBlock.stackTopExpression;
+    }
+    // END_CHANGE: BUG-2026-0172-3
 
     /**
      * Simple (non-recursive) check: both branches of condBlock produce values.
@@ -2653,6 +2904,10 @@ public class StructuredFlowBuilder {
 
         Expression trueVal = tTrue.stackTopExpression;
         Expression falseVal = tFalse.stackTopExpression;
+        // START_CHANGE: BUG-2026-0172-20261018-2 - see canFormTernary: pending pass-through arms
+        if (isPendingPassThrough(condBlock, tTrue)) trueVal = null;
+        if (isPendingPassThrough(condBlock, tFalse)) falseVal = null;
+        // END_CHANGE: BUG-2026-0172-2
 
         // Recursively build nested ternary for true branch
         if (trueVal == null && tTrue.isConditional()) {
@@ -2814,7 +3069,28 @@ public class StructuredFlowBuilder {
      * Substitute the ternary for the arm-value reference inside a merge statement.
      * Returns the rewritten statement, or null if the statement does not reference an arm value.
      */
+    // START_CHANGE: BUG-2026-0181-20261018-1 - The rebuilt statement is a new object: give it the
+    // pc of the statement it replaces. Without it the try/catch reconstructor could not place a
+    // `call(x == 2)` inside its try region at -g:none (no line to fall back on), saw an empty try
+    // body and silently dropped the whole catch.
+    private java.util.IdentityHashMap<Statement, Integer> statementPcs181;
+
+    public void setStatementPcs(java.util.IdentityHashMap<Statement, Integer> pcs) {
+        this.statementPcs181 = pcs;
+    }
+
     private Statement substituteTernaryInStatement(Statement s, Expression ternary,
+            Expression trueValue, Expression falseValue, boolean strict) {
+        Statement r = substituteTernaryInStatement0(s, ternary, trueValue, falseValue, strict);
+        if (r != null && statementPcs181 != null) {
+            Integer pc = statementPcs181.get(s);
+            if (pc != null && !statementPcs181.containsKey(r)) statementPcs181.put(r, pc);
+        }
+        return r;
+    }
+    // END_CHANGE: BUG-2026-0181-1
+
+    private Statement substituteTernaryInStatement0(Statement s, Expression ternary,
             Expression trueValue, Expression falseValue, boolean strict) {
         if (s instanceof ExpressionStatement) {
             Expression r = substituteTernaryInExpression(((ExpressionStatement) s).getExpression(),
@@ -2952,11 +3228,12 @@ public class StructuredFlowBuilder {
                     new UnaryOperatorExpression(ue.getLineNumber(), ue.getType(), ue.getOperator(),
                         t.getFalseExpression(), true));
             }
-            if (r instanceof TernaryExpression) {
-                return null; // would mis-render; let the fallback tiers handle it
-            }
+            // START_CHANGE: BUG-2026-0167-20261018-1 - Keep the ternary as the operand: the writer
+            // parenthesizes a ternary operand (BUG-2026-0142). Giving up here sent the merge to the
+            // legacy fallback, which replaced the whole consumer with the bare ternary.
             return new UnaryOperatorExpression(ue.getLineNumber(), ue.getType(),
                 ue.getOperator(), r, ue.isPrefix());
+            // END_CHANGE: BUG-2026-0167-1
         }
         if (expr instanceof BinaryOperatorExpression) {
             BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
@@ -2977,7 +3254,7 @@ public class StructuredFlowBuilder {
                             new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
                                 boe.getLeft(), boe.getOperator(), t.getFalseExpression()));
                     }
-                    return null; // would mis-render; let the fallback tiers handle it
+                    // BUG-2026-0167: otherwise nest it; the writer parenthesizes the operand
                 }
                 return new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
                     boe.getLeft(), boe.getOperator(), r);
@@ -2996,7 +3273,7 @@ public class StructuredFlowBuilder {
                             new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
                                 t.getFalseExpression(), boe.getOperator(), boe.getRight()));
                     }
-                    return null; // would mis-render; let the fallback tiers handle it
+                    // BUG-2026-0167: otherwise nest it; the writer parenthesizes the operand
                 }
                 return new BinaryOperatorExpression(boe.getLineNumber(), boe.getType(),
                     r, boe.getOperator(), boe.getRight());
@@ -3123,7 +3400,9 @@ public class StructuredFlowBuilder {
             List<Expression> args = mie.getArguments();
             // Determine the correct object receiver
             Expression obj = mie.getObject();
-            if (receiver != null) {
+            // BUG-2026-0147: the condition block's stack top is the LAST value pushed before the
+            // branch (often an earlier argument), not the receiver; only fill a missing receiver.
+            if (receiver != null && obj == null) {
                 obj = receiver;
             }
             if (args != null && !args.isEmpty()) {

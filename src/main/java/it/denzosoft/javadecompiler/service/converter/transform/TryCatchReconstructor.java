@@ -54,6 +54,24 @@ public class TryCatchReconstructor {
         this.statementPcs = statementPcs;
     }
 
+    // START_CHANGE: BUG-2026-0180-20261018-4 - Handler pcs of the try/finally regions that
+    // Javac7TwrNormalizer produced from a javac 7/8 try-with-resources desugaring. Such a group
+    // is a resource try by construction: it must never be dropped as "trivial".
+    private Set<Integer> twrHandlerPcs = Collections.<Integer>emptySet();
+
+    // START_CHANGE: BUG-2026-0182-20261018-3 - class-file major version (-1 = unknown)
+    private int classMajorVersion182 = -1;
+
+    public void setClassMajorVersion(int major) {
+        this.classMajorVersion182 = major;
+    }
+    // END_CHANGE: BUG-2026-0182-3
+
+    public void setTwrHandlerPcs(Set<Integer> pcs) {
+        this.twrHandlerPcs = pcs == null ? Collections.<Integer>emptySet() : pcs;
+    }
+    // END_CHANGE: BUG-2026-0180-4
+
     /**
      * Lowest bytecode pc contained in {@code s}, or -1 when unknown. Compound statements built
      * by the flow builder are not themselves in the map, so their position is the minimum of the
@@ -128,6 +146,44 @@ public class TryCatchReconstructor {
         return best;
     }
 
+    // START_CHANGE: BUG-2026-0189-20261018-2 - Highest recorded pc inside {@code s} (-1 = none).
+    private int maxPcOf(Statement s) {
+        if (s == null || statementPcs == null) return -1;
+        Integer direct = statementPcs.get(s);
+        int best = direct != null ? direct.intValue() : -1;
+        if (s instanceof BlockStatement) best = Math.max(best, maxPcOf(((BlockStatement) s).getStatements()));
+        else if (s instanceof IfStatement) best = Math.max(best, maxPcOf(((IfStatement) s).getThenBody()));
+        else if (s instanceof IfElseStatement) {
+            best = Math.max(best, Math.max(maxPcOf(((IfElseStatement) s).getThenBody()),
+                                           maxPcOf(((IfElseStatement) s).getElseBody())));
+        }
+        else if (s instanceof WhileStatement) best = Math.max(best, maxPcOf(((WhileStatement) s).getBody()));
+        else if (s instanceof DoWhileStatement) best = Math.max(best, maxPcOf(((DoWhileStatement) s).getBody()));
+        else if (s instanceof ForStatement) {
+            best = Math.max(best, Math.max(maxPcOf(((ForStatement) s).getBody()), maxPcOf(((ForStatement) s).getUpdate())));
+        }
+        else if (s instanceof ForEachStatement) best = Math.max(best, maxPcOf(((ForEachStatement) s).getBody()));
+        else if (s instanceof LabelStatement) best = Math.max(best, maxPcOf(((LabelStatement) s).getBody()));
+        else if (s instanceof SynchronizedStatement) best = Math.max(best, maxPcOf(((SynchronizedStatement) s).getBody()));
+        else if (s instanceof TryCatchStatement) {
+            TryCatchStatement t = (TryCatchStatement) s;
+            best = Math.max(best, maxPcOf(t.getTryBody()));
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) best = Math.max(best, maxPcOf(cc.body));
+            best = Math.max(best, maxPcOf(t.getFinallyBody()));
+        }
+        else if (s instanceof SwitchStatement) {
+            for (SwitchStatement.SwitchCase c : ((SwitchStatement) s).getCases()) best = Math.max(best, maxPcOf(c.getStatements()));
+        }
+        return best;
+    }
+
+    private int maxPcOf(List<Statement> list) {
+        int best = -1;
+        if (list != null) for (Statement s : list) best = Math.max(best, maxPcOf(s));
+        return best;
+    }
+    // END_CHANGE: BUG-2026-0189-2
+
     private int minPcOf(List<Statement> list) {
         if (list == null) return -1;
         int best = -1;
@@ -177,6 +233,7 @@ public class TryCatchReconstructor {
             return statements;
         }
 
+        fullTable198 = exceptionTable; // BUG-2026-0198: before coalescing
         // START_CHANGE: BUG-2026-0068-20260610-1 - Coalesce compiler-generated handler-protection
         // entries before grouping. The try-with-resources desugar re-protects the synthetic
         // Throwable close-and-rethrow handler region with the SAME user handler, e.g.
@@ -214,6 +271,17 @@ public class TryCatchReconstructor {
             }
             list.add(entry);
         }
+        // START_CHANGE: BUG-2026-0137-20261015-2 - One source `try` can own SEVERAL protected
+        // ranges: javac splits the range around code it excludes (e.g. the `areturn` of a
+        // `return` inside the try: [26,46)->56 and [47,56)->56). Grouping by (startPc, endPc)
+        // made each fragment its own try, so the body was wrapped twice in nested try/catch with
+        // the same clause and the code of the second fragment (`throw new ISE(s)`) ended up
+        // OUTSIDE both - an exception the source caught escaped the method. A handler pc belongs
+        // to exactly one source try statement, so regions whose (handlerPc, catchType) sets are
+        // identical are fragments of the same try: merge them into one group keyed by the
+        // union range.
+        groups = mergeSplitRegions(groups);
+        // END_CHANGE: BUG-2026-0137-2
 
         // Build a sorted array of all PCs that have line numbers
         List<Integer> sortedPcs = new ArrayList<Integer>(pcToLine.keySet());
@@ -258,6 +326,83 @@ public class TryCatchReconstructor {
         return statements;
     }
 
+    // START_CHANGE: BUG-2026-0137-20261015-3 - Merge range fragments of one source try.
+    private static String handlerSignature(List<CodeAttribute.ExceptionEntry> entries) {
+        List<String> parts = new ArrayList<String>();
+        for (CodeAttribute.ExceptionEntry e : entries) parts.add(e.handlerPc + ":" + e.catchType);
+        Collections.sort(parts);
+        return parts.toString();
+    }
+
+    private static Map<String, List<CodeAttribute.ExceptionEntry>> mergeSplitRegions(
+            Map<String, List<CodeAttribute.ExceptionEntry>> groups) {
+        Map<String, List<List<CodeAttribute.ExceptionEntry>>> bySig =
+            new LinkedHashMap<String, List<List<CodeAttribute.ExceptionEntry>>>();
+        for (List<CodeAttribute.ExceptionEntry> g : groups.values()) {
+            String sig = handlerSignature(g);
+            // Only ranges that lie entirely BEFORE their handlers are try-body fragments. A range
+            // covering handler code is compiler protection (synchronized's monitorexit handler
+            // re-protects itself: [11,23)->26 and [26,29)->26) and must stay a group of its own.
+            for (CodeAttribute.ExceptionEntry e : g) {
+                if (e.endPc > e.handlerPc) { sig = "self@" + e.startPc + "-" + e.endPc; break; }
+            }
+            List<List<CodeAttribute.ExceptionEntry>> l = bySig.get(sig);
+            if (l == null) {
+                l = new ArrayList<List<CodeAttribute.ExceptionEntry>>();
+                bySig.put(sig, l);
+            }
+            l.add(g);
+        }
+        if (bySig.size() == groups.size()) return groups;
+        Map<String, List<CodeAttribute.ExceptionEntry>> out =
+            new LinkedHashMap<String, List<CodeAttribute.ExceptionEntry>>();
+        for (List<List<CodeAttribute.ExceptionEntry>> frags : bySig.values()) {
+            int start = Integer.MAX_VALUE, end = -1;
+            List<CodeAttribute.ExceptionEntry> all = new ArrayList<CodeAttribute.ExceptionEntry>();
+            for (List<CodeAttribute.ExceptionEntry> f : frags) {
+                for (CodeAttribute.ExceptionEntry e : f) {
+                    if (e.startPc < start) start = e.startPc;
+                    if (e.endPc > end) end = e.endPc;
+                }
+            }
+            // The fragment holding the lowest startPc goes first: applyGroup reads the region
+            // start from groupEntries.get(0).
+            Collections.sort(frags, new Comparator<List<CodeAttribute.ExceptionEntry>>() {
+                public int compare(List<CodeAttribute.ExceptionEntry> a, List<CodeAttribute.ExceptionEntry> b) {
+                    return a.get(0).startPc - b.get(0).startPc;
+                }
+            });
+            for (List<CodeAttribute.ExceptionEntry> f : frags) all.addAll(f);
+            String key = start + "-" + end;
+            List<CodeAttribute.ExceptionEntry> prev = out.get(key);
+            if (prev != null) prev.addAll(all); else out.put(key, all);
+        }
+        return out;
+    }
+    // END_CHANGE: BUG-2026-0137-3
+
+    // START_CHANGE: BUG-2026-0198-20261018-1 - The exception table before BUG-2026-0068 drops
+    // handler-protection entries. Such an entry can also be the second FRAGMENT of an outer try
+    // that encloses an inner try/catch: [62,102)->114 and [103,111)->114 where 103 is the inner
+    // handler (javax.sound.sampled.AudioSystem.getMixer). Dropping it shrank the outer span to
+    // 102, and the BUG-2026-0189 rule then pushed the inner loop (last pc 108) out of the try.
+    private CodeAttribute.ExceptionEntry[] fullTable198;
+
+    /** End of the protected span of the group, counting dropped fragments with the same handler. */
+    private int fullSpanEnd198(List<CodeAttribute.ExceptionEntry> groupEntries, int end) {
+        if (fullTable198 == null) return end;
+        int start = Integer.MAX_VALUE;
+        for (CodeAttribute.ExceptionEntry g : groupEntries) start = Math.min(start, g.startPc);
+        for (CodeAttribute.ExceptionEntry e : fullTable198) {
+            if (e.endPc <= end || e.startPc < start || e.endPc > e.handlerPc) continue;
+            for (CodeAttribute.ExceptionEntry g : groupEntries) {
+                if (g.handlerPc == e.handlerPc && g.catchType == e.catchType) { end = e.endPc; break; }
+            }
+        }
+        return end;
+    }
+    // END_CHANGE: BUG-2026-0198-1
+
     /** Groups that found no statements at any level yet (likely nested inside a handler). */
     private List<List<CodeAttribute.ExceptionEntry>> pendingNestedGroups;
     /** Set by applyGroup when the group failed ONLY because no statements were found. */
@@ -273,6 +418,15 @@ public class TryCatchReconstructor {
             CodeAttribute.ExceptionEntry firstEntry = groupEntries.get(0);
             int tryStartPc = firstEntry.startPc;
             int tryEndPc = firstEntry.endPc;
+            // START_CHANGE: BUG-2026-0137-20261015-4 - A merged group spans all its fragments.
+            for (int gi = 1; gi < groupEntries.size(); gi++) {
+                if (groupEntries.get(gi).startPc < tryStartPc) tryStartPc = groupEntries.get(gi).startPc;
+                if (groupEntries.get(gi).endPc > tryEndPc) tryEndPc = groupEntries.get(gi).endPc;
+            }
+            // END_CHANGE: BUG-2026-0137-4
+            // BUG-2026-0198: span including dropped handler-protection fragments of this try; it
+            // also decides the merge point (the goto ending the LAST fragment targets it)
+            int spanEnd198 = fullSpanEnd198(groupEntries, tryEndPc);
 
             int tryStartLine = findLineForPc(tryStartPc, sortedPcs);
             int tryEndLine = findLineBeforePc(tryEndPc, sortedPcs);
@@ -318,13 +472,14 @@ public class TryCatchReconstructor {
             // firstHandlerLine was dropped, which lost the trailing `log.info(...); return resp;`
             // that appears AFTER the catch/finally in non-void methods.
             int afterTryStartLine = computeAfterTryStartLine(
-                firstHandlerPc, lastHandlerPc, tryEndPc, sortedPcs);
+                firstHandlerPc, lastHandlerPc, spanEnd198, sortedPcs); // BUG-2026-0198: was tryEndPc
             // END_CHANGE: BUG-2026-0056-1
 
             boolean inTryRegion = false;
             // BUG-2026-0122: set once a positioned statement past the try region is seen, so a later
             // unpositioned statement is not pulled back into the try.
             boolean leftTryRegion122 = false;
+            boolean leftTryLines175 = false; // BUG-2026-0175
             int groupEndPc122 = tryEndPc;
             for (int gi = 0; gi < groupEntries.size(); gi++) {
                 if (groupEntries.get(gi).endPc > groupEndPc122) groupEndPc122 = groupEntries.get(gi).endPc;
@@ -335,6 +490,8 @@ public class TryCatchReconstructor {
                 // A statement decoded at pc P belongs to the try region iff P is inside
                 // [startPc, endPc) of the exception entry -- exactly the JVM's own rule.
                 int sPc100 = usePc100 ? minPcOf(s) : -1;
+                // BUG-2026-0189: a compound reaching past the protected span is not try-body code
+                if (sPc100 >= 0 && hasChildStatements(s) && maxPcOf(s) >= spanEnd198) sPc100 = Integer.MAX_VALUE;
                 // START_CHANGE: BUG-2026-0122-20260907-6 - A group can hold SEVERAL protected
                 // ranges sharing one handler (javac splits a single source `try` whose body has
                 // gaps: sun/security/ec/SunEC$ProviderService.newInstance has three, [46,71)
@@ -347,7 +504,28 @@ public class TryCatchReconstructor {
                     for (int gi = 0; gi < groupEntries.size(); gi++) {
                         CodeAttribute.ExceptionEntry ge = groupEntries.get(gi);
                         if (sPc100 >= ge.startPc && sPc100 < ge.endPc) { inAnyRange122 = true; break; }
+                        // START_CHANGE: BUG-2026-0199-20261018-1 - javac ends a protected range
+                        // just BEFORE the return instruction of a `return expr;` that closes the try
+                        // body ([31,43) with areturn at 43), and a return statement is positioned at
+                        // that instruction. Without lines the return then fell outside the region:
+                        // with nothing else in the body the group was rejected and the catch clause
+                        // vanished (`try { return get(x); } catch (IAE e) {}` lost its handler).
+                        if (sPc100 == ge.endPc && sPc100 > ge.startPc && s instanceof ReturnStatement) {
+                            inAnyRange122 = true;
+                            break;
+                        }
+                        // END_CHANGE: BUG-2026-0199-1
                     }
+                    // START_CHANGE: BUG-2026-0137-20261015-5 - The gap between two fragments of one
+                    // source try is code javac excluded from the protected range (the `areturn` of
+                    // a `return` inside the try, an inlined finally copy) - still try-body code.
+                    // `if (s.equals(n)) return s.toUpperCase();` (position = its areturn pc, in the
+                    // gap) was otherwise moved after the catch.
+                    if (!inAnyRange122 && (groupEntries.size() > 1 || spanEnd198 > groupEndPc122)
+                            && sPc100 >= tryStartPc && sPc100 < spanEnd198) { // BUG-2026-0198: dropped fragments too
+                        inAnyRange122 = true;
+                    }
+                    // END_CHANGE: BUG-2026-0137-5
                 }
                 // END_CHANGE: BUG-2026-0122-6
                 // START_CHANGE: BUG-2026-0122-20260907-3 - A statement the flow builder SYNTHESISED
@@ -379,6 +557,55 @@ public class TryCatchReconstructor {
                     continue;
                 }
                 // END_CHANGE: BUG-2026-0100-7
+                // START_CHANGE: BUG-2026-0137-20261015-6 - A statement of a block that starts
+                // between two LineNumberTable entries carries no line (0): the code after
+                // `if (c) return x;` written on the same source line. The line test cannot place
+                // it, and it was pushed out of the try (`throw new ISE(s)` escaped its catch).
+                // Its bytecode position can: a recorded pc inside the group's protected span is
+                // try-body code.
+                // START_CHANGE: BUG-2026-0175-20261018-1 - The BUG-2026-0122-3 rule for line-bearing
+                // classes: a statement the flow builder synthesised (the boolean merge of
+                // `flag = s != null && check(s);`) has neither pc nor line. Classified by line it
+                // always failed and was moved after the catch, so an exception thrown by check()
+                // escaped the handler. Decode order is preserved: it belongs with its predecessor.
+                if (!usePc100 && sLine <= 0 && inTryRegion && !leftTryLines175 && minPcOf(s) < 0) {
+                    tryBody.add(s);
+                    continue;
+                }
+                // END_CHANGE: BUG-2026-0175-1
+                boolean pcInTry137 = false;
+                if (sLine <= 0 && statementPcs != null) {
+                    int pc137 = minPcOf(s);
+                    // START_CHANGE: BUG-2026-0189-20261018-1 - A compound statement's minimum pc
+                    // is its first CHILD's: for a loop that is the first body statement, past the
+                    // header. A loop whose body merely STARTS with the protected code then looked
+                    // like try-body code and the try was wrapped around the whole loop: the first
+                    // exception left the loop (`for (..) { try { f(); } catch (E e) {..} print(); }`).
+                    // A compound joins the try only when its last pc is inside the span too.
+                    if (pc137 >= 0 && hasChildStatements(s)) {
+                        int max189 = maxPcOf(s);
+                        if (max189 >= spanEnd198) pc137 = -1;
+                    }
+                    // END_CHANGE: BUG-2026-0189-1
+                    if (pc137 >= 0) {
+                        for (int gi = 0; gi < groupEntries.size(); gi++) {
+                            CodeAttribute.ExceptionEntry ge = groupEntries.get(gi);
+                            // Self-protecting handler ranges (synchronized's monitorexit) are not
+                            // source try bodies.
+                            if (ge.endPc > ge.handlerPc) continue;
+                            if (pc137 >= ge.startPc && pc137 < ge.endPc) { pcInTry137 = true; break; }
+                        }
+                        if (!pcInTry137 && (groupEntries.size() > 1 || spanEnd198 > groupEndPc122)
+                                && pc137 >= tryStartPc && pc137 < spanEnd198) { // BUG-2026-0198: dropped fragments too
+                            pcInTry137 = true;
+                        }
+                    }
+                }
+                if (pcInTry137) {
+                    inTryRegion = true;
+                    tryBody.add(s);
+                } else
+                // END_CHANGE: BUG-2026-0137-6
                 if (sLine > 0 && tryStartLine >= 0 && sLine >= tryStartLine && sLine <= tryEndLine) {
                     inTryRegion = true;
                     tryBody.add(s);
@@ -388,6 +615,7 @@ public class TryCatchReconstructor {
                     // START_CHANGE: BUG-2026-0056-20260421-2 - Restore after-try statements.
                     // Drop statements that fall inside any handler body's line range, but keep
                     // statements past the merge point (they are plain after-try code).
+                    leftTryLines175 = true; // BUG-2026-0175
                     if (afterTryStartLine > 0 && sLine >= afterTryStartLine) {
                         afterTry.add(s);
                         continue;
@@ -416,6 +644,7 @@ public class TryCatchReconstructor {
             List<TryCatchStatement.CatchClause> catchClauses =
                 new ArrayList<TryCatchStatement.CatchClause>();
             Statement finallyBody = null;
+            boolean scaffold182 = false; // BUG-2026-0182: a handler held try-with-resources addSuppressed scaffolding
 
             List<CodeAttribute.ExceptionEntry> sortedEntries =
                 new ArrayList<CodeAttribute.ExceptionEntry>(groupEntries);
@@ -425,7 +654,7 @@ public class TryCatchReconstructor {
                 }
             });
 
-            int mergePc = findTryCatchMergePc(tryEndPc);
+            int mergePc = findTryCatchMergePc(spanEnd198); // BUG-2026-0198: was tryEndPc
 
             // Group entries by handlerPc to merge multi-catch (same handler, different exception types)
             Map<Integer, List<CodeAttribute.ExceptionEntry>> handlerGroups =
@@ -509,10 +738,15 @@ public class TryCatchReconstructor {
 
                 if (allTyped) {
                     // Strip addSuppressed boilerplate from catch bodies
+                    int beforeStrip182 = handlerBody.size();
                     handlerBody = stripAddSuppressed(handlerBody);
+                    if (handlerBody.size() < beforeStrip182) scaffold182 = true; // BUG-2026-0182
                     // Merge all exception types into a single multi-catch clause
                     List<Type> types = new ArrayList<Type>();
+                    // BUG-2026-0137: fragments of a split region repeat the same catch type.
+                    Set<Integer> seenCatchTypes137 = new HashSet<Integer>();
                     for (CodeAttribute.ExceptionEntry he : hgEntries) {
+                        if (!seenCatchTypes137.add(Integer.valueOf(he.catchType))) continue;
                         String typeName = pool.getClassName(he.catchType);
                         if (typeName == null) {
                             typeName = "java/lang/Exception";
@@ -583,18 +817,70 @@ public class TryCatchReconstructor {
             // wrapper. This handles try-with-resources patterns where the compiler generates
             // complex nested try-catch for resource management but the actual body is lost
             // during decompilation. Emitting the original linear statements is more compilable.
-            if (isTryBodyTrivial(tryBody) && isTryWithResourcesPattern(catchClauses, finallyBody)) {
+            // START_CHANGE: BUG-2026-0180-20261018-5 - never for a normalized javac 7/8 resource try
+            boolean forcedTwr180 = false;
+            for (CodeAttribute.ExceptionEntry ge180 : groupEntries) {
+                if (twrHandlerPcs.contains(Integer.valueOf(ge180.handlerPc))) forcedTwr180 = true;
+            }
+            // END_CHANGE: BUG-2026-0180-5
+            // START_CHANGE: BUG-2026-0182-20261018-1 - A body of plain assignments (`r =
+            // Integer.parseInt(s);`, `v = "y" + in.read();`) is real code: skipping it deleted a
+            // genuine `catch (Throwable)` / `finally { in.close(); }` and the output still compiled.
+            // Skip only an EMPTY body, or a trivial one whose handler was try-with-resources
+            // scaffolding (an addSuppressed call, stripped above) - the javac 9+ shape needs that.
+            if (!forcedTwr180 && (tryBody.isEmpty() || (scaffold182 && isTryBodyTrivial(tryBody)))
+                    && isTryWithResourcesPattern(catchClauses, finallyBody)) {
+            // END_CHANGE: BUG-2026-0182-1
                 return null; // skip this exception group - emit original statements unchanged
             }
 
             // START_CHANGE: LIM-0008-20260326-1 - Try-with-resources resource extraction
             List<Statement> resources = null;
-            if (isTryWithResourcesPattern(catchClauses, finallyBody)) {
+            // START_CHANGE: BUG-2026-0182-20261018-2 - The heuristic fold (a try whose finally calls
+            // close() on a variable assigned just before it) also captured hand-written
+            // `try { .. } finally { ctx.close(); }` - illegal when the type is not AutoCloseable
+            // (javax.naming.Context) and different in meaning anyway. javac 7/8 resource tries are
+            // now recognised exactly (BUG-2026-0180) and classes older than 51 cannot contain one,
+            // so the heuristic is kept only for javac 9+ class files.
+            if ((forcedTwr180 || classMajorVersion182 >= 53) && isTryWithResourcesPattern(catchClauses, finallyBody)) {
+            // END_CHANGE: BUG-2026-0182-2
                 // Extract resource variable names from finally close() calls
                 List<String> closeVarNames = extractCloseVariableNames(finallyBody);
                 if (!closeVarNames.isEmpty()) {
                     resources = new ArrayList<Statement>();
                     List<Statement> remainingBefore = new ArrayList<Statement>();
+                    // START_CHANGE: BUG-2026-0180-20261018-8 - For a normalized javac 7/8 resource
+                    // try the resource is exactly the store right before the region: take only that
+                    // statement (not every earlier assignment of the slot) and make it a declaration
+                    // with the most precise type available.
+                    if (forcedTwr180) {
+                        remainingBefore.addAll(beforeTry);
+                        Statement last180 = beforeTry.isEmpty() ? null : beforeTry.get(beforeTry.size() - 1);
+                        String av180 = last180 == null ? null : getAssignedVarName(last180);
+                        if (av180 != null && closeVarNames.contains(av180)) {
+                            Statement decl180 = asResourceDeclaration180(last180, beforeTry);
+                            if (decl180 != null && !(last180 instanceof VariableDeclarationStatement)) {
+                                // A plain assignment: the slot is declared elsewhere (an earlier
+                                // use or a method-top pre-declaration), so the header needs a
+                                // fresh name, used throughout the try body.
+                                String fresh180 = av180 + "_r";
+                                while (statementsReferenceVar(tryBody, fresh180)
+                                        || statementsReferenceVar(beforeTry, fresh180)
+                                        || statementsDeclareVar(tryBody, fresh180)) {
+                                    fresh180 = fresh180 + "r";
+                                }
+                                VariableDeclarationStatement d180 = (VariableDeclarationStatement) decl180;
+                                decl180 = new VariableDeclarationStatement(d180.getLineNumber(), d180.getType(),
+                                    fresh180, d180.getInitializer(), false, false);
+                                tryBody = renameVarInStatements(tryBody, av180, fresh180);
+                            }
+                            if (decl180 != null) {
+                                resources.add(decl180);
+                                remainingBefore.remove(remainingBefore.size() - 1);
+                            }
+                        }
+                    } else
+                    // END_CHANGE: BUG-2026-0180-8
                     for (Statement bs : beforeTry) {
                         String assignedVar = getAssignedVarName(bs);
                         if (assignedVar != null && closeVarNames.contains(assignedVar)) {
@@ -609,7 +895,9 @@ public class TryCatchReconstructor {
                         for (Statement ts : tryBody) {
                             String assignedVar = getAssignedVarName(ts);
                             if (assignedVar != null && closeVarNames.contains(assignedVar)) {
-                                resources.add(ts);
+                                // BUG-2026-0180: a normalized resource is always a declaration
+                                Statement asDecl180 = forcedTwr180 ? asResourceDeclaration180(ts, beforeTry) : null;
+                                resources.add(asDecl180 != null ? asDecl180 : ts);
                             } else {
                                 remainingTry.add(ts);
                             }
@@ -715,8 +1003,16 @@ public class TryCatchReconstructor {
             if (bodies == null) continue;
             for (int bi = 0; bi < bodies.size(); bi++) {
                 List<Statement> innerStmts = bodies.get(bi);
-                int[] span = lineSpan(innerStmts);
-                if (span == null || tryStartLine < span[0] || tryStartLine > span[1]) continue;
+                // START_CHANGE: BUG-2026-0137-20261015-1 - Without a LineNumberTable the region has
+                // no start line, so the line-span test rejected EVERY compound body and a try nested
+                // in a loop or an if lost its catch clauses at -g:none. applyGroup decides region
+                // membership by bytecode pc in that mode and returns null when the body holds no
+                // statement of the region, so every body can simply be offered.
+                if (tryStartLine >= 0 || statementPcs == null || statementPcs.isEmpty()) {
+                    int[] span = lineSpan(innerStmts);
+                    if (span == null || tryStartLine < span[0] || tryStartLine > span[1]) continue;
+                }
+                // END_CHANGE: BUG-2026-0137-1
                 List<Statement> rebuilt = applyGroup(
                     new ArrayList<Statement>(innerStmts), groupEntries, sortedPcs);
                 if (rebuilt == null) continue;
@@ -1630,6 +1926,13 @@ public class TryCatchReconstructor {
     }
 
     private static Statement renameVarInStatement(Statement s, String oldName, String newName) {
+        // START_CHANGE: BUG-2026-0143-20261017-1 - The hand-written walker below skipped for,
+        // for-each, labels, lambdas, array initializers and more, so a catch body that used the
+        // exception inside a loop kept the slot's synthetic name (`var1.getCause()` under
+        // `catch (... e)`). The complete AstMapper.Renamer replaces it; the old walker is kept
+        // unreachable for reference only.
+        if (s != null) return new AstMapper.Renamer(oldName, newName).map(s);
+        // END_CHANGE: BUG-2026-0143-1
         if (s instanceof ExpressionStatement) {
             Expression expr = ((ExpressionStatement) s).getExpression();
             Expression renamed = renameVarInExpression(expr, oldName, newName);
@@ -1772,6 +2075,9 @@ public class TryCatchReconstructor {
     }
 
     private static Expression renameVarInExpression(Expression expr, String oldName, String newName) {
+        // START_CHANGE: BUG-2026-0143-20261017-2 - See BUG-2026-0143-1.
+        if (expr != null) return new AstMapper.Renamer(oldName, newName).map(expr);
+        // END_CHANGE: BUG-2026-0143-2
         if (expr instanceof LocalVariableExpression) {
             LocalVariableExpression lve = (LocalVariableExpression) expr;
             if (oldName.equals(lve.getName())) {
@@ -1983,7 +2289,23 @@ public class TryCatchReconstructor {
     public static List<Statement> removeDuplicatedFinally(List<Statement> catchBody,
                                                            List<Statement> finallyStmts) {
         int finallySize = (finallyStmts == null) ? 0 : finallyStmts.size();
-        if (finallySize <= 0 || catchBody.size() <= finallySize) return catchBody;
+        if (finallySize <= 0) return catchBody;
+
+        // START_CHANGE: BUG-2026-0129-20260907-1 - Strip the inlined finally copies that javac
+        // places before a NESTED exit. Cases 1-3 below only ever looked at the top level of the
+        // body list, so a copy inside an if/loop/label/switch/synchronized nested in the try
+        // survived and the action ran twice - for the lock.unlock() family that is an
+        // IllegalMonitorStateException at runtime, on output that compiles cleanly
+        // (498 sites / 82 files in JDK 25 java.base).
+        //
+        // Only the shapes javac actually emits are removed: a copy IMMEDIATELY followed by a
+        // return/break/continue, i.e. an exit that leaves the protected region normally. A
+        // `throw` inside the region is covered by the `any` handler, so javac emits no copy
+        // before it and a match there would always be a false positive - it is not accepted
+        // here (Case 2 keeps its historical Throw handling at the top level, unchanged).
+        catchBody = stripFinallyCopiesBeforeExits(catchBody, finallyStmts, true);
+        if (catchBody.size() <= finallySize) return catchBody;
+        // END_CHANGE: BUG-2026-0129-1
 
         // Case 1: the trailing N statements structurally match the finally body
         int tailStart = catchBody.size() - finallySize;
@@ -2038,6 +2360,152 @@ public class TryCatchReconstructor {
 
         return catchBody; // conservative: no match, remove nothing
     }
+
+    // START_CHANGE: BUG-2026-0129-20260907-2 - Recursive removal of inlined finally copies
+    // that precede a nested exit. The AST is immutable, so every compound statement that
+    // contains a rewritten list is rebuilt. Nothing else about the statement changes.
+    //
+    // `topLevel` distinguishes the body list handed to removeDuplicatedFinally (where Cases 1-3
+    // already handle the trailing copy and the copy before a trailing Return/Throw) from the
+    // nested lists, which had no handling at all. At the top level only Break/Continue exits are
+    // considered here, so the historical Return/Throw behaviour of Case 1/2/3 is untouched.
+    private static List<Statement> stripFinallyCopiesBeforeExits(List<Statement> list,
+                                                                  List<Statement> finallyStmts,
+                                                                  boolean topLevel) {
+        if (list == null || list.isEmpty()) return list;
+        int n = finallyStmts.size();
+
+        // 1. rebuild every compound statement with its inner lists processed
+        List<Statement> mapped = new ArrayList<Statement>(list.size());
+        boolean changed = false;
+        for (int i = 0; i < list.size(); i++) {
+            Statement s = list.get(i);
+            Statement r = rebuildWithFinallyCopiesStripped(s, finallyStmts);
+            if (r != s) changed = true;
+            mapped.add(r);
+        }
+
+        // 2. remove a run of N statements that matches the finally body and is immediately
+        //    followed by an exit out of the protected region
+        List<Statement> out = new ArrayList<Statement>(mapped.size());
+        int i = 0;
+        while (i < mapped.size()) {
+            if (i + n < mapped.size()
+                    && isFinallyCopyExit(mapped.get(i + n), topLevel)
+                    && statementsMatchFinally(mapped, i, finallyStmts)) {
+                i += n; // drop the copy, keep the exit
+                changed = true;
+                continue;
+            }
+            out.add(mapped.get(i));
+            i++;
+        }
+        return changed ? out : list;
+    }
+
+    /** Exits for which javac inlines a finally copy. Throw is deliberately excluded. */
+    private static boolean isFinallyCopyExit(Statement s, boolean topLevel) {
+        if (s instanceof BreakStatement || s instanceof ContinueStatement) return true;
+        // Return at the top level is Case 2's territory; only nested lists are handled here.
+        return !topLevel && (s instanceof ReturnStatement);
+    }
+
+    /** Rebuild a compound statement with each of its statement lists stripped recursively. */
+    private static Statement rebuildWithFinallyCopiesStripped(Statement s,
+                                                               List<Statement> finallyStmts) {
+        if (s instanceof BlockStatement) {
+            BlockStatement b = (BlockStatement) s;
+            List<Statement> body = stripFinallyCopiesBeforeExits(b.getStatements(), finallyStmts, false);
+            return (body == b.getStatements()) ? s : new BlockStatement(b.getLineNumber(), body);
+        }
+        if (s instanceof IfStatement) {
+            IfStatement f = (IfStatement) s;
+            Statement t = rebuildWithFinallyCopiesStripped(f.getThenBody(), finallyStmts);
+            return (t == f.getThenBody()) ? s
+                : new IfStatement(f.getLineNumber(), f.getCondition(), t);
+        }
+        if (s instanceof IfElseStatement) {
+            IfElseStatement f = (IfElseStatement) s;
+            Statement t = rebuildWithFinallyCopiesStripped(f.getThenBody(), finallyStmts);
+            Statement e = rebuildWithFinallyCopiesStripped(f.getElseBody(), finallyStmts);
+            return (t == f.getThenBody() && e == f.getElseBody()) ? s
+                : new IfElseStatement(f.getLineNumber(), f.getCondition(), t, e);
+        }
+        if (s instanceof WhileStatement) {
+            WhileStatement w = (WhileStatement) s;
+            Statement b = rebuildWithFinallyCopiesStripped(w.getBody(), finallyStmts);
+            return (b == w.getBody()) ? s
+                : new WhileStatement(w.getLineNumber(), w.getCondition(), b);
+        }
+        if (s instanceof DoWhileStatement) {
+            DoWhileStatement d = (DoWhileStatement) s;
+            Statement b = rebuildWithFinallyCopiesStripped(d.getBody(), finallyStmts);
+            return (b == d.getBody()) ? s
+                : new DoWhileStatement(d.getLineNumber(), d.getCondition(), b);
+        }
+        if (s instanceof ForStatement) {
+            ForStatement f = (ForStatement) s;
+            Statement b = rebuildWithFinallyCopiesStripped(f.getBody(), finallyStmts);
+            return (b == f.getBody()) ? s
+                : new ForStatement(f.getLineNumber(), f.getInit(), f.getCondition(), f.getUpdate(), b);
+        }
+        if (s instanceof ForEachStatement) {
+            ForEachStatement f = (ForEachStatement) s;
+            Statement b = rebuildWithFinallyCopiesStripped(f.getBody(), finallyStmts);
+            return (b == f.getBody()) ? s
+                : new ForEachStatement(f.getLineNumber(), f.getVariableType(), f.getVariableName(),
+                    f.getIterable(), b);
+        }
+        if (s instanceof LabelStatement) {
+            LabelStatement l = (LabelStatement) s;
+            Statement b = rebuildWithFinallyCopiesStripped(l.getBody(), finallyStmts);
+            return (b == l.getBody()) ? s
+                : new LabelStatement(l.getLineNumber(), l.getLabel(), b);
+        }
+        if (s instanceof SynchronizedStatement) {
+            SynchronizedStatement y = (SynchronizedStatement) s;
+            Statement b = rebuildWithFinallyCopiesStripped(y.getBody(), finallyStmts);
+            return (b == y.getBody()) ? s
+                : new SynchronizedStatement(y.getLineNumber(), y.getMonitor(), b);
+        }
+        if (s instanceof SwitchStatement) {
+            SwitchStatement sw = (SwitchStatement) s;
+            List<SwitchStatement.SwitchCase> cases = new ArrayList<SwitchStatement.SwitchCase>();
+            boolean ch = false;
+            for (SwitchStatement.SwitchCase c : sw.getCases()) {
+                List<Statement> b = stripFinallyCopiesBeforeExits(c.getStatements(), finallyStmts, false);
+                if (b != c.getStatements()) {
+                    ch = true;
+                    cases.add(new SwitchStatement.SwitchCase(c.getLabels(), b));
+                } else {
+                    cases.add(c);
+                }
+            }
+            return ch ? new SwitchStatement(sw.getLineNumber(), sw.getSelector(), cases, sw.isArrowStyle()) : s;
+        }
+        if (s instanceof TryCatchStatement) {
+            // Recurse into a nested try's body and catch clauses (javac inlines the OUTER finally
+            // before a return there too). The nested finally body is left alone: its own
+            // statements are not copies of the outer finally and must never be touched.
+            TryCatchStatement t = (TryCatchStatement) s;
+            Statement tb = rebuildWithFinallyCopiesStripped(t.getTryBody(), finallyStmts);
+            List<TryCatchStatement.CatchClause> catches = new ArrayList<TryCatchStatement.CatchClause>();
+            boolean ch = (tb != t.getTryBody());
+            for (TryCatchStatement.CatchClause cc : t.getCatchClauses()) {
+                Statement cb = rebuildWithFinallyCopiesStripped(cc.body, finallyStmts);
+                if (cb != cc.body) {
+                    ch = true;
+                    catches.add(new TryCatchStatement.CatchClause(cc.exceptionTypes, cc.variableName, cb));
+                } else {
+                    catches.add(cc);
+                }
+            }
+            return ch ? new TryCatchStatement(t.getLineNumber(), tb, catches,
+                t.hasFinally() ? t.getFinallyBody() : null, t.getResources()) : s;
+        }
+        return s;
+    }
+    // END_CHANGE: BUG-2026-0129-2
 
     /**
      * Strip a duplicated finally body inlined by javac at the START of the code that
@@ -2263,6 +2731,48 @@ public class TryCatchReconstructor {
     /**
      * Get the variable name assigned by a statement (VarDecl or Assignment).
      */
+    // START_CHANGE: BUG-2026-0180-20261018-9 - `x = init` / `T x = init` as a resource declaration.
+    // The slot's decoded type can be Object (an alias `R r = other;` without a LocalVariableTable):
+    // use the initializer's own type then, since a resource must be declared AutoCloseable or narrower.
+    private static Statement asResourceDeclaration180(Statement s, List<Statement> before) {
+        Type t;
+        String name;
+        Expression init;
+        if (s instanceof VariableDeclarationStatement) {
+            VariableDeclarationStatement v = (VariableDeclarationStatement) s;
+            t = v.getType();
+            name = v.getName();
+            init = v.getInitializer();
+        } else {
+            AssignmentExpression ae = (AssignmentExpression) ((ExpressionStatement) s).getExpression();
+            LocalVariableExpression lve = (LocalVariableExpression) ae.getLeft();
+            t = lve.getType();
+            name = lve.getName();
+            init = ae.getRight();
+        }
+        if (init == null || name == null) return null;
+        if (t == null || isJavaLangObject180(t)) {
+            Type it = init instanceof CastExpression ? ((CastExpression) init).getType() : init.getType();
+            if (it != null && !isJavaLangObject180(it)) t = it;
+        }
+        if ((t == null || isJavaLangObject180(t)) && init instanceof LocalVariableExpression) {
+            String src = ((LocalVariableExpression) init).getName();
+            for (Statement b : before) {
+                if (b instanceof VariableDeclarationStatement && src.equals(((VariableDeclarationStatement) b).getName())) {
+                    Type bt = ((VariableDeclarationStatement) b).getType();
+                    if (bt != null && !isJavaLangObject180(bt)) t = bt;
+                }
+            }
+        }
+        if (t == null) return null;
+        return new VariableDeclarationStatement(s.getLineNumber(), t, name, init, false, false);
+    }
+
+    private static boolean isJavaLangObject180(Type t) {
+        return t instanceof ObjectType && "java/lang/Object".equals(((ObjectType) t).getInternalName());
+    }
+    // END_CHANGE: BUG-2026-0180-9
+
     private String getAssignedVarName(Statement s) {
         if (s instanceof VariableDeclarationStatement) {
             VariableDeclarationStatement vds = (VariableDeclarationStatement) s;

@@ -6,6 +6,47 @@ A Java bytecode decompiler supporting **Java 1.0 through Java 25**, with zero ex
 
 DenzoSOFT Java Decompiler is an open-source Java decompiler that reconstructs Java source code from compiled `.class` files. It is designed to handle all Java versions from 1.0 up to Java 25 (class file format version 69).
 
+It ships as a single dependency-free JAR with three faces: a **Swing GUI** for browsing JARs, a
+**command line** for single classes and parallel batch runs, and a **library API** for embedding.
+
+**Documentation**: the [User Manual](docs/guides/guide-user-manual.md) covers installation, the GUI, every
+CLI option, the library API and how to read the decompiler's diagnostics. Technical references:
+[CLI](docs/references/ref-cli.md), [API](docs/references/ref-api.md),
+[architecture](docs/references/ref-decompilation-architecture.md).
+
+## Screenshots
+
+**Browsing a JAR.** Each opened archive gets its own tab, with a package tree on the left and one
+syntax-highlighted editor tab per decompiled class. Here: a record, try-with-resources over a
+`BufferedReader`, and a `continue` inside the read loop, all reconstructed from Java 25 bytecode.
+
+![Decompiled class in the GUI](docs/images/gui-decompiled.png)
+
+**Modern Java.** Type patterns and record deconstruction patterns (`instanceof Rectangle(double w,
+double h)`), generic for-each loops and varargs calls, read back as source. The *Classes* tab lists only
+class files, without resources.
+
+![Record patterns in the GUI](docs/images/gui-patterns.png)
+
+**Decompiler options.** Inline bytecode, JNI information for native methods and identifier
+deobfuscation are switched from the *Options* menu and apply to the classes opened next. (The GUI
+always shows the dense layout; its *Compact Output* item currently has no effect, BUG-2026-0204.)
+
+![Options menu](docs/images/gui-options.png)
+
+**Inline bytecode.** With *Show Bytecode Info* each statement is preceded by the JVM instructions it
+was decompiled from, with a plain-language note per instruction. Several archives can be open at once;
+here the decompiler is reading its own JAR.
+
+![Bytecode shown inline](docs/images/gui-bytecode.png)
+
+<details>
+<summary>Welcome screen</summary>
+
+![Welcome screen](docs/images/gui-welcome.png)
+
+</details>
+
 ## Acknowledgements
 
 This project is inspired by **[JD-Core](https://github.com/java-decompiler/jd-core)**, the Java Decompiler core library created by **Emmanuel Dupuy**.
@@ -101,7 +142,7 @@ This is a Copyleft license that gives the user the right to use, copy and modify
 - **CLI**: Single-class and JAR decompilation
 - **Batch mode**: Parallel decompilation of entire JARs/directories with thread pool
 - **Line number alignment**: Preserves original source line numbers by default (use `--compact` for dense output)
-- **Bytecode metadata**: Optional `--show-bytecode` displays bytecode size, max\_stack, max\_locals per method
+- **Inline bytecode**: Optional `--show-bytecode` prints the JVM instructions of each statement as comments before it
 - **Native method info**: Optional `--show-native-info` displays JNI function names and parameter types
 - **Trace mode**: Per-class diagnostic trace file for troubleshooting (see below)
 - **Library API**: Simple `Loader`/`Printer` interfaces for embedding
@@ -119,7 +160,7 @@ java -jar denzosoft-decompiler.jar MyClass.class
 # Compact output (no line number alignment)
 java -jar denzosoft-decompiler.jar --compact MyClass.class
 
-# Show bytecode metadata in method bodies
+# Show the JVM instructions of each statement as comments
 java -jar denzosoft-decompiler.jar --show-bytecode MyClass.class
 
 # Show JNI info for native methods
@@ -258,21 +299,16 @@ public static native void arraycopy(Object arg0, int arg1, Object arg2, int arg3
 
 #### `--deobfuscate`
 
-Sanitizes identifiers from obfuscated bytecode to produce compilable Java source. Java keywords used as names get a `_` prefix, illegal characters are replaced:
+Sanitizes identifiers from obfuscated bytecode to produce compilable Java source: illegal characters
+in names are replaced with `_`, and the obfuscation patterns in the table below are simplified or
+annotated. Java keywords used as names (fields or methods called `do`, `if`, `int`, valid in the JVM
+but not in Java) are prefixed with `_` in **every** mode, with or without this flag (BUG-2026-0049):
 
 ```java
-// Original obfuscated bytecode has fields named 'do' and 'if' (valid in JVM, invalid in Java)
-// Without --deobfuscate:
+// Original obfuscated bytecode has fields named 'do' and 'if'
 public class KwTest {
-    public int do;        // won't compile
-    public String if;     // won't compile
-    public int do() { return do; }
-}
-
-// With --deobfuscate:
-public class KwTest {
-    public int _do;       // compiles
-    public String _if;    // compiles
+    public int _do;
+    public String _if;
     public int _do() { return this._do; }
 }
 ```
@@ -542,11 +578,15 @@ it.denzosoft.javadecompiler
 
 ## Building
 
+The project targets Java 1.6 source/target, which current javac versions reject, so build it with a
+JDK 8:
+
 ```bash
-mvn clean package
+JAVA_HOME=/path/to/jdk8 mvn clean package
 ```
 
-The resulting JAR will be in `target/java-decompiler-1.13.0.jar`.
+The resulting JAR will be in `target/java-decompiler-1.13.0.jar`. Prebuilt JARs are attached to each
+[GitHub release](https://github.com/DenzoSOFTHub/DenzoSOFT-JavaDecompiler/releases).
 
 Source compatibility: **Java 1.6** (runs on any JVM 1.6+).
 Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
@@ -584,6 +624,19 @@ Class file support: **Java 1.0 through Java 25** (versions 45.0 - 69.0).
 - **Inner/anonymous/local classes** (since v1.10.0): named inner classes fully emitted, anonymous class bodies inlined into `new` expressions with captured variables (`val$`) substituted by their call-site expressions, local classes loaded and emitted (as nested members), member-inner synthetic outer parameters stripped. Inner classes are positioned at their original line locations.
 - **Type annotations** (Java 8+): Field type and method return type annotations are rendered. Annotations on generic type arguments (`List<@NonNull String>`) are not yet supported.
 - **Extreme bytecode patterns**: A handful of JDK-internal classes (Panama FFI `BindingSpecializer`, `FallbackLinker`, `ForkJoinPool`, `DirectMethodHandleDescImpl`) use bytecode patterns the decoder still can't fully reconstruct. When this happens the output contains explicit `// === DECOMPILATION NOTES ===` comment blocks identifying the pc and opcode of each unresolved site.
+
+### Known Open Defects (v1.13.0)
+
+The full list, with reproducers, is in [docs/tracking/track-bugs.md](docs/tracking/track-bugs.md).
+The ones most likely to matter on real code:
+
+- **`synchronized` inside a loop with an early `break`/`continue`** (BUG-2026-0132): the statements
+  after the block can be emitted inside it. The output compiles; the lock scope is wrong.
+- **try-with-resources** with several resources, or combined with `catch`/`finally`, can fail to
+  recompile in classes with debug information (BUG-2026-0111, BUG-2026-0130).
+- **Pattern switches**: a record-pattern switch *expression* (BUG-2026-0203) and a guarded pattern
+  switch (BUG-2026-0128) can lose their arm values; the guarded form is flagged with
+  `PATTERN_SWITCH_NOT_RECONSTRUCTED`, the record-pattern expression is not yet.
 
 ### Resolved in Previous Versions
 - **v1.13.0 — thread safety and determinism**: a static field holding per-method state made
@@ -632,7 +685,7 @@ Benchmark results (measured on project's own 180 class files):
 | Avg per class | ~0.25 ms |
 | Heap usage | ~1.7 MB for 200 classes |
 | Batch (parallel) | 150 classes in ~5 sec |
-| Thread safety | Full (one converter per call) |
+| Thread safety | One instance shareable across threads; deterministic output (v1.13.0) |
 | Security limits | Max 64KB bytecode, 200 recursion depth |
 
 ## Compilability
@@ -641,9 +694,9 @@ Decompiled output is verified to produce compilable Java source on real-world by
 
 | Test Set | Classes | Compile OK | Rate |
 |---|---|---|---|
-| **Construct matrix**, javac default debug (`-g:source,lines`) | 55 | 55 | **100%** (v1.11.0) |
-| **Construct matrix**, full debug `-g` (what Maven/Gradle emit) | 55 | 53 | **96%** (v1.11.0; was 44/55) |
-| **Construct matrix**, stripped `-g:none` (obfuscated jars) | 55 | 54 | **98%** (v1.11.0; was 53/55) |
+| **Construct matrix**, javac default debug (`-g:source,lines`) | 55 | 55 | **100%** (v1.13.0) |
+| **Construct matrix**, full debug `-g` (what Maven/Gradle emit) | 55 | 53 | **96%** (v1.13.0; was 44/55 before v1.11.0) |
+| **Construct matrix**, stripped `-g:none` (obfuscated jars) | 55 | 55 | **100%** (v1.13.0; was 54/55 in v1.12.0) |
 | **java.base** (core JDK 25) | 3,376 | 3,376 decompile OK, 0 errors | **100% decompile** |
 | **JDK 25 breadth** (random real classes, marker-clean) | 1,674 | 1,669, 0 crashes | **99.7%** (v1.10.0) |
 | **Spring Boot uber-jar** (real-world application, build A) | 1,402 | 1,402 decompile OK, 0 diagnostics | **100%** |
@@ -707,7 +760,7 @@ Recorded event types:
 
 ## Test Suite
 
-50 automated tests (49 passing, 1 known stale expectation) covering:
+81 automated tests (80 passing, 1 known stale expectation) covering:
 - Basic classes, constructors, field initialization
 - Annotations (`@Deprecated`, custom)
 - Generics (`<T extends Comparable<T>>`, `List<String>`)

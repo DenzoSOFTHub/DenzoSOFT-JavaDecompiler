@@ -141,6 +141,27 @@ public final class DuplicateDeclarationDemoter {
             recurse(((SynchronizedStatement) s).getBody(), scopes);
         } else if (s instanceof TryCatchStatement) {
             TryCatchStatement t = (TryCatchStatement) s;
+            // START_CHANGE: BUG-2026-0180-20261018-10 - A resource cannot be demoted to an
+            // assignment like other re-declarations: when its name is already declared in an
+            // enclosing scope (a method-top pre-declaration of a reused slot), give the resource a
+            // fresh name and rename its uses in the try body instead.
+            if (t.getResources() != null && t.getTryBody() instanceof BlockStatement) {
+                List<Statement> tb = ((BlockStatement) t.getTryBody()).getStatements();
+                for (int ri = 0; ri < t.getResources().size(); ri++) {
+                    if (!(t.getResources().get(ri) instanceof VariableDeclarationStatement)) continue;
+                    VariableDeclarationStatement rv = (VariableDeclarationStatement) t.getResources().get(ri);
+                    String rn = rv.getName();
+                    if (rn == null || !declaredInAnyScope(scopes, rn)) continue;
+                    String fresh = rn + "_r";
+                    while (declaredInAnyScope(scopes, fresh)) fresh = fresh + "r";
+                    AstMapper.Renamer ren = new AstMapper.Renamer(rn, fresh);
+                    for (int rj = ri; rj < t.getResources().size(); rj++) {
+                        t.getResources().set(rj, ren.map(t.getResources().get(rj)));
+                    }
+                    for (int bj = 0; bj < tb.size(); bj++) tb.set(bj, ren.map(tb.get(bj)));
+                }
+            }
+            // END_CHANGE: BUG-2026-0180-10
             scopes.add(new HashMap<String, String>());
             walkResources(t.getResources(), scopes);
             recurse(t.getTryBody(), scopes);
@@ -164,6 +185,11 @@ public final class DuplicateDeclarationDemoter {
             }
             scopes.remove(scopes.size() - 1);
         }
+    }
+
+    private static boolean declaredInAnyScope(List<Map<String, String>> scopes, String name) {
+        for (Map<String, String> m : scopes) if (m.containsKey(name)) return true;
+        return false;
     }
 
     private static void walkResources(List<Statement> resources, List<Map<String, String>> scopes) {

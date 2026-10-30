@@ -2,9 +2,25 @@
 
 All notable changes to DenzoSOFT Java Decompiler.
 
-## [1.13.0] - 2026-09-07
+## [1.13.0] - 2026-10-30
 
 ### Fixed
+- **Correctness campaign on real-world bytecode** (BUG-2026-0136 .. BUG-2026-0200, 65 items). A
+  bytecode-fingerprint and runtime-oracle hunt over `rt.jar` / `java.base` fixed silent defects in
+  control flow (if/else merges, do-while back-edges, try bodies without line numbers, `break` /
+  `continue` targets), types (a final `TypeCoercer` pass, variable-web splitting, least upper bounds,
+  NaN-correct `fcmpg`/`dcmpg`), declarations (placement, duplicates, constructor `super()` order),
+  imports (driven by what is actually rendered, simple-name collisions qualified), enum switches via
+  `$SwitchMap$`, javac 7/8 try-with-resources, short-circuit chains, anonymous classes, accessors and
+  constant inlining. New safety net: `ReachabilityChecker` (JLS 14.22) routes a structurally broken
+  method to the guaranteed `SafeStructurer`. Item files for this work were reconstructed from the code
+  at release time; 40 of the 65 have no dedicated test yet (see the release notes).
+- **`finally` ran twice** when javac's inlined copy preceded a nested `return`/`break`/`continue`
+  (BUG-2026-0129, CRITICAL).
+- **`--show-bytecode` printed nothing** (BUG-2026-0201, regression in the campaign work, fixed before
+  release).
+- **for-each over a `List<T>` parameter** came out as `for (Object x$e : xs)` plus a cast
+  (BUG-2026-0202, regression in the campaign work, fixed before release).
 - **The library is now thread-safe and decompilation is deterministic** (BUG-2026-0124, CRITICAL).
   `BooleanSimplifier` kept "does this method return boolean" — per-METHOD state — in a plain static
   field, written and reset around each call. Under the batch thread pool two tasks raced on it, so a
@@ -16,15 +32,25 @@ All notable changes to DenzoSOFT Java Decompiler.
   After the fix three multi-threaded batches are byte-identical to each other and to the
   single-threaded reference, and a shared instance driven by 8 threads over 400 classes matches the
   sequential output exactly.
-- **Constant-label and array-class pattern switches** (BUG-2026-0123, partial). javac routes an
+- **Constant-label and array-class pattern switches** (BUG-2026-0127, split from BUG-2026-0123). javac routes an
   ordinary constant switch through `SwitchBootstraps` as soon as it has a `case null`, so string and
   numeric labels arrive on the pattern path; and an array-class label is an ordinary type pattern once
   its descriptor is parsed. Both were rejected by an over-broad guard, leaving the raw dispatch with
   every arm value dropped. `java.base` raw dispatches: 7 -> 5. The guarded form remains open.
 
+### Known issues
+- `break`/`continue` out of a `synchronized` block in a loop now recompiles but moves the loop tail
+  inside the lock (BUG-2026-0132, runtime-oracle fixture `RSyncLoopExit`).
+- Record-pattern switch expressions lose their arm values with no diagnostic (BUG-2026-0203).
+- The GUI's *Compact Output* option has no effect (BUG-2026-0204).
+
 ### Added
 - `testThreadSafetyDeterminism`: decompiles the same classes sequentially and then 160 times across 8
-  threads through one shared `DenzoDecompiler`, requiring identical output. Suite is 49/50.
+  threads through one shared `DenzoDecompiler`, requiring identical output.
+- English user manual (`docs/guides/guide-user-manual.md`) and GUI screenshots in the README.
+- Runtime-oracle fixtures (`src/test/resources/runtime-oracle/`) and JD-freeze fixtures
+  (`src/test/resources/jd-freeze/`). Automated suite: 80/81 (only the stale `BasicClass` expectation
+  fails).
 - Two pattern-switch regression tests (`testConstantLabelSwitch`, `testArrayClassPatternSwitch`).
 
 ## [1.12.0] - 2026-09-06
@@ -51,9 +77,9 @@ Pattern switch (Java 21+) on real-world bytecode.
 - Two regression tests (`testQualifiedEnumCaseLabel`, `testStatementPatternSwitch`). Suite is 46/47.
 
 ### Known issues
-- BUG-2026-0123: guarded, multi-label and constant-label pattern switches still lose their arm values
-  (they travel on the operand stack to a merge the flow builder does not rebuild). 7 `java.base`
-  bodies, all flagged.
+- BUG-2026-0128: guarded pattern switches with an index restart still lose their arm values (they
+  travel on the operand stack to a merge the flow builder does not rebuild). 5 `java.base` bodies,
+  all flagged.
 
 ## [1.11.0] - 2026-09-05
 

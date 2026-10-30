@@ -46,6 +46,19 @@ public final class IdentifierSanitizer {
         return JAVA_KEYWORDS.contains(name);
     }
 
+    // START_CHANGE: BUG-2026-0153-20261017-1 - var/yield/record/sealed/permits are contextual:
+    // legal names for methods, fields and locals (rt.jar has methods called `yield` and fields
+    // called `sealed`), reserved only as type names. Renaming them everywhere broke every
+    // reference from another compilation unit, which still uses the real name.
+    private static final Set<String> CONTEXTUAL = new HashSet<String>(java.util.Arrays.asList(
+        "var", "yield", "record", "sealed", "permits", "non-sealed"));
+
+    /** True for names that can never be an identifier (category-independent). */
+    public static boolean isReservedKeyword(String name) {
+        return JAVA_KEYWORDS.contains(name) && !CONTEXTUAL.contains(name);
+    }
+    // END_CHANGE: BUG-2026-0153-1
+
     /**
      * Returns true if the name needs sanitization to be a valid Java identifier.
      */

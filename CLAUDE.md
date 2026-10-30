@@ -15,7 +15,7 @@ fixtures, so it needs JDK 25.
 
 ```bash
 JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64 mvn clean compile   # Compile (plain `mvn` fails on JDK 25)
-JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64 mvn clean package   # Build target/java-decompiler-1.12.0.jar
+JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64 mvn clean package   # Build target/java-decompiler-1.13.0.jar
 ```
 
 `mvn test` runs **no tests** — there is no JUnit dependency and no surefire configuration. The real
@@ -29,7 +29,7 @@ java -cp target/classes:target/test-classes it.denzosoft.javadecompiler.Decompil
 
 Each test compiles a source snippet with the given javac, decompiles the result, and asserts that
 expected substrings appear in the output. To run a single case, comment out the other calls in
-`DecompilerTest.main()` — there is no test selector. Current baseline: **50/51**; `BasicClass` fails
+`DecompilerTest.main()` — there is no test selector. Current baseline: **80/81**; `BasicClass` fails
 on a stale expectation (it asserts an explicit `super()` that the decompiler now correctly elides).
 Do not treat that one as a regression, and do not "fix" it by re-emitting implicit `super()`.
 
@@ -44,7 +44,22 @@ java -cp target/classes it.denzosoft.javadecompiler.Main --batch target/classes 
 **Construct matrix**: `src/test/resources/construct-matrix/` holds ~49 hand-written classes (55
 top-level, despite older docs saying 57) densely covering Java 1.0-25 constructs. The verification is a
 strict round trip — compile with JDK 25 → decompile → **recompile with JDK 25 → 0 errors**. There is no
-committed runner; drive it with a shell loop.
+committed runner; drive it with a shell loop:
+
+```bash
+JDK25=/usr/lib/jvm/java-25-openjdk-amd64; MODE="$1"; W=$(mktemp -d)   # MODE: -g:source,lines | -g | -g:none
+$JDK25/bin/javac $MODE -d $W/cls src/test/resources/construct-matrix/*.java || exit 1
+java -cp target/classes it.denzosoft.javadecompiler.Main --batch $W/cls $W/src >$W/decomp.log 2>&1
+ok=0; bad=0
+for f in $(cd $W/src && ls *.java); do
+  if $JDK25/bin/javac -d $W/re -cp $W/src $W/src/$f 2>$W/e.$f; then ok=$((ok+1))
+  else bad=$((bad+1)); echo "FAIL $f: $(head -1 $W/e.$f)"; fi
+done
+echo "$MODE : $ok ok / $bad fail"; echo "output kept in $W/src"
+```
+
+Recompiling each file separately with `-cp $W/src` (not all 55 in one javac call) is deliberate: it
+keeps one bad file from masking or cascading into the others.
 
 **Run it in all three debug modes — they are three different products**, and a defect usually lives in
 exactly one of them:
@@ -52,12 +67,73 @@ exactly one of them:
 - `-g` (full LocalVariableTable; what Maven/Gradle emit, so every production jar) — current 53/55
 - `-g:none` (no LineNumberTable; stripped and obfuscated jars) — current 55/55
 
+The two known `-g` failures are `C_RecordPattern` (`variable a is already defined`) and
+`C_VarInference` (`package Map does not exist`). They are the current baseline, not a regression you
+introduced — but any *third* failure, or a different message on these two, is.
+
 ## Verifying a decompiler fix (read this before claiming one works)
 
 **"It builds and nothing threw" proves nothing here.** The failure mode of a decompiler is output that
 compiles perfectly and means something else: a deleted `catch`, a lock that no longer wraps anything,
 a `for` counter typed `String[]`. Every one of those shipped in a release whose gates were green. Work
 through the ladder below and stop at the first rung that shows a problem.
+
+**The oracle is the ORIGINAL SOURCE, not the compiler.** A verification is only accurate if it
+establishes that the output reconstructs what the original source actually said and did. "It
+recompiles" is a syntax check — it says nothing about meaning, and every silent defect this project
+has shipped recompiled cleanly. So never report a fix as verified on a recompile alone. Where the
+fixture can be executed, the standing oracle is:
+
+```
+original source --javac--> run --> output A
+      |
+      decompile --> recompile --> run --> output B      A must equal B
+```
+
+Give fixtures a `main` that prints observable state (counters, flags, close/unlock order, the value
+each branch returns) so a divergence in MEANING shows up as a diff instead of hiding behind a clean
+compile. Where the fixture cannot be run — `java.base` classes, anything needing an environment —
+substitute the strongest available proxy in this order: statement-by-statement reading against the
+source (rung 1), a construct census (rung 5), and the bytecode itself (rung 2). Say which oracle you
+used when you report the result; "recompiles clean" on its own is not a verification, and reporting it
+as one is the specific failure this rule exists to prevent.
+
+The runner. `CLASSES=<dir>` selects the build (point it at a baseline to prove a fixture reproduces a
+defect BEFORE fixing it). Exit 0 = runtime-identical, 2 = does not recompile, 3 = **compiles but
+behaves differently** — rung 3 is the one that catches the silent class:
+
+```bash
+JDK25=/usr/lib/jvm/java-25-openjdk-amd64; SRC="$1"; MODE="${2:--g}"; W=$(mktemp -d)
+CLS=${CLASSES:-target/classes}; N=$(basename "$SRC" .java)
+$JDK25/bin/javac $MODE -d $W/cls "$SRC" || { echo "fixture does not compile"; exit 1; }
+$JDK25/bin/java -cp $W/cls $N > $W/A.txt 2>&1 || { echo "fixture does not RUN"; cat $W/A.txt; exit 1; }
+java -cp $CLS it.denzosoft.javadecompiler.Main --batch $W/cls $W/dec > $W/decomp.log 2>&1
+if ! $JDK25/bin/javac -d $W/re $W/dec/$N.java 2> $W/javac.err; then
+  echo "FAIL($MODE) $N: does not recompile"; head -3 $W/javac.err; echo "output: $W/dec/$N.java"; exit 2; fi
+$JDK25/bin/java -cp $W/re $N > $W/B.txt 2>&1
+if diff -q $W/A.txt $W/B.txt >/dev/null; then echo "PASS($MODE) $N: runtime-identical"
+else echo "FAIL($MODE) $N: BEHAVIOUR DIFFERS - compiles and means something else"
+     diff $W/A.txt $W/B.txt; echo "output: $W/dec/$N.java"; exit 3; fi
+```
+
+**The gate is proven, not just plausible.** On commit `e032be5` (pre-release v1.13.0) it returns 3 for this fixture — the
+output recompiles cleanly while the exception is no longer caught (original `open;close;caught;fin;`,
+recompiled output an uncaught `RuntimeException`):
+
+```java
+static void run() {
+    log.setLength(0);
+    try (R r = new R()) { r.boom(); }
+    catch (RuntimeException e) { log.append("caught;"); }
+    finally { log.append("fin;"); }
+}
+```
+
+Fixtures live in `src/test/resources/runtime-oracle/` (one shape each, with a table of today's exit
+code per fixture — see its README) and `src/test/resources/jd-freeze/` (record-switch shapes frozen
+against the JD retirement). Note that a plain `try (R r = new R()) { return r.use(); }` PASSES today
+while multi-resource and TWR+catch+finally do not — never assume a whole construct is broken because
+one shape is; pin the shape each fixture covers.
 
 **1. Read the code you produced.** Decompile the fixture and actually read the method. Compare it to
 the source it came from, statement by statement. This is the step that catches the silent class, and
@@ -75,19 +151,29 @@ input. Without it you cannot tell your regression from a defect that was already
 happen. Twice in this project a "regression" turned out to be the fix exposing an older bug, and once
 the reverse.
 
-**4. Recompile the output.** The construct matrix in all three debug modes (above). Necessary, never
-sufficient.
+**4. Recompile the output, then RUN it.** The construct matrix in all three debug modes (above) gives
+you the recompile half — necessary, never sufficient. For any fixture with observable behaviour,
+finish the loop: run the original and the recompiled output and diff their output. A dropped `catch`,
+a doubled `unlock()`, a lock that no longer wraps anything and a `finally` that runs twice all
+recompile perfectly and all show up here.
 
 **5. Census what recompilation cannot see.** Count the constructs that must survive and compare
 against the source: `catch (`, `finally`, `synchronized (`, `try (`. At `-g:none` this project once
 scored 53/55 on recompilation while emitting **zero** of the source's 15 `catch` clauses. A census
 would have caught it years earlier; the recompile gate never could.
 
-**6. Measure at scale, on a corpus you cannot recompile.** Batch-decompile JDK 25 `java.base`
-(~3,376 top-level classes) and count diagnostic markers and defect shapes: `__MONITORENTER__`,
-`/* inline stmt */`, `STACK_UNDERFLOW`, `SwitchBootstraps.typeSwitch`, locals re-declared in scope.
-Compare against the baseline build from step 3. Small fixtures cannot tell you whether a change helps
-or hurts across 3,376 classes; this is where net-negative changes reveal themselves.
+**6. Measure at scale.** Batch-decompile JDK 25 `java.base` (~3,376 top-level classes) and count
+diagnostic markers and defect shapes: `__MONITORENTER__`, `/* inline stmt */`, `STACK_UNDERFLOW`,
+`SwitchBootstraps.typeSwitch`, locals re-declared in scope. Compare against the baseline build from
+step 3. Small fixtures cannot tell you whether a change helps or hurts across 3,376 classes; this is
+where net-negative changes reveal themselves.
+
+`java.base` CAN also be recompiled — as a patched module, in about 9 seconds — so treat the recompile
+error count and its message histogram as a standing gate, not an impossibility. The procedure and the
+current baseline (14,286 errors across 965 of 3,376 files, and what the top messages mean) are in
+**`docs/guides/guide-corpus-gates.md`**. That guide also records a number from the analysis report that
+did NOT reproduce under a different javac invocation: quote this metric only together with the exact
+command that produced it, and always run baseline and fix through the identical procedure.
 
 **7. Distrust your measuring instrument.** Three times in one session a hand-rolled scanner reported
 numbers that were simply wrong — it counted `return x;` as a declaration, treated fields as locals,
@@ -110,19 +196,21 @@ Worked examples, with the numbers and the reasoning:
 
 **Running the decompiler:**
 ```bash
-java -jar target/java-decompiler-1.12.0.jar                                   # GUI (default)
-java -jar target/java-decompiler-1.12.0.jar <file.class>                      # CLI, line-aligned
-java -jar target/java-decompiler-1.12.0.jar --compact <file.class>            # Compact output
-java -jar target/java-decompiler-1.12.0.jar --show-bytecode <file.class>      # Inline bytecode instructions
-java -jar target/java-decompiler-1.12.0.jar --show-native-info <file.class>   # JNI info on native methods
-java -jar target/java-decompiler-1.12.0.jar --deobfuscate <file.class>        # Sanitize obfuscated names
-java -jar target/java-decompiler-1.12.0.jar <file.jar> <ClassName>            # From JAR
-java -jar target/java-decompiler-1.12.0.jar --batch <file.jar|dir> <out-dir>  # Batch (also .war/.ear/.apk)
-java -jar target/java-decompiler-1.12.0.jar --gui [file.jar ...]              # GUI explicit
-java -jar target/java-decompiler-1.12.0.jar --trace <dir> <file>              # Tracing
+java -jar target/java-decompiler-1.13.0.jar                                   # GUI (default)
+java -jar target/java-decompiler-1.13.0.jar <file.class>                      # CLI, line-aligned
+java -jar target/java-decompiler-1.13.0.jar --compact <file.class>            # Compact output
+java -jar target/java-decompiler-1.13.0.jar --show-bytecode <file.class>      # Inline bytecode instructions
+java -jar target/java-decompiler-1.13.0.jar --show-native-info <file.class>   # JNI info on native methods
+java -jar target/java-decompiler-1.13.0.jar --deobfuscate <file.class>        # Sanitize obfuscated names
+java -jar target/java-decompiler-1.13.0.jar <file.jar> <ClassName>            # From JAR
+java -jar target/java-decompiler-1.13.0.jar --batch <file.jar|dir> <out-dir>  # Batch (also .war/.ear/.apk)
+java -jar target/java-decompiler-1.13.0.jar --gui [file.jar ...]              # GUI explicit
+java -jar target/java-decompiler-1.13.0.jar --trace <dir> <file>              # Tracing
 ```
 
-**Version is tracked in two places** (keep in sync): `pom.xml` `<version>` and `DenzoDecompiler.getVersion()`.
+**Version is tracked in four places** (keep in sync): `pom.xml` `<version>`,
+`DenzoDecompiler.getVersion()`, the `README.md` H1 title plus its `target/java-decompiler-X.Y.Z.jar`
+build line, and the `ROADMAP.md` "Current state" line. `git grep -n <old-version>` finds any stragglers.
 
 **Git note**: this working copy lives on a VirtualBox shared mount, so git refuses to operate until
 the directory is marked safe (`git config --global --add safe.directory <repo path>`). The release
@@ -276,8 +364,11 @@ When beginning work on a new version:
 
 This way, when items are resolved during development, we already know where to move their files at release time.
 
-The highest released version is the newest tagged `docs/releases/v{X.Y.Z}/`; new work starts by
-bumping past it. As of this writing v1.12.0 is the latest released version.
+**The released version is the newest `git tag`, not the newest `docs/releases/` directory.** A
+release directory whose version is above the highest tag is the *in-flight* release: add resolved
+items to it and finish it, do not bump past it. As of this writing the highest tag is **v1.13.0**
+(released 2026-10-30), so the next work starts v1.14.0 (bump the version first, see *Starting a New
+Release*).
 
 ### Resolving Items (during development)
 
@@ -289,11 +380,60 @@ When an item reaches RESOLVED status:
 5. **Add** a summary line to `docs/releases/v{X.Y.Z}/release-notes.md`
 6. Mark status as CLOSED in the item file
 
+#### Severity: when sources disagree, the more critical one wins
+
+An item's severity often has two sources — the index row and an audit report, or an audit and the item
+file. **Always take the more critical of the two**, and record in the item that you did and what the
+other source said. A range (`LOW-MEDIUM`) resolves to its upper end. Never split the difference, and
+never silently pick the lower one.
+
+Under-rating costs more than over-rating here: severity is what decides whether an item is looked at
+at all, and this project's defect classes are the kind that ship silently. Worked examples:
+BUG-2026-0111 (audit HIGH vs index MEDIUM → HIGH) and BUG-2026-0116 (audit LOW-MEDIUM vs index
+LOW → MEDIUM).
+
+After changing a severity, sync it in BOTH places — the item file header and the index row. This
+lists any that have drifted apart:
+
+```bash
+for f in docs/tracking/items/BUG-*.md; do id=$(basename $f .md)
+  fs=$(grep -m1 "^\*\*Severity\*\*" $f | sed 's/^\*\*Severity\*\*: *//;s/ (.*//')
+  is=$(grep -hE "^\| $id \|" docs/tracking/track-bugs.md | awk -F'|' '{print $3}' | tr -d ' ')
+  [ "$fs" = "$is" ] || echo "DIFF $id file=$fs index=$is"
+done
+```
+
+(`track-limitations.md` and `track-optimizations.md` have no severity column — a scanner that assumes
+column 3 is severity will report false positives there.)
+
+#### Partially resolved items: CLOSE the original and SPLIT it in two
+
+Partial resolution is common here — a fix lands for `-g:none` but not for line-bearing classes, or for
+two label shapes out of three. **There is no PARTIALLY_RESOLVED status.** The original item is closed
+and replaced by two new items:
+
+1. Set the original to **CLOSED**, replace its body with a short split record — a table naming the two
+   successors and one sentence on why the halves are different problems — and move it to the release
+   directory. It keeps no content of its own.
+2. **Resolved half** → a new ID, **CLOSED**, in `docs/releases/v{X.Y.Z}/`. Carries the description,
+   analysis, solution, files modified, test case and measured results.
+3. **Open half** → a new ID, still open, in `docs/tracking/items/`, and listed in the index
+   (`track-*.md`). Carries what remains, plus **what was already tried and why it was not shipped** —
+   that section is the most valuable thing in the file, since the next attempt starts by not repeating it.
+
+Both new items carry a `**Parent/related**:` line naming the original and each other. Worked example:
+BUG-2026-0122 → BUG-2026-0125 (closed) + BUG-2026-0126 (open), and BUG-2026-0123 → BUG-2026-0127
+(closed) + BUG-2026-0128 (open), all in `docs/releases/v1.13.0/` and `docs/tracking/items/`.
+
+An item file is never copied — one ID, one file, one location. Two copies of one ID with divergent
+status is a tracking bug: `for f in docs/tracking/items/*.md; do ls docs/releases/*/$(basename $f)
+2>/dev/null; done` lists any that exist.
+
 ### Publishing a Release
 
 **Build and verify:**
 1. `JAVA_HOME=<jdk8> mvn clean compile` (must succeed)
-2. Run `DecompilerTest` with the JDK 25 javac path (50/51 — only the known `BasicClass` expectation may fail)
+2. Run `DecompilerTest` with the JDK 25 javac path (80/81 — only the known `BasicClass` expectation may fail)
 3. Run the all-class decompilation test (0 errors required)
 4. Run the construct-matrix round trip (compile → decompile → recompile clean)
 5. `JAVA_HOME=<jdk8> mvn clean package` to produce the JAR
@@ -359,7 +499,7 @@ reads `printer` and `configuration`. CLI flags reach the writer as `configuratio
 
 Key files:
 - `DenzoDecompiler.java` - Orchestrator (per-thread entry point), wraps each stage failure in `DecompilationException`
-- `Main.java` / `BatchDecompiler.java` - CLI dispatch; batch uses a thread pool whose threads get a **2MB stack** (deep recursion on complex JDK classes)
+- `Main.java` / `BatchDecompiler.java` - CLI dispatch; batch uses a thread pool whose threads get a **2MB stack** for archive input (deep recursion on complex JDK classes); directory input uses default-stack threads
 - `ClassFileToJavaSyntaxConverter.java` (~5000 lines) - Bytecode decoder (stack simulation), flow-pipeline selection, transform orchestration
 - `StructuredFlowBuilder.java` (~3100 lines) - Legacy CFG pattern matching (if/while/for/switch/ternary/do-while)
 - `service/converter/cfg/jd/` - Ported JD-Core pipeline: `ControlFlowGraphMaker` → `ControlFlowGraphReducer` (+ loop/goto reducers) → `JdFlowBuilder` emitter
@@ -390,8 +530,13 @@ the output. Guiding principle from `JdFlowBuilder`: *"Every truncation is a grav
 blocks are emitted inline, never silently dropped. Prefer degraded-but-complete output over losing
 statements, and prefer a recorded diagnostic over a silent miscompilation.
 
-ROADMAP §3 has an open decision on whether to invest the JD pipeline to parity or retire it — check
-there before doing large work on either builder.
+**The JD pipeline is being RETIRED** — decided 2026-09-07, tracked as IMP-2026-0072 (ROADMAP §3).
+Measurement showed it loses control flow outright: with the flag on a `for` becomes a single
+`if`/`else return` with the back-edge dropped, which compiles in a `void` method and is silently
+wrong. Do not invest in it, and do not build new work on it. It is still in the tree because its
+selective route is the only thing that folds record-deconstruction switches today; the retirement is
+sequenced freeze → port the value merge to legacy (BUG-2026-0128) → route to legacy → delete
+`cfg/jd/`. Read IMP-2026-0072 before touching either builder.
 
 ### Transform chain
 

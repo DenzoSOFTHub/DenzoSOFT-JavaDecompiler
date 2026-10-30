@@ -95,7 +95,18 @@ public final class ForLoopDetector {
                         if (prevDecl.getType() != null && currDecl.getType() != null
                             && prevDecl.getType().getName().equals(currDecl.getType().getName())) {
                             // Check for second update at end of body
-                            if (forBody.size() >= 1) {
+                            // START_CHANGE: BUG-2026-0197-20261018-1 - Both counters must be dead
+                            // after the loop: a counter read later is hoisted out by the
+                            // LocalDeclarationFixer, which demoted ONE of the two declarations and
+                            // left the illegal mixed init `for (m = .., int n = ..; ..)`
+                            // (java/lang/Throwable.printEnclosedStackTrace reads m after the loop).
+                            boolean usedAfter197 = false;
+                            for (int k = i + 2; k < statements.size() && !usedAfter197; k++) {
+                                if (nameUsedInStatement(statements.get(k), prevVarName)
+                                        || nameUsedInStatement(statements.get(k), initVarName)) usedAfter197 = true;
+                            }
+                            // END_CHANGE: BUG-2026-0197-1
+                            if (forBody.size() >= 1 && !usedAfter197) {
                                 Statement secondLastInBody = forBody.get(forBody.size() - 1);
                                 if (isUpdateOf(secondLastInBody, prevVarName)) {
                                     // Multi-init: combine two inits into a BlockStatement

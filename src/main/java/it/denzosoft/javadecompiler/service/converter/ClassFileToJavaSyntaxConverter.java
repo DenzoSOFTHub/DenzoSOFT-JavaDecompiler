@@ -26,6 +26,7 @@ import it.denzosoft.javadecompiler.util.SignatureParser;
 import it.denzosoft.javadecompiler.DecompilerLimits;
 import it.denzosoft.javadecompiler.service.converter.cfg.BasicBlock;
 import it.denzosoft.javadecompiler.service.converter.cfg.ControlFlowGraph;
+import it.denzosoft.javadecompiler.service.converter.cfg.Javac7TwrNormalizer;
 import it.denzosoft.javadecompiler.service.converter.cfg.StructuredFlowBuilder;
 // START_CHANGE: BUG-2026-0097-20260610-6 - Walker/rewriter used to restore captured-variable names
 import it.denzosoft.javadecompiler.service.converter.transform.AstLocalRewriter;
@@ -61,6 +62,10 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             && Boolean.TRUE.equals(config0007.get("showBytecode"));
         // END_CHANGE: OPT-0007-1
 
+        // START_CHANGE: BUG-2026-0161-20261018-1 - Class hierarchy for structural checks.
+        Loader loader161 = message.getHeader("loader");
+        this.hierarchy = new it.denzosoft.javadecompiler.service.converter.cfg.ClassHierarchy(loader161);
+        // END_CHANGE: BUG-2026-0161-1
         JavaSyntaxResult result = convert(classFile);
 
         // Process inner classes - load and decompile each one
@@ -136,6 +141,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     ClassFile innerCf = deser.deserialize(innerData);
 
                     ClassFileToJavaSyntaxConverter innerConverter = new ClassFileToJavaSyntaxConverter();
+                    innerConverter.hierarchy = this.hierarchy; // BUG-2026-0161
                     JavaSyntaxResult innerResult = innerConverter.convert(innerCf);
                     innerResult.setInnerClass(true);
                     innerResult.setInnerClassAccessFlags(ic.accessFlags);
@@ -350,6 +356,28 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         currentClassInternalName = classFile.getThisClassName();
         currentSuperClassInternalName = classFile.getSuperClassName();
         // END_CHANGE: ISS-2026-0010-2
+        // START_CHANGE: BUG-2026-0140-20261017-1 - Remember the class-file version so that
+        // language-level-dependent rewrites (pattern instanceof, Java 16) never fire on older classes.
+        currentMajorVersion = classFile.getMajorVersion();
+        // END_CHANGE: BUG-2026-0140-1
+        // START_CHANGE: BUG-2026-0157-20261017-1 - Fields whose declared type is a type variable
+        // (`T value;`): the descriptor says Object, the source type is T.
+        currentFieldTypeVars = new HashMap<String, Type>();
+        currentGenericFields = new HashSet<String>();
+        if (classFile.getFields() != null) {
+            for (FieldInfo f157 : classFile.getFields()) {
+                SignatureAttribute sa157 = f157.findAttribute("Signature");
+                if (sa157 != null && sa157.getSignature() != null && sa157.getSignature().startsWith("T")
+                        && sa157.getSignature().endsWith(";")) {
+                    String tv = sa157.getSignature().substring(1, sa157.getSignature().length() - 1);
+                    currentFieldTypeVars.put(classFile.getThisClassName() + "." + f157.getName(), new GenericType(tv));
+                }
+                if (sa157 != null && sa157.getSignature() != null && sa157.getSignature().indexOf('<') >= 0) {
+                    currentGenericFields.add(classFile.getThisClassName() + "." + f157.getName()); // BUG-2026-0165
+                }
+            }
+        }
+        // END_CHANGE: BUG-2026-0157-1
         JavaSyntaxResult result = new JavaSyntaxResult();
         result.setMajorVersion(classFile.getMajorVersion());
         result.setMinorVersion(classFile.getMinorVersion());
@@ -575,6 +603,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         ConstantValueAttribute cv = field.findAttribute("ConstantValue");
         if (cv != null) {
             initialValue = getConstantExpression(cv.getConstantValueIndex(), classFile.getConstantPool());
+            // START_CHANGE: BUG-2026-0142-20261017-5 - A boolean ConstantValue is stored as an int.
+            if ("Z".equals(field.getDescriptor()) && initialValue instanceof IntegerConstantExpression) {
+                initialValue = ((IntegerConstantExpression) initialValue).getValue() != 0
+                    ? BooleanExpression.TRUE : BooleanExpression.FALSE;
+            }
+            // END_CHANGE: BUG-2026-0142-5
         }
 
         SignatureAttribute sig = field.findAttribute("Signature");
@@ -651,6 +685,16 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
 
         // Decompile method body
         List<Statement> bodyStatements = new ArrayList<Statement>();
+        // START_CHANGE: BUG-2026-0180-20261018-2 - Normalize the javac 7/8 try-with-resources
+        // desugaring into a plain try/finally before any decoding (see Javac7TwrNormalizer).
+        twrHandlerPcs = java.util.Collections.<Integer>emptySet();
+        classMajorVersion182 = classFile.getMajorVersion(); // BUG-2026-0182
+        if (code != null && classFile.getMajorVersion() >= 51) {
+            Javac7TwrNormalizer.Result twr = Javac7TwrNormalizer.normalize(code, classFile.getConstantPool());
+            code = twr.code;
+            twrHandlerPcs = twr.twrHandlerPcs;
+        }
+        // END_CHANGE: BUG-2026-0180-2
         if (code != null) {
             bodyStatements = decompileMethodBody(code, classFile.getConstantPool(), method);
         }
@@ -722,6 +766,91 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             }
         }
         // END_CHANGE: BUG-2026-0031-1
+
+        // START_CHANGE: BUG-2026-0142-20261017-4 - Last step on the body: make every implicit JVM
+        // conversion (int<->boolean, int->byte/short/char, Object->T) explicit, from the types the
+        // class file states for certain.
+        // START_CHANGE: BUG-2026-0150-20261017-1 - Leftover `v = $exception;` handler stores.
+        bodyStatements = it.denzosoft.javadecompiler.service.converter.transform.CatchVarNormalizer.normalize(bodyStatements);
+        // END_CHANGE: BUG-2026-0150-1
+        // START_CHANGE: BUG-2026-0148-20261017-2 - Asserts anywhere in the tree (catch bodies,
+        // switch cases, loops, labels): reconstructAsserts only recursed into blocks and ifs, so
+        // every other assert left a reference to the unprintable synthetic $assertionsDisabled.
+        bodyStatements = new it.denzosoft.javadecompiler.service.converter.transform.AstMapper() {
+            @Override
+            public Statement map(Statement s) {
+                // the <clinit> initialization of the synthetic field itself is left to the writer
+                if (s instanceof ExpressionStatement && ((ExpressionStatement) s).getExpression() instanceof AssignmentExpression) {
+                    Expression l148 = ((AssignmentExpression) ((ExpressionStatement) s).getExpression()).getLeft();
+                    if (l148 instanceof FieldAccessExpression
+                            && "$assertionsDisabled".equals(((FieldAccessExpression) l148).getName())) {
+                        return s;
+                    }
+                }
+                Statement a = s instanceof IfStatement ? tryReconstructAssert(s) : null;
+                if (a == null && s instanceof IfStatement) a = tryReconstructNestedAssert((IfStatement) s);
+                return a != null ? a : super.map(s);
+            }
+            @Override
+            public Expression map(Expression e) {
+                // Any reference the assert reconstruction could not absorb: the synthetic field is
+                // not source, its value is the negated desired assertion status of its class.
+                if (e instanceof FieldAccessExpression
+                        && "$assertionsDisabled".equals(((FieldAccessExpression) e).getName())
+                        && ((FieldAccessExpression) e).getObject() == null) {
+                    String owner = ((FieldAccessExpression) e).getOwnerInternalName();
+                    int line = e.getLineNumber();
+                    Expression status = new MethodInvocationExpression(line, PrimitiveType.BOOLEAN,
+                        new ClassExpression(line, new ObjectType(owner)), "java/lang/Class",
+                        "desiredAssertionStatus", "()Z", new ArrayList<Expression>());
+                    return new UnaryOperatorExpression(line, PrimitiveType.BOOLEAN, "!", status, true);
+                }
+                return super.map(e);
+            }
+        }.mapList(bodyStatements);
+        // END_CHANGE: BUG-2026-0148-2
+        // START_CHANGE: BUG-2026-0158-20261017-1 - One name, several variables of different types.
+        bodyStatements = it.denzosoft.javadecompiler.service.converter.transform.VariableWebSplitter.split(
+            bodyStatements, paramNames, paramTypes);
+        // END_CHANGE: BUG-2026-0158-1
+        // START_CHANGE: BUG-2026-0144-20261017-1 - Declare locals that no enclosing declaration covers.
+        bodyStatements = it.denzosoft.javadecompiler.service.converter.transform.LocalDeclarationFixer.fix(
+            bodyStatements, paramNames, "<init>".equals(method.getName()));
+        // END_CHANGE: BUG-2026-0144-1
+        // START_CHANGE: BUG-2026-0157-20261017-2 - Source return / parameter types that are type
+        // variables come from the Signature attribute (the descriptor has their erasure).
+        Type srcReturn157 = returnType;
+        List<Type> srcParams157 = paramTypes;
+        if (signature != null) {
+            int close157 = signature.lastIndexOf(')');
+            String rs157 = close157 >= 0 ? signature.substring(close157 + 1) : null;
+            if (rs157 != null && rs157.startsWith("T") && rs157.endsWith(";") && rs157.indexOf('^') < 0) {
+                srcReturn157 = new GenericType(rs157.substring(1, rs157.length() - 1));
+            }
+        }
+        it.denzosoft.javadecompiler.service.converter.transform.TypeCoercer.setGenericFields(currentGenericFields);
+        // START_CHANGE: BUG-2026-0202-20261030-1 - Parameters declared with type arguments in the
+        // method Signature are as generic as an LVTT-typed local: without this the BUG-2026-0159
+        // raw-Iterable rewrite fired on `for (Double x : xs)` over a `List<Double>` parameter.
+        it.denzosoft.javadecompiler.service.converter.transform.TypeCoercer.setGenericParams(
+            genericParamNames202(signature, paramNames));
+        // END_CHANGE: BUG-2026-0202-1
+        bodyStatements = it.denzosoft.javadecompiler.service.converter.transform.TypeCoercer.coerce(
+            bodyStatements, paramNames, srcParams157, srcReturn157, currentFieldTypeVars, hierarchy);
+        // END_CHANGE: BUG-2026-0157-2
+        // START_CHANGE: BUG-2026-0176-20261018-1 - Short-circuit boolean chains back from the
+        // exponentially duplicated ternary trees the flow builder emits for them.
+        bodyStatements = it.denzosoft.javadecompiler.service.converter.transform.ShortCircuitRebuilder.rebuild(bodyStatements);
+        // END_CHANGE: BUG-2026-0176-1
+        // START_CHANGE: BUG-2026-0162-20261018-1 - No local declared while one of the same name is in scope.
+        bodyStatements = it.denzosoft.javadecompiler.service.converter.transform.DuplicateDeclarationResolver.resolve(
+            bodyStatements, paramNames, paramTypes);
+        // END_CHANGE: BUG-2026-0162-1
+        // START_CHANGE: BUG-2026-0166-20261018-3 - Enum switches compiled through a $SwitchMap$ table.
+        bodyStatements = it.denzosoft.javadecompiler.service.converter.transform.EnumSwitchMapResolver.resolve(
+            bodyStatements, hierarchy);
+        // END_CHANGE: BUG-2026-0166-3
+        // END_CHANGE: BUG-2026-0142-4
 
         JavaSyntaxResult.MethodDeclaration md = new JavaSyntaxResult.MethodDeclaration(
             method.getAccessFlags(), method.getName(), method.getDescriptor(),
@@ -1199,6 +1328,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
      */
     private List<Statement> decompileMethodBody(CodeAttribute codeAttr, ConstantPool pool, MethodInfo method) {
         byte[] bytecode = codeAttr.getCode();
+        lvtSlotRanges191 = null; // BUG-2026-0191: per-method, rebuilt with the LVT index below
 
         if (bytecode.length > DecompilerLimits.MAX_METHOD_BYTECODE_SIZE) {
             // Fall back to linear decoder for oversized methods
@@ -1298,6 +1428,9 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     }
                 }
             }
+            // START_CHANGE: BUG-2026-0191-20261018-2 - keep every slot's scopes (see isUncoveredSlotPc191)
+            lvtSlotRanges191 = bySlot103.isEmpty() ? null : bySlot103;
+            // END_CHANGE: BUG-2026-0191-2
             for (Map.Entry<Integer, List<LvtRange>> e103 : bySlot103.entrySet()) {
                 Set<String> distinct103 = new HashSet<String>();
                 for (int i103 = 0; i103 < e103.getValue().size(); i103++) {
@@ -1323,6 +1456,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         slotRenames = new HashMap<Integer, String>();
         slotSplitCounts = new HashMap<Integer, Integer>();
         // END_CHANGE: BUG-2026-0096-2
+        slotIdent191 = new SlotIdent191(); // BUG-2026-0191
         String[] paramDescs = TypeNameUtil.parseMethodParameterDescriptors(method.getDescriptor());
         int paramSlot = method.isStatic() ? 0 : 1;
         for (int pi = 0; pi < paramDescs.length; pi++) {
@@ -1460,6 +1594,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         String varName = (String) entry.getValue();
                         preDeclarations.add(new VariableDeclarationStatement(0, varType, varName, null, false, false));
                         declaredVars.add(idx);
+                        slotIdent191.declaredNames.add(varName); // BUG-2026-0191
                     }
                 }
             }
@@ -1524,7 +1659,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     // emitter preserves the clean desugar (MatchException try/catch + if(1!=0) + nested
                     // instanceof + value in place), which these folders reconstruct into real patterns.
                     jdResult = it.denzosoft.javadecompiler.service.converter.transform.RecordPatternReconstructor.reconstruct(jdResult);
+                    // START_CHANGE: BUG-2026-0140-20261017-3 - Pattern instanceof only exists from Java 16 (major 60).
+                    if (currentMajorVersion >= 60) {
                     jdResult = it.denzosoft.javadecompiler.service.converter.transform.InstanceOfPatternReconstructor.reconstruct(jdResult);
+                    }
+                    // END_CHANGE: BUG-2026-0140-3
                     jdResult = it.denzosoft.javadecompiler.service.converter.transform.RecordDeconstructionFolder.reconstruct(jdResult);
                     // BUG-2026-0079: fold the typeSwitch record-pattern switch into `return switch(subj){...}`.
                     jdResult = it.denzosoft.javadecompiler.service.converter.transform.TypeSwitchRecordFolder.reconstruct(jdResult);
@@ -1594,16 +1733,27 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             slotRenames = new HashMap<Integer, String>();
             slotSplitCounts = new HashMap<Integer, Integer>();
             // END_CHANGE: BUG-2026-0096-3
+            slotIdent191 = new SlotIdent191(); // BUG-2026-0191
         }
         // END_CHANGE: IMP-2026-0062-18
 
+        // START_CHANGE: BUG-2026-0152-20261017-3 - Decode state before the legacy builder runs,
+        // restored for the SafeStructurer fallback.
+        final Set<Integer> preLegacyDeclared152 = declaredVars == null ? null : new HashSet<Integer>(declaredVars);
+        final Map<String, List<String>> preLegacyPatternLabels152 = patternSwitchLabels == null
+            ? null : new HashMap<String, List<String>>(patternSwitchLabels);
+        // END_CHANGE: BUG-2026-0152-3
         // Build structured statements from CFG
         StructuredFlowBuilder builder = new StructuredFlowBuilder(cfg, decoder);
+        builder.setStatementPcs(statementPcs); // BUG-2026-0181
         // START_CHANGE: BUG-2026-0066-20260610-16 - Tell the flow builder whether `ireturn`
         // returns a boolean so reconstructed switch-expression arms with int 0/1 values render
         // as boolean literals (BooleanSimplifier runs too late to descend into the arms).
         builder.setMethodReturnsBoolean(
             "Z".equals(TypeNameUtil.parseMethodReturnDescriptor(method.getDescriptor())));
+        // START_CHANGE: BUG-2026-0140-20261017-7 - Pattern bindings only for Java 16+ classes.
+        builder.setAllowPatternBinding(currentMajorVersion >= 60);
+        // END_CHANGE: BUG-2026-0140-7
         // END_CHANGE: BUG-2026-0066-16
         // START_CHANGE: BUG-2026-0067-20260610-56 - Expose the typeSwitch bootstrap labels to the
         // flow builder so it can synthesize unnamed type-pattern arms (`case Integer _ ->`),
@@ -1664,6 +1814,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 // try-region membership no longer depends on the LineNumberTable.
                 tryCatchReconstructor.setStatementPcs(statementPcs);
                 // END_CHANGE: BUG-2026-0100-8
+                tryCatchReconstructor.setTwrHandlerPcs(twrHandlerPcs); // BUG-2026-0180
+                tryCatchReconstructor.setClassMajorVersion(classMajorVersion182); // BUG-2026-0182
                 result = tryCatchReconstructor.reconstruct(result, codeAttr.getExceptionTable());
                 // BUG-2026-0068: collapse the Java 9+ try-with-resources desugar into `try (res) {...}`.
                 result = it.denzosoft.javadecompiler.service.converter.transform.ModernTwrReconstructor.reconstruct(result);
@@ -1710,7 +1862,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 // START_CHANGE: BUG-2026-0064-20260608-1 - Reconstruct instanceof pattern bindings
                 // BUG-2026-0069: strip record-pattern MatchException try/catch scaffolding + always-true ifs.
                 result = it.denzosoft.javadecompiler.service.converter.transform.RecordPatternReconstructor.reconstruct(result);
-                result = it.denzosoft.javadecompiler.service.converter.transform.InstanceOfPatternReconstructor.reconstruct(result);
+                // START_CHANGE: BUG-2026-0140-20261017-4 - Pattern instanceof only exists from Java 16 (major 60).
+                if (currentMajorVersion >= 60) {
+                    result = it.denzosoft.javadecompiler.service.converter.transform.InstanceOfPatternReconstructor.reconstruct(result);
+                }
+                // END_CHANGE: BUG-2026-0140-4
                 // BUG-2026-0067: fold record-deconstruction component extraction into `instanceof Type(comp, ...)`.
                 result = it.denzosoft.javadecompiler.service.converter.transform.RecordDeconstructionFolder.reconstruct(result);
                 // END_CHANGE: BUG-2026-0064-1
@@ -1747,8 +1903,19 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 // Prepend variable pre-declarations (for vars used across if/else branches)
                 if (!preDeclarations.isEmpty()) {
                     List<Statement> withDecls = new ArrayList<Statement>();
+                    // START_CHANGE: BUG-2026-0190-20261018-1 - In a constructor the declarations go
+                    // after the explicit super(..)/this(..) call, which must stay the first statement.
+                    int ctorCall190 = -1;
+                    if ("<init>".equals(method.getName())) {
+                        for (int ci190 = 0; ci190 < result.size() && ci190 < 8; ci190++) {
+                            if (it.denzosoft.javadecompiler.service.converter.transform.LocalDeclarationFixer
+                                    .isConstructorCall(result.get(ci190))) { ctorCall190 = ci190; break; }
+                        }
+                    }
+                    for (int ci190 = 0; ci190 <= ctorCall190; ci190++) withDecls.add(result.get(ci190));
                     withDecls.addAll(preDeclarations);
-                    withDecls.addAll(result);
+                    for (int ci190 = ctorCall190 + 1; ci190 < result.size(); ci190++) withDecls.add(result.get(ci190));
+                    // END_CHANGE: BUG-2026-0190-1
                     result = withDecls;
                 }
                 // Post-process: merge separate declaration + assignment into single declaration
@@ -1766,6 +1933,14 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                         + " missing from this body");
                 }
                 // END_CHANGE: BUG-2026-0109-2
+                // START_CHANGE: BUG-2026-0152-20261017-4 - Structural validation of the legacy
+                // result; a body javac would reject (unreachable code, missing return, a break
+                // with no target - the marks of a lost or misplaced block) is rebuilt by the
+                // SafeStructurer, which is accepted only when it validates itself.
+                List<Statement> safe152 = safeFallback(result, codeAttr, pool, method, decoder,
+                    preLegacyDeclared152, preLegacyPatternLabels152, preDeclarations);
+                if (safe152 != null) return safe152;
+                // END_CHANGE: BUG-2026-0152-4
                 return result;
             }
         } catch (Exception e) {
@@ -1777,8 +1952,101 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             // Fallback to linear scan
         }
 
+        // START_CHANGE: BUG-2026-0152-20261017-5 - The structured builder threw: try the
+        // SafeStructurer before degrading to the linear scan.
+        {
+            List<Statement> safe152 = safeFallback(null, codeAttr, pool, method, decoder,
+                preLegacyDeclared152, preLegacyPatternLabels152, preDeclarations);
+            if (safe152 != null) return safe152;
+        }
+        // END_CHANGE: BUG-2026-0152-5
         return decompileMethodBodyLinear(codeAttr, pool, method, pcToLine, localVarNames, localVarDescriptors);
     }
+
+    // START_CHANGE: BUG-2026-0152-20261017-6 - SafeStructurer fallback (see SafeStructurer).
+    private static final boolean FORCE_SAFE_FLOW = "1".equals(System.getenv("DENZO_SAFE_FLOW"))
+        || Boolean.getBoolean("denzo.safe.flow");
+
+    /**
+     * @param legacy the legacy result, or null when the legacy builder failed
+     * @return the SafeStructurer body when the legacy one is structurally invalid (or forced)
+     *         and the safe one is valid; null to keep the legacy result
+     */
+    private List<Statement> safeFallback(List<Statement> legacy, CodeAttribute codeAttr, ConstantPool pool,
+            MethodInfo method, StructuredFlowBuilder.BytecodeDecoder decoder, Set<Integer> declared,
+            Map<String, List<String>> patternLabels, List<Statement> preDecls) {
+        String retDesc = TypeNameUtil.parseMethodReturnDescriptor(method.getDescriptor());
+        boolean nonVoid = !"V".equals(retDesc);
+        // START_CHANGE: BUG-2026-0161-20261018-2 - Checked exceptions are part of the structural check.
+        String[] declared161 = null;
+        ExceptionsAttribute exa161 = method.findAttribute("Exceptions");
+        if (exa161 != null) declared161 = exa161.getExceptions();
+        if (legacy != null && !FORCE_SAFE_FLOW) {
+            if (it.denzosoft.javadecompiler.service.converter.cfg.ReachabilityChecker.check(legacy, nonVoid).isEmpty()
+                    && (hierarchy == null || it.denzosoft.javadecompiler.service.converter.cfg.ExceptionChecker.check(
+                        legacy, hierarchy, declared161, currentSuperClassInternalName, currentClassInternalName).isEmpty())) {
+                return null;
+            }
+        }
+        // END_CHANGE: BUG-2026-0161-2
+        // decode state as it was before the legacy builder, so declarations are re-decided
+        Set<Integer> savedDeclared = declaredVars;
+        Map<Integer, Integer> savedCats = slotDeclCategories;
+        Map<Integer, String> savedRenames = slotRenames;
+        Map<Integer, Integer> savedSplits = slotSplitCounts;
+        SlotIdent191 savedIdent191 = slotIdent191; // BUG-2026-0191
+        Map<String, List<String>> savedLabels = patternSwitchLabels;
+        int diagSnapshot = currentMethodDiagnostics.size();
+        declaredVars = declared == null ? new HashSet<Integer>() : new HashSet<Integer>(declared);
+        slotDeclCategories = new HashMap<Integer, Integer>();
+        slotRenames = new HashMap<Integer, String>();
+        slotSplitCounts = new HashMap<Integer, Integer>();
+        slotIdent191 = new SlotIdent191(); // BUG-2026-0191
+        patternSwitchLabels = patternLabels == null ? null : new HashMap<String, List<String>>(patternLabels);
+        List<Statement> safe = null;
+        try {
+            ControlFlowGraph cfg2 = new ControlFlowGraph(currentBytecode, codeAttr.getExceptionTable());
+            cfg2.build();
+            safe = new it.denzosoft.javadecompiler.service.converter.cfg.SafeStructurer(
+                cfg2, currentBytecode, codeAttr.getExceptionTable(), decoder, pool).build();
+            safe = CompoundAssignmentSimplifier.simplify(safe);
+            if (preDecls != null && !preDecls.isEmpty()) {
+                List<Statement> withDecls = new ArrayList<Statement>(preDecls);
+                withDecls.addAll(safe);
+                safe = withDecls;
+            }
+            boolean newDiag = currentMethodDiagnostics.size() > diagSnapshot;
+            if (System.getenv("DENZO_SAFE_DEBUG") != null) {
+                System.err.println("SAFE " + currentClassInternalName + "." + method.getName() + " diag=" + newDiag + " problems="
+                    + it.denzosoft.javadecompiler.service.converter.cfg.ReachabilityChecker.check(safe, nonVoid));
+            }
+            if (newDiag || !it.denzosoft.javadecompiler.service.converter.cfg.ReachabilityChecker.check(safe, nonVoid).isEmpty()
+                    || (hierarchy != null && !it.denzosoft.javadecompiler.service.converter.cfg.ExceptionChecker.check(
+                        safe, hierarchy, declared161, currentSuperClassInternalName, currentClassInternalName).isEmpty())) {
+                safe = null;
+            }
+        } catch (it.denzosoft.javadecompiler.service.converter.cfg.SafeStructurer.Failure f) {
+            if (System.getenv("DENZO_SAFE_DEBUG") != null) System.err.println("SAFE " + currentClassInternalName + "." + method.getName() + " declined: " + f.getMessage());
+            safe = null;
+        } catch (RuntimeException e) {
+            safe = null;
+        }
+        if (safe == null) {
+            // keep the legacy body and the legacy decode state
+            while (currentMethodDiagnostics.size() > diagSnapshot) {
+                currentMethodDiagnostics.remove(currentMethodDiagnostics.size() - 1);
+            }
+            declaredVars = savedDeclared;
+            slotDeclCategories = savedCats;
+            slotRenames = savedRenames;
+            slotSplitCounts = savedSplits;
+            slotIdent191 = savedIdent191; // BUG-2026-0191
+            patternSwitchLabels = savedLabels;
+            return null;
+        }
+        return safe;
+    }
+    // END_CHANGE: BUG-2026-0152-6
 
     // START_CHANGE: ISS-2026-0010-20260323-1 - Track current class internal name for this() vs super() detection
     private String currentClassInternalName;
@@ -1787,6 +2055,17 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     // can distinguish a legitimate super(args) call from an embedded `new X(args)` when both
     // appear in the same constructor body.
     private String currentSuperClassInternalName;
+    // START_CHANGE: BUG-2026-0140-20261017-2 - Class-file major version of the class being converted.
+    private int currentMajorVersion;
+    // END_CHANGE: BUG-2026-0140-2
+    // BUG-2026-0161: class hierarchy view (null when no loader context).
+    private it.denzosoft.javadecompiler.service.converter.cfg.ClassHierarchy hierarchy;
+    // BUG-2026-0157: owner.field -> type variable of fields declared with one.
+    private Map<String, Type> currentFieldTypeVars = new HashMap<String, Type>();
+    private Set<String> currentGenericFields = new HashSet<String>();
+    // START_CHANGE: BUG-2026-0147-20261017-6 - Entry-stack top of the block being decoded.
+    private Expression currentDecodeEntryTop;
+    // END_CHANGE: BUG-2026-0147-6
     // END_CHANGE: BUG-2026-0055-4
     // START_CHANGE: BUG-2026-0082-20260610-1 - Pending iinc state: an `iinc` decoded with no
     // matching value on the operand stack is held here so it can fuse as a PREFIX ++var/--var
@@ -1850,6 +2129,11 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     private java.util.IdentityHashMap<Statement, Integer> statementPcs =
         new java.util.IdentityHashMap<Statement, Integer>();
     // END_CHANGE: BUG-2026-0100-1
+    // START_CHANGE: BUG-2026-0180-20261018-3 - Handler pcs of try/finally regions produced by
+    // Javac7TwrNormalizer: the reconstructor folds them into try-with-resources unconditionally.
+    private java.util.Set<Integer> twrHandlerPcs = java.util.Collections.<Integer>emptySet();
+    private int classMajorVersion182 = -1; // BUG-2026-0182: class-file major version
+    // END_CHANGE: BUG-2026-0180-3
 
     // START_CHANGE: BUG-2026-0103-20260905-1 - Range-aware LocalVariableTable lookup.
     // The LVT is otherwise flattened to one name/descriptor per SLOT (last entry wins), so two
@@ -1896,6 +2180,82 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         return best;
     }
     // END_CHANGE: BUG-2026-0103-1
+
+    // START_CHANGE: BUG-2026-0191-20261018-1 - Slot accesses outside every LocalVariableTable
+    // scope. javac emits no LVT entry for its own temporaries (the for-each array/length/index
+    // `arr$`/`len$`/`i$`, the iterator, switch-on-string and finally temps) and later reuses their
+    // slots for named variables. The flattened slot->name map then gave the temporary the NAME
+    // and the TYPE of an unrelated variable of the same slot, merging the two:
+    // `setName = name_1.length; setter = 0; while (setter < setName)` with setName a String and
+    // setter a Method (com.oracle.webservices.internal.api.message.BasePropertySet). An access
+    // at a pc covered by no entry of its slot (with the same store near-miss tolerance as
+    // resolveSlotRange) is therefore a variable of its own, named `var<slot>[_k]` and typed
+    // from the stored value; a later store that opens a NAMED variable on that slot is a new
+    // declaration instead of an assignment to the temporary.
+    private Map<Integer, List<LvtRange>> lvtSlotRanges191;
+    private SlotIdent191 slotIdent191 = new SlotIdent191();
+
+    /** Per-method naming state of the uncovered (LVT-less) slot accesses. */
+    private static final class SlotIdent191 {
+        final Map<Integer, String> uncoveredName = new HashMap<Integer, String>();
+        final Map<Integer, Type> uncoveredType = new HashMap<Integer, Type>();
+        final Map<Integer, Integer> uncoveredCount = new HashMap<Integer, Integer>();
+        final Map<Integer, String> lastStoredName = new HashMap<Integer, String>();
+        final Set<String> declaredNames = new HashSet<String>();
+        final Set<String> syntheticNames = new HashSet<String>();
+    }
+
+    private boolean isUncoveredSlotPc191(int slot, int pc) {
+        if (lvtSlotRanges191 == null || pc < 0) return false;
+        List<LvtRange> ranges = lvtSlotRanges191.get(Integer.valueOf(slot));
+        if (ranges == null) return false;
+        for (int i = 0; i < ranges.size(); i++) {
+            LvtRange r = ranges.get(i);
+            if (pc >= r.startPc && pc < r.endPc) return false;
+            int delta = r.startPc - pc;
+            if (delta > 0 && delta <= 4) return false;
+        }
+        return true;
+    }
+
+    /** The LVT entry of {@code slot} live at {@code pc} (or opened by a store at pc), or null. */
+    private LvtRange lvtRangeAt191(int slot, int pc) {
+        if (lvtSlotRanges191 == null || pc < 0) return null;
+        List<LvtRange> ranges = lvtSlotRanges191.get(Integer.valueOf(slot));
+        if (ranges == null) return null;
+        LvtRange best = null;
+        for (int i = 0; i < ranges.size(); i++) {
+            LvtRange r = ranges.get(i);
+            if (pc >= r.startPc && pc < r.endPc) return r;
+            int delta = r.startPc - pc;
+            if (delta > 0 && delta <= 4 && (best == null || r.startPc < best.startPc)) best = r;
+        }
+        return best;
+    }
+
+    /** Fresh name for a new uncovered region of {@code slot}, distinct from every LVT name. */
+    private String newUncoveredName191(int slot) {
+        Integer prev = slotIdent191.uncoveredCount.get(Integer.valueOf(slot));
+        int k = prev == null ? 0 : prev.intValue();
+        while (true) {
+            String n = k == 0 ? "var" + slot : "var" + slot + "_" + k;
+            k++;
+            if (!isLvtName191(n)) {
+                slotIdent191.uncoveredCount.put(Integer.valueOf(slot), Integer.valueOf(k));
+                slotIdent191.syntheticNames.add(n);
+                return n;
+            }
+        }
+    }
+
+    private boolean isLvtName191(String n) {
+        if (lvtSlotRanges191 == null) return false;
+        for (List<LvtRange> rs : lvtSlotRanges191.values()) {
+            for (int i = 0; i < rs.size(); i++) if (n.equals(rs.get(i).name)) return true;
+        }
+        return false;
+    }
+    // END_CHANGE: BUG-2026-0191-1
 
     // START_CHANGE: BUG-2026-0104-20260905-2 - JVMS 2.11.1 computational type category.
     /** True for long and double, the only values occupying two JVM operand-stack slots. */
@@ -2116,6 +2476,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 ? block.exceptionHandlerType : "java/lang/Throwable";
             stack.push(new LocalVariableExpression(block.lineNumber, new ObjectType(excType), "$exception", 0));
         } else // END_CHANGE: BUG-2026-0050-3
+        // START_CHANGE: BUG-2026-0152-20261017-2 - Explicit seed (SafeStructurer).
+        if (block.forcedEntryStack != null) {
+            for (int fi = 0; fi < block.forcedEntryStack.size(); fi++) stack.push(block.forcedEntryStack.get(fi));
+            block.entryStackTop = stack.isEmpty() ? null : stack.peek();
+        } else
+        // END_CHANGE: BUG-2026-0152-2
         // START_CHANGE: BUG-2026-0051-20260420-2 - Seed the entire stack from a predecessor's
         // exit snapshot when available (handles compound arithmetic around ternaries and
         // other expressions whose sub-values span block boundaries). Falls back to the prior
@@ -2130,10 +2496,16 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                     break;
                 }
             }
+            // START_CHANGE: BUG-2026-0147-20261017-2 - Remember the seeded top (see BasicBlock).
+            block.entryStackTop = null;
+            // END_CHANGE: BUG-2026-0147-2
             if (source != null) {
                 for (int i = 0; i < source.exitStack.size(); i++) {
                     stack.push(source.exitStack.get(i));
                 }
+                // START_CHANGE: BUG-2026-0147-20261017-3
+                block.entryStackTop = stack.peek();
+                // END_CHANGE: BUG-2026-0147-3
                 if (block.lineNumber == 0 && source.lineNumber > 0) {
                     block.lineNumber = source.lineNumber;
                 }
@@ -2151,6 +2523,9 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             }
         }
         // END_CHANGE: BUG-2026-0051-2
+        // START_CHANGE: BUG-2026-0147-20261017-5
+        currentDecodeEntryTop = block.isExceptionHandler ? null : block.entryStackTop;
+        // END_CHANGE: BUG-2026-0147-5
         List<Statement> stmts = new ArrayList<Statement>();
         ByteReader reader = new ByteReader(currentBytecode);
         reader.setOffset(block.startPc);
@@ -2242,6 +2617,10 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             while (it.hasNext()) topFirst.add(it.next());
             for (int i = topFirst.size() - 1; i >= 0; i--) snapshot.add(topFirst.get(i));
             block.exitStack = snapshot;
+        } else if (block.forcedEntryStack != null) {
+            // BUG-2026-0152: an explicit-seed decode reports an exact (possibly empty) exit stack
+            block.exitStack = new ArrayList<Expression>();
+            block.stackTopExpression = null;
         }
         // END_CHANGE: BUG-2026-0051-3
     }
@@ -2492,6 +2871,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         slotRenames = new HashMap<Integer, String>();
         slotSplitCounts = new HashMap<Integer, Integer>();
         // END_CHANGE: BUG-2026-0096-4
+        slotIdent191 = new SlotIdent191(); // BUG-2026-0191
         String[] paramDescsLin = TypeNameUtil.parseMethodParameterDescriptors(method.getDescriptor());
         int paramSlotLin = method.isStatic() ? 0 : 1;
         for (int pi = 0; pi < paramDescsLin.length; pi++) {
@@ -2575,6 +2955,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             if (lvr103i != null) name = lvr103i.name;
         }
         // END_CHANGE: BUG-2026-0103-8
+        // START_CHANGE: BUG-2026-0191-20261018-3 - iinc of an LVT-less temporary (for-each index)
+        if (!iincRenamed && isUncoveredSlotPc191(varIdx, currentDecodePc)) {
+            String un191 = slotIdent191.uncoveredName.get(Integer.valueOf(varIdx));
+            name = un191 != null ? un191 : "var" + varIdx;
+        }
+        // END_CHANGE: BUG-2026-0191-3
         if ((incr == 1 || incr == -1) && !stack.isEmpty()
                 && stack.peek() instanceof LocalVariableExpression
                 && ((LocalVariableExpression) stack.peek()).getIndex() == varIdx) {
@@ -2668,15 +3054,21 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             // Constants
             case 0x00: // nop
                 break;
+            // START_CHANGE: BUG-2026-0178-20261018-1 - Every decoded constant is a FRESH node. The
+            // flow builder matches ternary arm values and merge-stack seeds by object identity; the
+            // shared iconst/aconst_null singletons made two unrelated ternaries' `1` the same object,
+            // so `sb.append(f() ? 1 : 0).append(g() ? 1 : 0)` came out as
+            // `sb.append(1).append(g() ? f() ? 1 : 0 : 0)`.
             case 0x01: // aconst_null
-                stack.push(NullExpression.INSTANCE);
+                stack.push(new NullExpression());
                 break;
             case 0x02: // iconst_m1
-                stack.push(IntegerConstantExpression.valueOf(line, -1));
+                stack.push(new IntegerConstantExpression(line, -1));
                 break;
             case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: // iconst_0 .. iconst_5
-                stack.push(IntegerConstantExpression.valueOf(line, opcode - 0x03));
+                stack.push(new IntegerConstantExpression(line, opcode - 0x03));
                 break;
+            // END_CHANGE: BUG-2026-0178-1
             case 0x09: case 0x0A: // lconst_0, lconst_1
                 stack.push(new LongConstantExpression(line, opcode - 0x09));
                 break;
@@ -2687,10 +3079,10 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 stack.push(new DoubleConstantExpression(line, opcode - 0x0E));
                 break;
             case 0x10: // bipush
-                stack.push(IntegerConstantExpression.valueOf(line, reader.readByte()));
+                stack.push(new IntegerConstantExpression(line, reader.readByte())); // BUG-2026-0178
                 break;
             case 0x11: // sipush
-                stack.push(IntegerConstantExpression.valueOf(line, reader.readShort()));
+                stack.push(new IntegerConstantExpression(line, reader.readShort())); // BUG-2026-0178
                 break;
             case 0x12: { // ldc
                 int index = reader.readUnsignedByte();
@@ -3082,7 +3474,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             case 0x94: case 0x95: case 0x96: case 0x97: case 0x98: { // lcmp, fcmp, dcmp
                 Expression b = popOrUnderflowInt(stack, line);
                 Expression a = popOrUnderflowInt(stack, line);
-                stack.push(new BinaryOperatorExpression(line, PrimitiveType.INT, a, "<=>", b));
+                // START_CHANGE: BUG-2026-0177-20261018-1 - fcmpg/dcmpg push 1 for NaN, fcmpl/dcmpl
+                // push -1: the operator carries the variant so `(a <=> b) >= 0` from dcmpg is
+                // rendered `!(a < b)` (true for NaN), not `a >= b` (false for NaN).
+                String cmp177 = (opcode == 0x96 || opcode == 0x98) ? "<=>g" : (opcode == 0x95 || opcode == 0x97) ? "<=>l" : "<=>";
+                stack.push(new BinaryOperatorExpression(line, PrimitiveType.INT, a, cmp177, b));
+                // END_CHANGE: BUG-2026-0177-1
                 break;
             }
 
@@ -3231,6 +3628,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 Type fieldType = parseType(desc);
                 Expression value = popOrUnderflowRef(stack);
                 Expression field = new FieldAccessExpression(line, fieldType, null, className, fieldName, desc);
+                // BUG-2026-0139: `cb[pos++]` on a static field.
+                if (foldFieldPostIncrement(stack, value, null, fieldName, line, fieldType)) break;
                 statements.add(new ExpressionStatement(
                     new AssignmentExpression(line, fieldType, field, "=", value)));
                 break;
@@ -3254,6 +3653,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 Expression value = popOrUnderflowRef(stack);
                 Expression obj = stack.isEmpty() ? new ThisExpression(line, ObjectType.OBJECT) : stack.pop();
                 Expression field = new FieldAccessExpression(line, fieldType, obj, className, fieldName, desc);
+                // BUG-2026-0139: `this.cb[this.nextChar++]` on an instance field.
+                if (foldFieldPostIncrement(stack, value, obj, fieldName, line, fieldType)) break;
                 statements.add(new ExpressionStatement(
                     new AssignmentExpression(line, fieldType, field, "=", value)));
                 // START_CHANGE: BUG-2026-0104-20260905-3 - Same aliasing rule as the dup;store pair
@@ -3288,7 +3689,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 for (int i = paramDescs.length - 1; i >= 0; i--) {
                     Expression arg = popOrUnderflowRef(stack);
                     // START_CHANGE: BUG-2026-0043-20260327-2 - Convert int constants to correct types for typed params
-                    if (arg instanceof IntegerConstantExpression) {
+                    // BUG-2026-0147: never the value seeded from a ternary arm (identity is its merge key).
+                    if (arg instanceof IntegerConstantExpression && arg != currentDecodeEntryTop) {
                         int v = ((IntegerConstantExpression) arg).getValue();
                         if ("Z".equals(paramDescs[i]) && (v == 0 || v == 1)) {
                             arg = v != 0 ? BooleanExpression.TRUE : BooleanExpression.FALSE;
@@ -3392,7 +3794,8 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
                 for (int i = paramDescs.length - 1; i >= 0; i--) {
                     Expression arg = popOrUnderflowRef(stack);
                     // START_CHANGE: BUG-2026-0043-20260327-3 - Convert int constants to correct types for typed params (static)
-                    if (arg instanceof IntegerConstantExpression) {
+                    // BUG-2026-0147: never the value seeded from a ternary arm (identity is its merge key).
+                    if (arg instanceof IntegerConstantExpression && arg != currentDecodeEntryTop) {
                         int v = ((IntegerConstantExpression) arg).getValue();
                         if ("Z".equals(paramDescs[i]) && (v == 0 || v == 1)) {
                             arg = v != 0 ? BooleanExpression.TRUE : BooleanExpression.FALSE;
@@ -4023,6 +4426,16 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             name = lvr103.name;
         }
         // END_CHANGE: BUG-2026-0103-3
+        // START_CHANGE: BUG-2026-0191-20261018-4 - load of an LVT-less temporary: its own name and
+        // the type recorded at its store, never the LVT entry of another variable of the slot.
+        if (!slotRenamed && isUncoveredSlotPc191(index, currentDecodePc)) {
+            String un191 = slotIdent191.uncoveredName.get(Integer.valueOf(index));
+            Type ut191 = slotIdent191.uncoveredType.get(Integer.valueOf(index));
+            stack.push(new LocalVariableExpression(line, ut191 != null ? ut191 : defaultType,
+                un191 != null ? un191 : "var" + index, index));
+            return;
+        }
+        // END_CHANGE: BUG-2026-0191-4
         // Prefer generic signature type over erased descriptor
         Type type = defaultType;
         // START_CHANGE: BUG-2026-0103-20260905-4 - Prefer the resolved entry's own signature/descriptor.
@@ -4075,6 +4488,36 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             name = lvr103s.name;
         }
         // END_CHANGE: BUG-2026-0103-5
+        // START_CHANGE: BUG-2026-0191-20261018-5 - store into an LVT-less temporary gets a name of
+        // its own (a new one per region); a store that switches the slot to a different variable
+        // that was never declared opens a new declaration instead of assigning the previous one.
+        boolean seedStore191 = !stack.isEmpty()
+            && stack.peek() instanceof LocalVariableExpression
+            && "$exception".equals(((LocalVariableExpression) stack.peek()).getName());
+        boolean uncovered191 = !slotRenamed && !seedStore191 && isUncoveredSlotPc191(index, currentDecodePc);
+        if (uncovered191) {
+            String prev191 = slotIdent191.lastStoredName.get(Integer.valueOf(index));
+            String un191 = slotIdent191.uncoveredName.get(Integer.valueOf(index));
+            if (un191 == null || !un191.equals(prev191)) {
+                un191 = newUncoveredName191(index);
+                slotIdent191.uncoveredName.put(Integer.valueOf(index), un191);
+                slotIdent191.uncoveredType.remove(Integer.valueOf(index));
+            }
+            name = un191;
+        }
+        if (lvtSlotRanges191 != null && !slotRenamed && !seedStore191) {
+            String prev191 = slotIdent191.lastStoredName.get(Integer.valueOf(index));
+            // only a switch between a temporary and a named variable: transitions between two
+            // NAMED variables keep the established assignment + promotion handling (BUG-2026-0103)
+            if (prev191 != null && !prev191.equals(name) && declaredVars != null
+                    && (uncovered191 || slotIdent191.syntheticNames.contains(prev191))
+                    && declaredVars.contains(index) && !slotIdent191.declaredNames.contains(name)) {
+                declaredVars.remove(Integer.valueOf(index));
+                if (slotDeclCategories != null) slotDeclCategories.remove(Integer.valueOf(index));
+            }
+            slotIdent191.lastStoredName.put(Integer.valueOf(index), name);
+        }
+        // END_CHANGE: BUG-2026-0191-5
         int storeCat = storeCategory(defaultType);
         // Never split on the synthetic `$exception` handler seed (BUG-2026-0050): the handler's
         // opening astore is consumed by the try/catch reconstruction, which names the catch
@@ -4113,7 +4556,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             if (t103 != null) type = t103;
         }
         // END_CHANGE: BUG-2026-0103-7
-        if (lvr103s == null && !slotRenamed && currentLocalVarSignatures != null) {
+        if (lvr103s == null && !slotRenamed && !uncovered191 && currentLocalVarSignatures != null) {
             String sig = (String) currentLocalVarSignatures.get(index);
             if (sig != null) {
                 Type sigType = parseSignatureType(sig);
@@ -4123,7 +4566,7 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             }
         }
         boolean typeFromDebugInfo = type != defaultType;
-        if (lvr103s == null && !slotRenamed && type == defaultType) {
+        if (lvr103s == null && !slotRenamed && !uncovered191 && type == defaultType) {
             String desc = (String) descriptors.get(index);
             if (desc != null) {
                 type = parseType(desc);
@@ -4180,9 +4623,13 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         }
         // END_CHANGE: BUG-2026-0087-1
 
+        // START_CHANGE: BUG-2026-0191-20261018-6 - remember the temporary's type for its loads
+        if (uncovered191) slotIdent191.uncoveredType.put(Integer.valueOf(index), type);
+        // END_CHANGE: BUG-2026-0191-6
         if (declaredVars != null && !declaredVars.contains(index)) {
             // First assignment - emit as variable declaration
             declaredVars.add(index);
+            slotIdent191.declaredNames.add(name); // BUG-2026-0191
             // START_CHANGE: BUG-2026-0096-20260610-9 - Record the slot's verifier category so a
             // later store of a conflicting category triggers the slot split above.
             if (slotDeclCategories != null) {
@@ -4192,8 +4639,12 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
             VariableDeclarationStatement vdsNew = new VariableDeclarationStatement(line, type, name, value, false, false);
             // START_CHANGE: BUG-2026-0065-20260421-3 - Propagate LVTT signature to declaration
             // (BUG-2026-0096: unless the slot was split — the LVTT entry is the old variable's)
-            if (currentLocalVarSignatures != null && !slotRenamed) {
+            if (currentLocalVarSignatures != null && !slotRenamed && !uncovered191) {
                 String sig = currentLocalVarSignatures.get(index);
+                // BUG-2026-0191: with a LocalVariableTable the signature is the one of the entry
+                // whose scope this store opens, not the slot's flattened (last-wins) signature.
+                LvtRange at191 = lvtRangeAt191(index, currentDecodePc);
+                if (at191 != null) sig = at191.signature;
                 if (sig != null) vdsNew.setGenericSignature(sig);
             }
             // END_CHANGE: BUG-2026-0065-3
@@ -4990,6 +5441,45 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
      * Handles type parameters like "TT;" -> GenericType("T"),
      * and falls back to parseType for standard descriptors.
      */
+    // START_CHANGE: BUG-2026-0202-20261030-2 - Names of the parameters whose Signature type has
+    // type arguments. The Signature omits synthetic/mandated parameters (BUG-2026-0168), so its
+    // entries are aligned with the LAST parameter names.
+    private static Set<String> genericParamNames202(String signature, List<String> paramNames) {
+        Set<String> names = new HashSet<String>();
+        if (signature == null || paramNames == null) return names;
+        int open = signature.indexOf('(');
+        int close = signature.lastIndexOf(')');
+        if (open < 0 || close < open) return names;
+        List<String> entries = new ArrayList<String>();
+        int i = open + 1;
+        while (i < close) {
+            int start = i;
+            while (i < close && signature.charAt(i) == '[') i++;
+            if (i >= close) return names;
+            char c = signature.charAt(i);
+            if (c == 'L' || c == 'T') {
+                int depth = 0;
+                while (i < close) {
+                    char d = signature.charAt(i);
+                    if (d == '<') depth++;
+                    else if (d == '>') depth--;
+                    else if (d == ';' && depth == 0) break;
+                    i++;
+                }
+                if (i >= close) return names; // malformed: claim nothing
+            }
+            i++;
+            entries.add(signature.substring(start, i));
+        }
+        int offset = paramNames.size() - entries.size();
+        if (offset < 0) return names;
+        for (int k = 0; k < entries.size(); k++) {
+            if (entries.get(k).indexOf('<') >= 0) names.add(paramNames.get(offset + k));
+        }
+        return names;
+    }
+    // END_CHANGE: BUG-2026-0202-2
+
     private Type parseSignatureType(String signature) {
         if (signature == null || signature.isEmpty()) return null;
         int arrayDim = 0;
@@ -5146,6 +5636,23 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         return new AssertStatement(lineNumber, assertCondition, message);
     }
 
+    // START_CHANGE: BUG-2026-0148-20261017-3 - `if (!$assertionsDisabled) { if (c) throw new
+    // AssertionError(m); }` is `assert !c : m;` (the condition split into two ifs).
+    private Statement tryReconstructNestedAssert(IfStatement is) {
+        if (!isAssertionsDisabledCheck(is.getCondition()) || isAssertionsDisabledField(is.getCondition())) return null;
+        Statement body = is.getThenBody();
+        while (body instanceof BlockStatement && ((BlockStatement) body).getStatements().size() == 1) {
+            body = ((BlockStatement) body).getStatements().get(0);
+        }
+        if (!(body instanceof IfStatement)) return null;
+        IfStatement inner = (IfStatement) body;
+        ThrowStatement thr = extractThrowAssertionError(inner.getThenBody());
+        if (thr == null) return null;
+        return new AssertStatement(is.getLineNumber(), negateExpression(inner.getCondition(), is.getLineNumber()),
+            extractAssertionErrorMessage(thr));
+    }
+    // END_CHANGE: BUG-2026-0148-3
+
     private boolean containsAssertionsDisabled(Expression expr) {
         if (expr instanceof FieldAccessExpression) {
             return "$assertionsDisabled".equals(((FieldAccessExpression) expr).getName());
@@ -5166,6 +5673,26 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
      * Pattern: $assertionsDisabled == 0 && cond  ->  cond (after boolean simplification)
      */
     private Expression removeAssertionsDisabledFromCondition(Expression expr) {
+        // START_CHANGE: BUG-2026-0148-20261017-1 - `if (!$assertionsDisabled) throw ...` throws
+        // whenever assertions are on: the asserted condition is FALSE, so the condition this
+        // method returns (later negated) must be TRUE. It returned false, producing `assert !false`
+        // (an assert that never fires). Also strip the check from the LEFTMOST conjunct of a
+        // longer chain: `!$ad && a && b` parses as `((!$ad && a) && b)`.
+        if (isAssertionsDisabledCheck(expr) && !isAssertionsDisabledField(expr)) {
+            return new BooleanExpression(expr.getLineNumber(), true);
+        }
+        if (expr instanceof BinaryOperatorExpression
+                && "&&".equals(((BinaryOperatorExpression) expr).getOperator())) {
+            BinaryOperatorExpression and = (BinaryOperatorExpression) expr;
+            if (!isAssertionsDisabledCheck(and.getLeft())) {
+                Expression rest = removeAssertionsDisabledFromCondition(and.getLeft());
+                if (rest != null && !(rest instanceof BooleanExpression)) {
+                    return new BinaryOperatorExpression(and.getLineNumber(), PrimitiveType.BOOLEAN,
+                        rest, "&&", and.getRight());
+                }
+            }
+        }
+        // END_CHANGE: BUG-2026-0148-1
         if (expr instanceof BinaryOperatorExpression) {
             BinaryOperatorExpression boe = (BinaryOperatorExpression) expr;
             if ("&&".equals(boe.getOperator())) {
@@ -5267,6 +5794,41 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
     }
     // END_CHANGE: ISS-2026-0011-2
 
+    // START_CHANGE: BUG-2026-0139-20261015-1 - Field post-increment/decrement used as a value.
+    // javac compiles `cb[pos++]` to `getstatic pos; dup; iconst_1; iadd; putstatic pos` (instance
+    // fields: `aload_0; dup; getfield f; dup_x1; iconst_1; iadd; putfield f`): the OLD value stays
+    // on the operand stack while the field is written. The put used to be emitted as the
+    // statement `pos += 1;` BEFORE the consumer, whose stack entry is a field READ - so the
+    // consumer observed the NEW value: `pos += 1; return cb[pos];` silently read the next
+    // element (BufferedReader.read). Recognized by identity: the value being stored is
+    // `<X> +/- 1` where X is the very expression object still on top of the stack (the dup copy)
+    // and X reads the field being written. The store is folded into that entry as `X++` / `X--`.
+    private boolean foldFieldPostIncrement(Deque<Expression> stack, Expression value, Expression obj,
+                                           String fieldName, int line, Type fieldType) {
+        if (stack.isEmpty() || value == null) return false;
+        Expression v = value;
+        if (v instanceof CastExpression) v = ((CastExpression) v).getExpression();
+        if (!(v instanceof BinaryOperatorExpression)) return false;
+        BinaryOperatorExpression b = (BinaryOperatorExpression) v;
+        String op = b.getOperator();
+        if (!"+".equals(op) && !"-".equals(op)) return false;
+        Expression r = b.getRight();
+        boolean one = (r instanceof IntegerConstantExpression && ((IntegerConstantExpression) r).getValue() == 1)
+            || (r instanceof LongConstantExpression && ((LongConstantExpression) r).getValue() == 1L)
+            || (r instanceof FloatConstantExpression && ((FloatConstantExpression) r).getValue() == 1.0f)
+            || (r instanceof DoubleConstantExpression && ((DoubleConstantExpression) r).getValue() == 1.0d);
+        if (!one) return false;
+        Expression top = stack.peek();
+        if (b.getLeft() != top || !(top instanceof FieldAccessExpression)) return false;
+        FieldAccessExpression fa = (FieldAccessExpression) top;
+        if (!fieldName.equals(fa.getName())) return false;
+        if (obj != null && fa.getObject() != obj) return false;
+        stack.pop();
+        stack.push(new UnaryOperatorExpression(line, fieldType, "+".equals(op) ? "++" : "--", top, false));
+        return true;
+    }
+    // END_CHANGE: BUG-2026-0139-1
+
     // START_CHANGE: ISS-2026-0008-20260324-3 - Reconstruct synchronized blocks from monitor markers
     /**
      * Detect the pattern: varX = lockExpr; __MONITORENTER__; ... body ...; __MONITOREXIT__;
@@ -5283,6 +5845,15 @@ public class ClassFileToJavaSyntaxConverter implements Processor {
         // the `__MONITOREXIT__` inside an enclosing region's try-body and leave that region with no
         // end, yielding an empty `synchronized {}` with the body hoisted out of the lock.
         if (statements == null) return statements;
+        // START_CHANGE: BUG-2026-0137-20261015-8 - A body holding ONLY the synthetic
+        // try { lock; ENTER; ...; EXIT } finally { EXIT } (a synchronized block that is the sole
+        // statement of an if branch whose region the try reconstructor now finds) must be
+        // unwrapped too; the size<2 shortcut skipped stripMonitorFromTryFinally and left the
+        // try/finally with a raw __MONITOREXIT__ marker around the rebuilt synchronized.
+        if (statements.size() == 1 && statements.get(0) instanceof TryCatchStatement) {
+            statements = stripMonitorFromTryFinally(statements);
+        }
+        // END_CHANGE: BUG-2026-0137-8
         if (statements.size() < 2) {
             // A lone if/loop/try can still contain a complete nested region.
             for (int ri101 = 0; ri101 < statements.size(); ri101++) recurseSynchronized(statements.get(ri101));

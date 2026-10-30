@@ -5,6 +5,7 @@
  */
 package it.denzosoft.javadecompiler.service.writer;
 
+import it.denzosoft.javadecompiler.api.loader.Loader;
 import it.denzosoft.javadecompiler.api.printer.Printer;
 import it.denzosoft.javadecompiler.model.classfile.attribute.AnnotationInfo;
 import it.denzosoft.javadecompiler.model.javasyntax.expression.*;
@@ -31,11 +32,23 @@ public class JavaSourceWriter implements Processor {
 
     // Field names whose static initializations were inlined into field declarations
     private Set<String> inlinedStaticFieldNames = new HashSet<String>();
+    // START_CHANGE: BUG-2026-0174-20261018-1 - The <clinit> statements actually moved into field
+    // initializers, by identity. Filtering the static block by field NAME also dropped every later
+    // assignment of an inlined field (`compat = false` inlined, then `compat = form.equals("1.0")`
+    // after a try silently vanished: javax.management.Notification).
+    private final Set<Statement> inlinedClinitStmts =
+        Collections.newSetFromMap(new IdentityHashMap<Statement, Boolean>());
+    // END_CHANGE: BUG-2026-0174-1
     // START_CHANGE: LIM-0006-20260324-1 - Track major version for text block support
     private int currentMajorVersion;
     // END_CHANGE: LIM-0006-1
     // START_CHANGE: BUG-2026-0029-20260325-1 - Map anonymous inner class names to their interface/superclass display name
     private Map<String, String> anonymousClassDisplayNames = new HashMap<String, String>();
+    // START_CHANGE: BUG-2026-0141-20261017-6 - Internal name of each anonymous class's supertype:
+    // the display name must be rendered (and imported, and qualified) like any reference to that
+    // type, e.g. `new UIDefaults.LazyValue() {` rather than a bare, unresolvable `LazyValue`.
+    private Map<String, String> anonymousClassSupers = new HashMap<String, String>();
+    // END_CHANGE: BUG-2026-0141-6
     // END_CHANGE: BUG-2026-0029-1
     // START_CHANGE: IMP-LINES-20260326-7 - Output flags from configuration
     private boolean showBytecode;
@@ -50,6 +63,25 @@ public class JavaSourceWriter implements Processor {
     // the `new` site, so val$ reads inside the inlined body render the actual captured value.
     private LinkedList<Map<String, Expression>> capturedArgSubstitutions = new LinkedList<Map<String, Expression>>();
     // END_CHANGE: BUG-2026-0097-1
+    // START_CHANGE: BUG-2026-0141-20261017-1 - Import resolution driven by what is actually rendered.
+    // The AST walk in collectImports() misses every type reached through a node it does not visit
+    // (throw, if/while conditions, switch selectors, synchronized, labels ...), and nothing ever
+    // checked two imports for a shared simple name. A dry render now records every type reference
+    // that goes through emitRef(); the import block is the union of both, and any simple-name
+    // collision is resolved by printing the losing type fully qualified.
+    /** True while this instance performs the reference-collecting dry render. */
+    private boolean dryRun;
+    /** Dry run only: type internal name -> number of references emitted. */
+    private Map<String, Integer> renderedTypeRefs = new HashMap<String, Integer>();
+    /** Top-level internal names that must be printed fully qualified (simple name is taken). */
+    private Set<String> qualifiedTopLevels = new HashSet<String>();
+    /** The compilation unit's top-level result (accessors may live in any class of the unit). */
+    private JavaSyntaxResult rootResult;
+    /** Synthetic accessors (owner.name+desc) with at least one call that could not be inlined. */
+    private Set<String> unresolvedAccessors = new HashSet<String>();
+    /** Class loader of the decompilation, used to probe for same-package types (may be null). */
+    private Loader loader;
+    // END_CHANGE: BUG-2026-0141-1
     /** Current method's bytecode instructions map (line -> instructions), null if not showing bytecode */
     private java.util.Map<Integer, java.util.List<String>> currentBytecodeInstructions;
     // END_CHANGE: IMP-LINES-7
@@ -79,6 +111,24 @@ public class JavaSourceWriter implements Processor {
         // START_CHANGE: LIM-0006-20260324-2 - Store major version for text block detection
         currentMajorVersion = result.getMajorVersion();
         // END_CHANGE: LIM-0006-2
+        // START_CHANGE: BUG-2026-0141-20261017-2 - Dry render to collect the type references.
+        loader = message.getHeader("loader");
+        JavaSourceWriter pre = new JavaSourceWriter();
+        pre.dryRun = true;
+        pre.showBytecode = showBytecode;
+        pre.showNativeInfo = showNativeInfo;
+        pre.deobfuscate = deobfuscate;
+        pre.currentMajorVersion = currentMajorVersion;
+        pre.loader = loader;
+        try {
+            pre.writeCompilationUnit(new NullPrinter(), result);
+            renderedTypeRefs = pre.renderedTypeRefs;
+            unresolvedAccessors = pre.unresolvedAccessors;
+        } catch (RuntimeException e) {
+            // The real render reports the failure; imports fall back to the AST walk alone.
+            renderedTypeRefs = new HashMap<String, Integer>();
+        }
+        // END_CHANGE: BUG-2026-0141-2
         int maxLine = computeMaxLine(result);
         printer.start(maxLine, result.getMajorVersion(), result.getMinorVersion());
         writeCompilationUnit(printer, result);
@@ -106,8 +156,10 @@ public class JavaSourceWriter implements Processor {
                 String[] ifaces = inner.getInterfaces();
                 if (ifaces != null && ifaces.length > 0) {
                     anonymousClassDisplayNames.put(innerName, TypeNameUtil.simpleNameFromInternal(ifaces[0]));
+                    anonymousClassSupers.put(innerName, ifaces[0]);
                 } else if (inner.getSuperName() != null && !"java/lang/Object".equals(inner.getSuperName())) {
                     anonymousClassDisplayNames.put(innerName, TypeNameUtil.simpleNameFromInternal(inner.getSuperName()));
+                    anonymousClassSupers.put(innerName, inner.getSuperName());
                 }
             }
             // Recurse into nested inner classes
@@ -126,7 +178,9 @@ public class JavaSourceWriter implements Processor {
         // without deobfuscate. A class/field named "default" or "true" is valid in the class
         // file but produces illegal source otherwise. Leave non-keyword names untouched to
         // preserve byte-for-byte fidelity when no deobfuscation is requested.
-        if (name != null && IdentifierSanitizer.isKeyword(name)) {
+        // BUG-2026-0153: contextual keywords are only reserved as type names
+        if (name != null && (IdentifierSanitizer.isReservedKeyword(name)
+                || ("cls".equals(category) && IdentifierSanitizer.isKeyword(name)))) {
             return "_" + name;
         }
         // END_CHANGE: BUG-2026-0049-1
@@ -143,6 +197,15 @@ public class JavaSourceWriter implements Processor {
     private void emitRef(Printer printer, int type, String internalName, String name, String descriptor, String owner) {
         // START_CHANGE: BUG-2026-0039-20260327-2 - Inner class references use Outer.Inner format
         String displayName = name;
+        // START_CHANGE: BUG-2026-0141-20261017-7 - An anonymous class prints as its supertype.
+        if (type == Printer.TYPE && internalName != null && anonymousClassSupers.containsKey(internalName)) {
+            String sup = anonymousClassSupers.get(internalName);
+            if (!sup.equals(internalName)) {
+                emitRef(printer, type, sup, TypeNameUtil.simpleNameFromInternal(sup), descriptor, owner);
+                return;
+            }
+        }
+        // END_CHANGE: BUG-2026-0141-7
         if (type == Printer.TYPE && internalName != null && internalName.indexOf('$') >= 0) {
             // For anonymous inner classes, use the display name (interface/superclass) if available
             String anonDisplay = anonymousClassDisplayNames.get(internalName);
@@ -170,6 +233,22 @@ public class JavaSourceWriter implements Processor {
             displayName = sn(displayName, type == Printer.TYPE ? "cls" : "fld");
         }
         // END_CHANGE: BUG-2026-0039-2
+        // START_CHANGE: BUG-2026-0141-20261017-3 - Record the reference (dry run) and qualify a
+        // type whose simple name is taken by another type of the compilation unit.
+        if (type == Printer.TYPE && internalName != null && !internalName.startsWith("[")) {
+            if (dryRun) {
+                Integer n = renderedTypeRefs.get(internalName);
+                renderedTypeRefs.put(internalName, Integer.valueOf(n == null ? 1 : n.intValue() + 1));
+            } else if (!qualifiedTopLevels.isEmpty()) {
+                int dollar = internalName.indexOf('$');
+                String top = dollar >= 0 ? internalName.substring(0, dollar) : internalName;
+                if (qualifiedTopLevels.contains(top) && !anonymousClassDisplayNames.containsKey(internalName)) {
+                    String pkg = TypeNameUtil.packageFromInternal(top);
+                    if (!pkg.isEmpty()) displayName = pkg + "." + displayName;
+                }
+            }
+        }
+        // END_CHANGE: BUG-2026-0141-3
         printer.printReference(type, internalName, displayName, descriptor, owner);
     }
     // END_CHANGE: IMP-2026-0005-2
@@ -222,6 +301,184 @@ public class JavaSourceWriter implements Processor {
         }
         return null;
     }
+
+    // START_CHANGE: BUG-2026-0163-20261018-2 - Fields and instance initialization of an inlined
+    // anonymous class body. Constructor parameters are replaced by the `new`-site arguments.
+    private int writeAnonymousMembers(Printer printer, JavaSyntaxResult anon,
+            JavaSyntaxResult.MethodDeclaration init, final List<Expression> siteArgs,
+            String ownerInternalName, int line) {
+        String anonName = anon.getInternalName() != null ? anon.getInternalName() : ownerInternalName;
+        Map<String, Expression> fieldInit = new HashMap<String, Expression>();
+        List<Statement> rest = new ArrayList<Statement>();
+        if (init != null && init.body != null) {
+            final List<String> params = init.parameterNames;
+            AstLocalRewriter argMapper = new AstLocalRewriter() {
+                protected Expression onLocal(LocalVariableExpression lv) {
+                    int pIdx = params != null ? params.indexOf(lv.getName()) : -1;
+                    return (pIdx >= 0 && siteArgs != null && pIdx < siteArgs.size()) ? siteArgs.get(pIdx) : lv;
+                }
+            };
+            boolean superSeen = false;
+            for (Statement st : init.body) {
+                if (st instanceof ReturnStatement && !((ReturnStatement) st).hasExpression()) continue;
+                if (st instanceof ExpressionStatement) {
+                    Expression ie = ((ExpressionStatement) st).getExpression();
+                    if (ie instanceof MethodInvocationExpression
+                            && ("super".equals(((MethodInvocationExpression) ie).getMethodName())
+                                || "<init>".equals(((MethodInvocationExpression) ie).getMethodName()))) {
+                        superSeen = true;
+                        continue;
+                    }
+                    if (ie instanceof AssignmentExpression && ((AssignmentExpression) ie).getLeft() instanceof FieldAccessExpression) {
+                        FieldAccessExpression fa = (FieldAccessExpression) ((AssignmentExpression) ie).getLeft();
+                        String fn = fa.getName();
+                        if (fn != null && (fn.startsWith("val$") || fn.startsWith("this$"))) continue;
+                        if (superSeen && fa.getObject() instanceof ThisExpression && !fieldInit.containsKey(fn) && rest.isEmpty()
+                                && anonName.equals(fa.getOwnerInternalName())) {
+                            fieldInit.put(fn, ((ExpressionStatement) argMapper.rewrite(
+                                new ExpressionStatement(((AssignmentExpression) ie).getRight()))).getExpression());
+                            continue;
+                        }
+                    }
+                    if (!superSeen) continue; // argument evaluation before super(...)
+                }
+                rest.add(argMapper.rewrite(st));
+            }
+        }
+        if (anon.getFields() != null) {
+            for (JavaSyntaxResult.FieldDeclaration f : anon.getFields()) {
+                if (f.name == null || f.name.startsWith("val$") || f.name.startsWith("this$")) continue;
+                if ((f.accessFlags & 0x1000) != 0) continue;
+                printer.startLine(line++);
+                Expression fi = fieldInit.get(f.name);
+                if (fi != null) {
+                    writeFieldWithInit(printer, f, anonName, fi);
+                } else {
+                    writeField(printer, f, anonName);
+                }
+                printer.endLine();
+            }
+        }
+        if (!rest.isEmpty()) {
+            printer.startLine(line++);
+            printer.printText("{");
+            printer.endLine();
+            printer.indent();
+            for (Statement st : rest) line = writeStatement(printer, st, anonName, line);
+            printer.unindent();
+            printer.startLine(line++);
+            printer.printText("}");
+            printer.endLine();
+        }
+        return line;
+    }
+    // END_CHANGE: BUG-2026-0163-2
+
+    // START_CHANGE: BUG-2026-0146-20261017-3 - Synthetic accessors are not source. javac derives
+    // them from the private accesses it compiles and names them access$NNN itself, so printing
+    // ours makes the recompile fail ("conflicts with a compiler-synthesized symbol"). An accessor
+    // is printed only when a call to it could not be inlined, and then under a name javac never
+    // generates.
+    private boolean isHiddenAccessor(JavaSyntaxResult.MethodDeclaration method, String owner) {
+        if ((method.accessFlags & 0x1000) == 0 || !method.name.startsWith("access$")) return false;
+        return !unresolvedAccessors.contains(owner + "." + method.name + method.descriptor);
+    }
+
+    private static String accessorSourceName(String name) {
+        return name != null && name.startsWith("access$") ? name + "$" : name;
+    }
+    // END_CHANGE: BUG-2026-0146-3
+
+    // START_CHANGE: BUG-2026-0146-20261017-2 - Substitution inliner for synthetic accessors.
+    private Expression inlineAccessor(StaticMethodInvocationExpression smie) {
+        JavaSyntaxResult root = rootResult != null ? rootResult : currentResult;
+        if (root == null) return null;
+        String owner = smie.getOwnerInternalName();
+        JavaSyntaxResult target = owner != null && owner.equals(root.getInternalName())
+            ? root : findInnerClassResult(root, owner);
+        if (target == null) {
+            // the accessor may live in an enclosing class of the current unit's root
+            return null;
+        }
+        JavaSyntaxResult.MethodDeclaration acc = null;
+        for (JavaSyntaxResult.MethodDeclaration md : target.getMethods()) {
+            if (smie.getMethodName().equals(md.name) && smie.getDescriptor() != null
+                    && smie.getDescriptor().equals(md.descriptor)) {
+                acc = md;
+                break;
+            }
+        }
+        if (acc == null || acc.body == null) return null;
+        Statement only = null;
+        List<Statement> real146 = new ArrayList<Statement>();
+        for (Statement st : acc.body) {
+            if (st instanceof CommentStatement) continue;
+            if (st instanceof ReturnStatement && !((ReturnStatement) st).hasExpression()) continue;
+            real146.add(st);
+        }
+        if (real146.size() == 2 && real146.get(0) instanceof ExpressionStatement
+                && ((ExpressionStatement) real146.get(0)).getExpression() instanceof AssignmentExpression
+                && real146.get(1) instanceof ReturnStatement && ((ReturnStatement) real146.get(1)).hasExpression()) {
+            // `return target = value;` decoded as `target = value; return value;` (dup before store)
+            AssignmentExpression asg = (AssignmentExpression) ((ExpressionStatement) real146.get(0)).getExpression();
+            Expression ret = ((ReturnStatement) real146.get(1)).getExpression();
+            boolean same = ret == asg.getRight()
+                || (ret instanceof LocalVariableExpression && asg.getRight() instanceof LocalVariableExpression
+                    && ((LocalVariableExpression) ret).getName().equals(((LocalVariableExpression) asg.getRight()).getName()));
+            if (!same) return null;
+            only = new ExpressionStatement(asg);
+        } else if (real146.size() == 1) {
+            only = real146.get(0);
+        } else {
+            return null;
+        }
+        Expression body;
+        if (only instanceof ReturnStatement && ((ReturnStatement) only).hasExpression()) {
+            body = ((ReturnStatement) only).getExpression();
+        } else if (only instanceof ExpressionStatement) {
+            body = ((ExpressionStatement) only).getExpression();
+        } else {
+            return null;
+        }
+        final List<Expression> args = smie.getArguments() != null ? smie.getArguments() : new ArrayList<Expression>();
+        final List<String> params = acc.parameterNames;
+        if (params == null || params.size() != args.size()) return null;
+        // Each parameter may be substituted more than once only when its argument is trivial.
+        final int[] uses = new int[params.size()];
+        new AstLocalCounter(params, uses).map(body);
+        for (int i = 0; i < uses.length; i++) {
+            if (uses[i] > 1 && !isTrivialOperand(args.get(i))) return null;
+        }
+        Expression out = new it.denzosoft.javadecompiler.service.converter.transform.AstMapper() {
+            @Override
+            protected Expression mapLocal(LocalVariableExpression lv) {
+                int i = params.indexOf(lv.getName());
+                return i >= 0 ? args.get(i) : lv;
+            }
+        }.map(body);
+        // A receiver argument printed as `x.m()` must not be a bare constant or a lambda.
+        return out;
+    }
+
+    private static boolean isTrivialOperand(Expression e) {
+        return e instanceof LocalVariableExpression || e instanceof ThisExpression
+            || e instanceof IntegerConstantExpression || e instanceof BooleanExpression
+            || e instanceof NullExpression || e instanceof StringConstantExpression;
+    }
+
+    /** Counts references to the given parameter names. */
+    private static final class AstLocalCounter extends it.denzosoft.javadecompiler.service.converter.transform.AstMapper {
+        private final List<String> names;
+        private final int[] counts;
+        AstLocalCounter(List<String> names, int[] counts) { this.names = names; this.counts = counts; }
+        @Override
+        protected Expression mapLocal(LocalVariableExpression lv) {
+            int i = names.indexOf(lv.getName());
+            if (i >= 0) counts[i]++;
+            return lv;
+        }
+    }
+    // END_CHANGE: BUG-2026-0146-2
 
     private String extractAccessTarget(Statement stmt) {
         Expression expr = null;
@@ -329,6 +586,7 @@ public class JavaSourceWriter implements Processor {
 
     private void writeCompilationUnit(Printer printer, JavaSyntaxResult result) {
         this.currentResult = result;
+        this.rootResult = result; // BUG-2026-0146
         String internalName = result.getInternalName();
         String packageName = TypeNameUtil.packageFromInternal(internalName);
         String simpleName = TypeNameUtil.simpleNameFromInternal(internalName);
@@ -352,12 +610,27 @@ public class JavaSourceWriter implements Processor {
             printer.printText(packageName);
             printer.printText(";");
             printer.endLine();
+            // START_CHANGE: BUG-2026-0141-20261017-8 - The package annotations' types need imports
+            // too; in package-info.java they follow the package declaration.
+            Set<String> pkgImports = resolveImports(result, packageName);
+            List<String> sortedPkgImports = new ArrayList<String>(pkgImports);
+            Collections.sort(sortedPkgImports);
+            for (String imp : sortedPkgImports) {
+                printer.startLine(++lineNumber);
+                printer.printKeyword("import");
+                printer.printText(" ");
+                printer.printText(imp);
+                printer.printText(";");
+                printer.endLine();
+            }
+            // END_CHANGE: BUG-2026-0141-8
             return;
         }
         // END_CHANGE: BUG-2026-0048-1
 
         // START_CHANGE: BUG-2026-0029-20260325-2 - Build anonymous class display name map from inner class results
         anonymousClassDisplayNames.clear();
+        anonymousClassSupers.clear();
         buildAnonymousClassMap(result);
         // END_CHANGE: BUG-2026-0029-2
 
@@ -420,7 +693,9 @@ public class JavaSourceWriter implements Processor {
         }
 
         // Collect imports
-        Set<String> imports = collectImports(result);
+        // START_CHANGE: BUG-2026-0141-20261017-4 - AST walk + rendered references, collisions resolved.
+        Set<String> imports = resolveImports(result, packageName);
+        // END_CHANGE: BUG-2026-0141-4
         if (!imports.isEmpty()) {
             List<String> sortedImports = new ArrayList<String>(imports);
             Collections.sort(sortedImports);
@@ -582,6 +857,8 @@ public class JavaSourceWriter implements Processor {
 
         // Build map of field name -> initializer from static init (<clinit>)
         Map<String, Expression> staticInits = new LinkedHashMap<String, Expression>();
+        Map<String, Statement> staticInitStmts174 = new HashMap<String, Statement>(); // BUG-2026-0174
+        Set<String> noInline174 = new HashSet<String>();
         Set<String> inlinedFieldNames = new HashSet<String>();
         for (JavaSyntaxResult.MethodDeclaration m : result.getMethods()) {
             if ("<clinit>".equals(m.name) && m.body != null) {
@@ -592,7 +869,14 @@ public class JavaSourceWriter implements Processor {
                             AssignmentExpression ae = (AssignmentExpression) e;
                             if (ae.getLeft() instanceof FieldAccessExpression) {
                                 String fieldName = ((FieldAccessExpression) ae.getLeft()).getName();
-                                staticInits.put(fieldName, ae.getRight());
+                                // BUG-2026-0174: a field assigned twice in the prefix is not inlined
+                                if (staticInits.containsKey(fieldName) || noInline174.contains(fieldName)) {
+                                    staticInits.remove(fieldName);
+                                    noInline174.add(fieldName);
+                                } else {
+                                    staticInits.put(fieldName, ae.getRight());
+                                    staticInitStmts174.put(fieldName, s);
+                                }
                             } else {
                                 break; // Stop at first non-field-assignment
                             }
@@ -685,6 +969,8 @@ public class JavaSourceWriter implements Processor {
                 writeFieldWithInit(printer, field, internalName, staticInits.get(field.name));
                 inlinedFieldNames.add(field.name);
                 inlinedStaticFieldNames.add(field.name);
+                inlinedStaticFieldNames.add(internalName + "." + field.name); // BUG-2026-0170
+                inlinedClinitStmts.add(staticInitStmts174.get(field.name)); // BUG-2026-0174
             } else {
                 writeField(printer, field, internalName);
             }
@@ -702,6 +988,7 @@ public class JavaSourceWriter implements Processor {
         boolean firstVisibleMethod = true;
         for (int m = 0; m < result.getMethods().size(); m++) {
             JavaSyntaxResult.MethodDeclaration method = result.getMethods().get(m);
+            if (isHiddenAccessor(method, internalName)) continue; // BUG-2026-0146
             if (result.isEnum()) {
                 if ("values".equals(method.name) && method.parameterTypes.isEmpty()) continue;
                 if ("valueOf".equals(method.name) && method.parameterTypes.size() == 1) continue;
@@ -732,7 +1019,8 @@ public class JavaSourceWriter implements Processor {
                                 AssignmentExpression ae = (AssignmentExpression) e;
                                 if (ae.getLeft() instanceof FieldAccessExpression) {
                                     String fn = ((FieldAccessExpression) ae.getLeft()).getName();
-                                    if (inlinedFieldNames.contains(fn)) {
+                                    if (inlinedClinitStmts.contains(s)
+                                            || (result.isEnum() && inlinedFieldNames.contains(fn))) { // BUG-2026-0174
                                         continue;
                                     }
                                 }
@@ -1129,6 +1417,8 @@ public class JavaSourceWriter implements Processor {
         // START_CHANGE: BUG-2026-0022-20260324-2 - Extract enum constructor args from inner class clinit
         // Build staticInits map for inner classes (same logic as top-level)
         Map<String, Expression> innerStaticInits = new LinkedHashMap<String, Expression>();
+        Map<String, Statement> innerStaticInitStmts174 = new HashMap<String, Statement>(); // BUG-2026-0174
+        Set<String> innerNoInline174 = new HashSet<String>();
         Set<String> innerInlinedFieldNames = new HashSet<String>();
         for (JavaSyntaxResult.MethodDeclaration m : inner.getMethods()) {
             if ("<clinit>".equals(m.name) && m.body != null) {
@@ -1139,7 +1429,14 @@ public class JavaSourceWriter implements Processor {
                             AssignmentExpression ae = (AssignmentExpression) e;
                             if (ae.getLeft() instanceof FieldAccessExpression) {
                                 String fieldName = ((FieldAccessExpression) ae.getLeft()).getName();
-                                innerStaticInits.put(fieldName, ae.getRight());
+                                // BUG-2026-0174: a field assigned twice in the prefix is not inlined
+                                if (innerStaticInits.containsKey(fieldName) || innerNoInline174.contains(fieldName)) {
+                                    innerStaticInits.remove(fieldName);
+                                    innerNoInline174.add(fieldName);
+                                } else {
+                                    innerStaticInits.put(fieldName, ae.getRight());
+                                    innerStaticInitStmts174.put(fieldName, s);
+                                }
                             } else {
                                 break;
                             }
@@ -1230,6 +1527,8 @@ public class JavaSourceWriter implements Processor {
             if (field.isStatic() && field.initialValue == null && innerStaticInits.containsKey(field.name)) {
                 writeFieldWithInit(printer, field, innerInternalName, innerStaticInits.get(field.name));
                 innerInlinedFieldNames.add(field.name);
+                inlinedStaticFieldNames.add(innerInternalName + "." + field.name); // BUG-2026-0170
+                inlinedClinitStmts.add(innerStaticInitStmts174.get(field.name)); // BUG-2026-0174
             } else {
                 writeField(printer, field, innerInternalName);
             }
@@ -1249,6 +1548,7 @@ public class JavaSourceWriter implements Processor {
         boolean innerFirstMethod = true;
         for (int m = 0; m < inner.getMethods().size(); m++) {
             JavaSyntaxResult.MethodDeclaration method = inner.getMethods().get(m);
+            if (isHiddenAccessor(method, innerInternalName)) continue; // BUG-2026-0146
             if (inner.isEnum()) {
                 if ("values".equals(method.name) && method.parameterTypes.isEmpty()) continue;
                 if ("valueOf".equals(method.name) && method.parameterTypes.size() == 1) continue;
@@ -1276,7 +1576,8 @@ public class JavaSourceWriter implements Processor {
                             if (e instanceof AssignmentExpression) {
                                 Expression lhs = ((AssignmentExpression) e).getLeft();
                                 if (lhs instanceof FieldAccessExpression
-                                        && innerInlinedFieldNames.contains(((FieldAccessExpression) lhs).getName())) {
+                                        && (inlinedClinitStmts.contains(s) || (inner.isEnum() // BUG-2026-0174
+                                            && innerInlinedFieldNames.contains(((FieldAccessExpression) lhs).getName())))) {
                                     continue;
                                 }
                             }
@@ -1477,6 +1778,135 @@ public class JavaSourceWriter implements Processor {
         printer.endLine();
     }
 
+    // START_CHANGE: BUG-2026-0141-20261017-5 - Final import set and simple-name collision handling.
+    // Java resolves a simple type name in this order: types declared in the compilation unit
+    // (and their member types), single-type imports, types of the same package, java.lang.
+    // Each simple name may therefore denote exactly ONE type; every other referenced type with
+    // the same simple name is printed fully qualified (qualifiedTopLevels) and not imported.
+    private Set<String> resolveImports(JavaSyntaxResult result, String packageName) {
+        Set<String> imports = collectImports(result);
+        if (dryRun) return imports;
+        qualifiedTopLevels.clear();
+        String thisPackage = packageName;
+        for (String ref : renderedTypeRefs.keySet()) {
+            addImport(imports, ref, thisPackage);
+        }
+        // Reference counts per top-level type (an import covers all nested types of its outer).
+        Map<String, Integer> topCounts = new HashMap<String, Integer>();
+        for (Map.Entry<String, Integer> e : renderedTypeRefs.entrySet()) {
+            String ref = e.getKey();
+            if (!isValidInternalName(ref)) continue;
+            int dollar = ref.indexOf('$');
+            String top = dollar >= 0 ? ref.substring(0, dollar) : ref;
+            Integer n = topCounts.get(top);
+            topCounts.put(top, Integer.valueOf((n == null ? 0 : n.intValue()) + e.getValue().intValue()));
+        }
+        for (String imp : imports) {
+            String top = TypeNameUtil.qualifiedToInternal(imp);
+            if (!topCounts.containsKey(top)) topCounts.put(top, Integer.valueOf(0));
+        }
+        // Simple names declared by this compilation unit: they shadow every import.
+        Set<String> declared = new HashSet<String>();
+        String selfTop = result.getInternalName();
+        int selfDollar = selfTop.indexOf('$');
+        if (selfDollar >= 0) selfTop = selfTop.substring(0, selfDollar);
+        collectDeclaredSimpleNames(result, declared);
+        // Group every referenced top-level type by simple name.
+        Map<String, List<String>> bySimple = new HashMap<String, List<String>>();
+        for (String top : topCounts.keySet()) {
+            String simple = TypeNameUtil.simpleNameFromInternal(top);
+            List<String> l = bySimple.get(simple);
+            if (l == null) { l = new ArrayList<String>(); bySimple.put(simple, l); }
+            l.add(top);
+        }
+        for (Map.Entry<String, List<String>> e : bySimple.entrySet()) {
+            String simple = e.getKey();
+            List<String> tops = e.getValue();
+            String owner = null;
+            if (declared.contains(simple)) {
+                // A type of this compilation unit owns the name (it is printed as Outer.Inner or plain).
+                owner = tops.contains(selfTop) ? selfTop : "";
+            } else {
+                // Prefer a same-package type, then the most referenced import, then java.lang.
+                String best = null;
+                int bestRank = -1;
+                for (String top : tops) {
+                    String pkg = TypeNameUtil.packageFromInternal(top);
+                    int rank;
+                    if (pkg.equals(thisPackage)) rank = 3000000;
+                    else if ("java.lang".equals(pkg)) rank = 0;
+                    else rank = 1000 + topCounts.get(top).intValue();
+                    if (rank > bestRank || (rank == bestRank && top.compareTo(best) < 0)) { best = top; bestRank = rank; }
+                }
+                owner = best;
+                // An unreferenced same-package type still beats java.lang (on-demand) resolution.
+                if (owner != null && "java.lang".equals(TypeNameUtil.packageFromInternal(owner))
+                        && !thisPackage.isEmpty() && samePackageTypeExists(thisPackage, simple)) {
+                    owner = "";
+                }
+            }
+            for (String top : tops) {
+                if (top.equals(owner)) continue;
+                if (top.equals(selfTop)) continue;
+                qualifiedTopLevels.add(top);
+                imports.remove(TypeNameUtil.internalToQualified(top));
+            }
+        }
+        return imports;
+    }
+
+    private void collectDeclaredSimpleNames(JavaSyntaxResult result, Set<String> out) {
+        String name = result.getInternalName();
+        if (name != null) {
+            String simple = TypeNameUtil.simpleNameFromInternal(name);
+            if (simple.length() > 0 && !Character.isDigit(simple.charAt(0))) out.add(simple);
+        }
+        // START_CHANGE: BUG-2026-0183-20261018-4 - Inherited member types shadow imports and
+        // java.lang just like declared ones (`Double` in a Rectangle2D subclass).
+        if (name != null && loader != null) {
+            try {
+                out.addAll(new it.denzosoft.javadecompiler.service.converter.cfg.ClassHierarchy(loader)
+                    .inheritedMemberTypeNames(name));
+            } catch (RuntimeException e) {
+                // best effort: an unreadable supertype only means less qualification
+            }
+        }
+        // END_CHANGE: BUG-2026-0183-4
+        List<JavaSyntaxResult> inners = result.getInnerClassResults();
+        if (inners != null) {
+            for (JavaSyntaxResult inner : inners) collectDeclaredSimpleNames(inner, out);
+        }
+    }
+
+    private boolean samePackageTypeExists(String thisPackage, String simple) {
+        if (loader == null) return false;
+        try {
+            return loader.canLoad(thisPackage.replace('.', '/') + "/" + simple);
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Printer that discards everything; used by the reference-collecting dry render. */
+    private static final class NullPrinter implements Printer {
+        public void start(int maxLineNumber, int majorVersion, int minorVersion) { }
+        public void end() { }
+        public void printText(String text) { }
+        public void printNumericConstant(String constant) { }
+        public void printStringConstant(String constant, String ownerInternalName) { }
+        public void printKeyword(String keyword) { }
+        public void printDeclaration(int type, String internalTypeName, String name, String descriptor) { }
+        public void printReference(int type, String internalTypeName, String name, String descriptor, String ownerInternalName) { }
+        public void indent() { }
+        public void unindent() { }
+        public void startLine(int lineNumber) { }
+        public void endLine() { }
+        public void extraLine(int count) { }
+        public void startMarker(int type) { }
+        public void endMarker(int type) { }
+    }
+    // END_CHANGE: BUG-2026-0141-5
+
     // START_CHANGE: BUG-2026-0036-20260327-1 - Collect imports from all types used in class
     private Set<String> collectImports(JavaSyntaxResult result) {
         Set<String> imports = new TreeSet<String>();
@@ -1670,6 +2100,17 @@ public class JavaSourceWriter implements Processor {
             for (SwitchStatement.SwitchCase sc : ((SwitchStatement) stmt).getCases()) {
                 for (Statement s : sc.getStatements()) { collectStatementImports(imports, s, thisPackage); }
             }
+        // START_CHANGE: BUG-2026-0200-20261018-1 - Labeled blocks and synchronized bodies were not
+        // visited: `L8: { Iterator<Header> itr = ..; }` declared a type whose import was never
+        // emitted (com.sun.xml.internal.ws.handler.SOAPMessageContextImpl). Throw operands too.
+        } else if (stmt instanceof LabelStatement) {
+            collectStatementImports(imports, ((LabelStatement) stmt).getBody(), thisPackage);
+        } else if (stmt instanceof SynchronizedStatement) {
+            collectExprImports(imports, ((SynchronizedStatement) stmt).getMonitor(), thisPackage);
+            collectStatementImports(imports, ((SynchronizedStatement) stmt).getBody(), thisPackage);
+        } else if (stmt instanceof ThrowStatement) {
+            collectExprImports(imports, ((ThrowStatement) stmt).getExpression(), thisPackage);
+        // END_CHANGE: BUG-2026-0200-1
         }
         // Collect from expressions in ExpressionStatement
         if (stmt instanceof ExpressionStatement) {
@@ -1966,6 +2407,39 @@ public class JavaSourceWriter implements Processor {
         if (f == Float.NEGATIVE_INFINITY) return "Float.NEGATIVE_INFINITY";
         return f + "F";
     }
+
+    // START_CHANGE: BUG-2026-0166-20261018-4 - Enum constant case labels.
+    /**
+     * A case label. In a switch without pattern cases the selector is the enum itself, so an
+     * enum constant label must be the bare constant name (Java before 21 rejects a qualified
+     * one); in a pattern switch the qualified form is the one that is legal.
+     */
+    private void writeCaseLabel(Printer printer, Expression label, String ownerInternalName, boolean bareEnum) {
+        if (bareEnum && label instanceof FieldAccessExpression) {
+            FieldAccessExpression f = (FieldAccessExpression) label;
+            if (f.getObject() == null && f.getOwnerInternalName() != null
+                    && ("L" + f.getOwnerInternalName() + ";").equals(f.getDescriptor())) {
+                printer.printText(f.getName());
+                return;
+            }
+        }
+        writeExpression(printer, label, ownerInternalName);
+    }
+
+    private static boolean hasPatternCase(SwitchStatement sw) {
+        for (SwitchStatement.SwitchCase c : sw.getCases()) {
+            if (c.isPattern() || c.isNullLabel()) return true;
+        }
+        return false;
+    }
+
+    private static boolean hasPatternCase(SwitchExpression sw) {
+        for (SwitchExpression.SwitchCase c : sw.getCases()) {
+            if (c.isPattern() || c.isRecordPattern()) return true;
+        }
+        return false;
+    }
+    // END_CHANGE: BUG-2026-0166-4
 
     private void writeRecordPattern(Printer printer, Type outerType,
                                     it.denzosoft.javadecompiler.model.javasyntax.expression.RecordPattern rp,
@@ -2306,9 +2780,15 @@ public class JavaSourceWriter implements Processor {
                         AssignmentExpression ae = (AssignmentExpression) e;
                         if (ae.getLeft() instanceof FieldAccessExpression) {
                             String fn = ((FieldAccessExpression) ae.getLeft()).getName();
-                            if (!inlinedStaticFieldNames.isEmpty() && inlinedStaticFieldNames.contains(fn)) {
+                            // START_CHANGE: BUG-2026-0170-20261018-1 - Match the inlined set by
+                            // OWNER-qualified name: a nested class's inlined fields were never recorded
+                            // here, so its static block re-assigned every inlined final field
+                            // (HTML.Tag: 79 x "cannot assign a value to final variable").
+                            // BUG-2026-0174: by statement identity, not by (owner-qualified) name
+                            if (inlinedClinitStmts.contains(stmt)) {
                                 continue;
                             }
+                            // END_CHANGE: BUG-2026-0170-1
                             // START_CHANGE: ISS-2026-0011-20260323-4 - Skip $assertionsDisabled init in clinit
                             if ("$assertionsDisabled".equals(fn)) {
                                 continue;
@@ -2394,7 +2874,7 @@ public class JavaSourceWriter implements Processor {
                 writeType(printer, method.returnType, ownerInternalName);
             }
             printer.printText(" ");
-            emitDecl(printer,Printer.METHOD, ownerInternalName, method.name, method.descriptor);
+            emitDecl(printer,Printer.METHOD, ownerInternalName, accessorSourceName(method.name), method.descriptor);
         } else {
             // START_CHANGE: BUG-2026-0097-20260610-8 - Local classes have digit-leading simple
             // names (`1Local`); prefix '_' so the constructor name matches the sanitized class
@@ -2403,6 +2883,13 @@ public class JavaSourceWriter implements Processor {
             if (ctorName.length() > 0 && Character.isDigit(ctorName.charAt(0))) {
                 ctorName = "_" + ctorName;
             }
+            // START_CHANGE: BUG-2026-0145-20261017-1 - A generic constructor (`<T> Foo(T t)`)
+            // declares its own type parameters too; without them `T` does not resolve.
+            if (methodTypeParams != null && methodTypeParams.length() > 0) {
+                printer.printText(methodTypeParams);
+                printer.printText(" ");
+            }
+            // END_CHANGE: BUG-2026-0145-1
             emitDecl(printer,Printer.CONSTRUCTOR, ownerInternalName, ctorName, method.descriptor);
             // END_CHANGE: BUG-2026-0097-8
         }
@@ -2443,8 +2930,14 @@ public class JavaSourceWriter implements Processor {
                 } else {
                     writeType(printer, paramType, ownerInternalName);
                 }
-            } else if (genericParamTypes != null && i < genericParamTypes.length) {
-                printer.printText(genericParamTypes[i]);
+            // START_CHANGE: BUG-2026-0168-20261018-1 - The Signature attribute omits synthetic and
+            // mandated parameters (enum name/ordinal, outer instance), so it can be shorter than the
+            // descriptor. Align it to the descriptor's TAIL instead of indexing it from 0, which
+            // shifted every type by the synthetic count (`KnownOIDs(String[] oid, String, String...)`).
+            } else if (genericParamTypes != null && genericParamTypes.length <= method.parameterTypes.size()
+                    && i - (method.parameterTypes.size() - genericParamTypes.length) >= 0) {
+                printer.printText(genericParamTypes[i - (method.parameterTypes.size() - genericParamTypes.length)]);
+            // END_CHANGE: BUG-2026-0168-1
             } else {
                 writeType(printer, method.parameterTypes.get(i), ownerInternalName);
             }
@@ -2510,8 +3003,13 @@ public class JavaSourceWriter implements Processor {
             lineNumber++;
 
             // START_CHANGE: IMP-LINES-20260326-10 - Store bytecode instructions for inline display
+            // START_CHANGE: BUG-2026-0201-20261030-1 - Work on a COPY of the method's map. Emission
+            // removes each line's entry once printed, and the reference-collecting dry render
+            // (BUG-2026-0141) runs first over the same AST: consuming the shared map there left
+            // the real render with nothing to print, so --show-bytecode emitted no instructions.
             currentBytecodeInstructions = (showBytecode && method.bytecodeInstructions != null)
-                ? method.bytecodeInstructions : null;
+                ? new java.util.HashMap<Integer, java.util.List<String>>(method.bytecodeInstructions) : null;
+            // END_CHANGE: BUG-2026-0201-1
             // END_CHANGE: IMP-LINES-10
 
             // START_CHANGE: IMP-2026-0002-20260420-13 - Emit per-method decompilation notes
@@ -2530,7 +3028,17 @@ public class JavaSourceWriter implements Processor {
             }
             // END_CHANGE: IMP-2026-0002-13
 
-            for (Statement stmt : method.body) {
+            // START_CHANGE: BUG-2026-0149-20261017-1 - With the synthetic outer parameter dropped
+            // from the declaration, its uses in the body must go too: javac's null check
+            // `outer.getClass();`, the outer argument it forwards to an inner superclass /
+            // sibling constructor (`super(outer, ...)` -> `super(...)`, supplied implicitly), and
+            // any other read, which is the enclosing instance `Outer.this`.
+            List<Statement> body149 = method.body;
+            if (dropOuterParam && method.parameterNames != null && !method.parameterNames.isEmpty()) {
+                body149 = rewriteOuterParamUses(method.body, method.parameterNames.get(0), result);
+            }
+            // END_CHANGE: BUG-2026-0149-1
+            for (Statement stmt : body149) {
                 // Skip trailing void return in constructors and void methods
                 if (stmt instanceof ReturnStatement && !((ReturnStatement) stmt).hasExpression()) {
                     continue;
@@ -2552,6 +3060,14 @@ public class JavaSourceWriter implements Processor {
                     continue;
                 }
                 // END_CHANGE: BUG-2026-0066-1
+                // START_CHANGE: BUG-2026-0179-20261018-1 - A final instance field with a constant
+                // initializer carries a ConstantValue attribute (already rendered as the
+                // declaration's `= value`) AND javac still emits its putfield in every
+                // constructor. Re-emitting `this.F = value;` assigns a final twice.
+                if (method.isConstructor() && isConstantFinalFieldInit(stmt, result)) {
+                    continue;
+                }
+                // END_CHANGE: BUG-2026-0179-1
                 // START_CHANGE: BUG-2026-0097-20260610-10 - With the outer-instance parameter
                 // dropped, also drop the JDK18+ `Objects.requireNonNull(outerArg)` null-check
                 // javac emits for it: that parameter no longer exists in the emitted source.
@@ -2879,7 +3395,13 @@ public class JavaSourceWriter implements Processor {
                 }
                 selectorNeedsOrdinal = allIntLabels;
             }
+            // START_CHANGE: BUG-2026-0166-20261018-5 - `((E) x).ordinal()`, not `(E) x.ordinal()`
+            boolean parenSel166 = selectorNeedsOrdinal && (switchSel instanceof CastExpression
+                || switchSel instanceof TernaryExpression || switchSel instanceof AssignmentExpression);
+            if (parenSel166) printer.printText("(");
             writeExpression(printer, switchSel, ownerInternalName);
+            if (parenSel166) printer.printText(")");
+            // END_CHANGE: BUG-2026-0166-5
             if (selectorNeedsOrdinal) {
                 printer.printText(".ordinal()");
             }
@@ -2925,7 +3447,7 @@ public class JavaSourceWriter implements Processor {
                         }
                         printer.printKeyword("case");
                         printer.printText(" ");
-                        writeExpression(printer, sc.getLabels().get(ci), ownerInternalName);
+                        writeCaseLabel(printer, sc.getLabels().get(ci), ownerInternalName, !hasPatternCase(ss)); // BUG-2026-0166
                         printer.printText(":");
                     }
                 }
@@ -3016,6 +3538,24 @@ public class JavaSourceWriter implements Processor {
             LabelStatement ls = (LabelStatement) stmt;
             printer.printText(ls.getLabel());
             printer.printText(":");
+            // START_CHANGE: BUG-2026-0152-20261017-7 - A labeled BLOCK (`L: { ... break L; }`)
+            // needs its braces: a bare BlockStatement is otherwise flattened into its parent,
+            // which would move the statements out of the label's scope.
+            if (ls.getBody() instanceof BlockStatement) {
+                printer.printText(" {");
+                printer.endLine();
+                printer.indent();
+                int ln152 = line + 1;
+                for (Statement inner : ((BlockStatement) ls.getBody()).getStatements()) {
+                    ln152 = writeStatement(printer, inner, ownerInternalName, ln152);
+                }
+                printer.unindent();
+                printer.startLine(ln152);
+                printer.printText("}");
+                printer.endLine();
+                return ln152 + 1;
+            }
+            // END_CHANGE: BUG-2026-0152-7
             printer.endLine();
             lineNumber = writeStatement(printer, ls.getBody(), ownerInternalName, line + 1);
             return lineNumber;
@@ -3104,7 +3644,15 @@ public class JavaSourceWriter implements Processor {
                     ? null : capturedArgSubstitutions.getFirst().get(fieldName);
                 if (capturedArg != null) {
                     Map<String, Expression> innermost = capturedArgSubstitutions.removeFirst();
+                    // BUG-2026-0146: the captured value replaces a primary; a cast/operator
+                    // expression needs parentheses there (`((Method) m).setAccessible(true)`)
+                    boolean paren146 = capturedArg instanceof CastExpression
+                        || capturedArg instanceof BinaryOperatorExpression || capturedArg instanceof TernaryExpression
+                        || capturedArg instanceof AssignmentExpression || capturedArg instanceof UnaryOperatorExpression
+                        || capturedArg instanceof InstanceOfExpression || capturedArg instanceof LambdaExpression;
+                    if (paren146) printer.printText("(");
                     writeExpression(printer, capturedArg, ownerInternalName);
+                    if (paren146) printer.printText(")");
                     capturedArgSubstitutions.addFirst(innermost);
                 } else {
                     // val$xxx is a captured variable from outer scope - write just the variable name
@@ -3167,9 +3715,25 @@ public class JavaSourceWriter implements Processor {
         } else if (expr instanceof StaticMethodInvocationExpression) {
             StaticMethodInvocationExpression smie = (StaticMethodInvocationExpression) expr;
             // START_CHANGE: BUG-2026-0045-20260327-2 - Inline synthetic access$NNN methods
+            // START_CHANGE: BUG-2026-0146-20261017-1 - Inline the accessor by substituting the call's
+            // arguments into the accessor's own decompiled body (`return arg0.next;`,
+            // `arg0.unlink();`, `return Outer.helper(arg0, arg1, arg2);`). The name-only resolution
+            // below handles getters/setters with 1-2 arguments and loses the receiver's cast
+            // parentheses; it stays as the fallback.
+            Expression inlined146 = smie.getMethodName().startsWith("access$") ? inlineAccessor(smie) : null;
+            if (inlined146 == null && smie.getMethodName().startsWith("access$")) {
+                unresolvedAccessors.add(smie.getOwnerInternalName() + "." + smie.getMethodName() + smie.getDescriptor());
+            }
+            if (inlined146 != null) {
+                writeExpression(printer, inlined146, ownerInternalName);
+            } else
+            // END_CHANGE: BUG-2026-0146-1
             if (smie.getMethodName().startsWith("access$") && smie.getArguments().size() >= 1) {
                 // START_CHANGE: BUG-2026-0046-20260327-1 - Resolve access$NNN to actual method/field via parent result
-                String resolvedName = resolveAccessorName(smie.getOwnerInternalName(), smie.getMethodName());
+                // BUG-2026-0146: the name-only getter/setter guess misread 1-argument static setters
+                // (`access$102(value)` printed as `value.field`); an accessor that cannot be
+                // inlined is now always called through its renamed, printed declaration.
+                String resolvedName = null;
                 Expression outerRef = smie.getArguments().get(0);
                 if (smie.getArguments().size() == 1 && resolvedName != null && "V".equals(TypeNameUtil.parseMethodReturnDescriptor(smie.getDescriptor()))) {
                     // Void method call: outerRef.resolvedMethod()
@@ -3191,13 +3755,18 @@ public class JavaSourceWriter implements Processor {
                         emitRef(printer, Printer.TYPE, owner, TypeNameUtil.simpleNameFromInternal(owner), "", ownerInternalName);
                         printer.printText(".");
                     }
-                    emitRef(printer, Printer.METHOD, owner, smie.getMethodName(), smie.getDescriptor(), ownerInternalName);
+                    emitRef(printer, Printer.METHOD, owner, accessorSourceName(smie.getMethodName()), smie.getDescriptor(), ownerInternalName);
                     writeArguments(printer, smie.getArguments(), ownerInternalName);
                 }
                 // END_CHANGE: BUG-2026-0046-1
             } else {
             // Simplify autoboxing: Integer.valueOf(1) -> 1, etc.
-            if ("valueOf".equals(smie.getMethodName()) && smie.getArguments().size() == 1) {
+            // BUG-2026-0154: only the boxing overload `valueOf(<primitive>)` is implicit;
+            // `Integer.valueOf(String)` parses and must stay
+            String vd154 = smie.getDescriptor();
+            boolean boxing154 = vd154 != null && vd154.length() > 3 && vd154.charAt(2) == ')'
+                && "ZBCSIJFD".indexOf(vd154.charAt(1)) >= 0;
+            if (boxing154 && "valueOf".equals(smie.getMethodName()) && smie.getArguments().size() == 1) {
                 String autoboxOwner = smie.getOwnerInternalName();
                 if ("java/lang/Integer".equals(autoboxOwner) || "java/lang/Long".equals(autoboxOwner) ||
                     "java/lang/Short".equals(autoboxOwner) || "java/lang/Byte".equals(autoboxOwner) ||
@@ -3260,6 +3829,22 @@ public class JavaSourceWriter implements Processor {
             if (displayName != null) {
                 emitRef(printer,Printer.TYPE, ne.getInternalTypeName(),
                     displayName, "", ownerInternalName);
+                // START_CHANGE: BUG-2026-0155-20261017-1 - Keep the anonymous class's type
+                // arguments (`new Comparator<QName>() {`): the raw form does not see the generic
+                // `compare(QName, QName)` as implementing `compare(Object, Object)`.
+                JavaSyntaxResult anon155 = findInnerClassResult(rootResult != null ? rootResult : currentResult,
+                    ne.getInternalTypeName());
+                if (anon155 != null && anon155.getSignature() != null) {
+                    String targs155 = null;
+                    String[] ifs155 = SignatureParser.parseClassInterfaceTypes(anon155.getSignature());
+                    if (anon155.getInterfaces() != null && anon155.getInterfaces().length > 0) {
+                        if (ifs155 != null && ifs155.length > 0) targs155 = signatureTypeArguments(ifs155[0]);
+                    } else {
+                        targs155 = signatureTypeArguments(SignatureParser.parseClassSuperType(anon155.getSignature()));
+                    }
+                    if (targs155 != null && targs155.indexOf('?') < 0) printer.printText(targs155);
+                }
+                // END_CHANGE: BUG-2026-0155-1
                 // START_CHANGE: BUG-2026-0097-20260610-4 - Build the capture substitution map
                 // (val$ field -> new-site argument expression) and recover the superclass
                 // constructor arguments from the anon <init> body. Previously the arguments were
@@ -3325,6 +3910,13 @@ public class JavaSourceWriter implements Processor {
                     printer.endLine();
                     printer.indent();
                     int anonLine = 1;
+                    // START_CHANGE: BUG-2026-0163-20261018-1 - The anonymous class's own fields
+                    // and the rest of its constructor (field initializers, instance initializer
+                    // code) were dropped: only methods were inlined, so `this.idx` did not resolve
+                    // and initialization code silently disappeared.
+                    anonLine = writeAnonymousMembers(printer, anonResult, anonInit, neArgs, ownerInternalName, anonLine);
+                    // END_CHANGE: BUG-2026-0163-1
+                    renameShadowingLocals196(anonResult, captureMap); // BUG-2026-0196
                     for (int mi = 0; mi < anonResult.getMethods().size(); mi++) {
                         JavaSyntaxResult.MethodDeclaration m = anonResult.getMethods().get(mi);
                         if ("<init>".equals(m.name)) continue;
@@ -3442,7 +4034,12 @@ public class JavaSourceWriter implements Processor {
             // END_CHANGE: ISS-2026-0002-4
         } else if (expr instanceof ArrayAccessExpression) {
             ArrayAccessExpression aae = (ArrayAccessExpression) expr;
+            // BUG-2026-0142: `((T[]) o)[i]` - a cast in array position needs parentheses
+            boolean castArr142 = aae.getArray() instanceof CastExpression || aae.getArray() instanceof TernaryExpression
+                || aae.getArray() instanceof AssignmentExpression;
+            if (castArr142) printer.printText("(");
             writeExpression(printer, aae.getArray(), ownerInternalName);
+            if (castArr142) printer.printText(")");
             printer.printText("[");
             writeExpression(printer, aae.getIndex(), ownerInternalName);
             printer.printText("]");
@@ -3457,6 +4054,11 @@ public class JavaSourceWriter implements Processor {
             if (castType instanceof GenericType) {
                 redundant = false;
             } else
+            // START_CHANGE: BUG-2026-0142-20261017-2 - Casts required by TypeCoercer always print.
+            if (ce.isExplicit()) {
+                redundant = false;
+            } else
+            // END_CHANGE: BUG-2026-0142-2
             // END_CHANGE: BUG-2026-0031-1
             if (castType != null && exprType != null &&
                 castType.getDescriptor() != null &&
@@ -3508,15 +4110,25 @@ public class JavaSourceWriter implements Processor {
                     printer.printText(ioe.getPatternVariableName());
                 }
             }
+        } else if (expr instanceof BinaryOperatorExpression
+                && it.denzosoft.javadecompiler.service.converter.transform.BooleanSimplifier
+                    .compareAsSource((BinaryOperatorExpression) expr) != null) {
+            // BUG-2026-0185: exact source form of `(a <=> b) OP 0`, whoever built it
+            writeExpression(printer, it.denzosoft.javadecompiler.service.converter.transform.BooleanSimplifier
+                .compareAsSource((BinaryOperatorExpression) expr), ownerInternalName);
         } else if (expr instanceof BinaryOperatorExpression) {
             // START_CHANGE: BUG-2026-0051-20260327-1 - Convert <=> (lcmp/dcmp) to valid Java comparison
-            if ("<=>".equals(((BinaryOperatorExpression) expr).getOperator())) {
+            if (((BinaryOperatorExpression) expr).getOperator().startsWith("<=>")) { // BUG-2026-0177
                 BinaryOperatorExpression cmpExpr = (BinaryOperatorExpression) expr;
                 String cmpClass = "Long";
                 Type lt = cmpExpr.getLeft().getType();
                 if (lt == PrimitiveType.DOUBLE) cmpClass = "Double";
                 else if (lt == PrimitiveType.FLOAT) cmpClass = "Float";
-                printer.printText(cmpClass + ".compare(");
+                // START_CHANGE: BUG-2026-0183-20261018-1 - Print the box type as a type reference:
+                // inside Arc2D.Double / Point2D.Float a bare `Double` names the nested class.
+                writeType(printer, new ObjectType("java/lang/" + cmpClass), ownerInternalName);
+                printer.printText(".compare(");
+                // END_CHANGE: BUG-2026-0183-1
                 writeExpression(printer, cmpExpr.getLeft(), ownerInternalName);
                 printer.printText(", ");
                 writeExpression(printer, cmpExpr.getRight(), ownerInternalName);
@@ -3565,7 +4177,10 @@ public class JavaSourceWriter implements Processor {
                 // Wrap complex expressions in parentheses for correct precedence
                 // e.g., !(x instanceof Foo) instead of !x instanceof Foo
                 boolean needsParens = uoe.getExpression() instanceof InstanceOfExpression
-                    || uoe.getExpression() instanceof BinaryOperatorExpression;
+                    || uoe.getExpression() instanceof BinaryOperatorExpression
+                    // BUG-2026-0142: `!(b ? x : y)`, `-(i = j)`
+                    || uoe.getExpression() instanceof TernaryExpression
+                    || uoe.getExpression() instanceof AssignmentExpression;
                 printer.printText(uoe.getOperator());
                 if (needsParens) printer.printText("(");
                 writeExpression(printer, uoe.getExpression(), ownerInternalName);
@@ -3712,7 +4327,7 @@ public class JavaSourceWriter implements Processor {
                     printer.printText(" ");
                     for (int li = 0; li < sc.getLabels().size(); li++) {
                         if (li > 0) printer.printText(", ");
-                        writeExpression(printer, sc.getLabels().get(li), ownerInternalName);
+                        writeCaseLabel(printer, sc.getLabels().get(li), ownerInternalName, !hasPatternCase(se)); // BUG-2026-0166
                     }
                 }
                 printer.printText(" -> ");
@@ -3999,7 +4614,7 @@ public class JavaSourceWriter implements Processor {
                     for (int li = 0; li < c.getLabels().size(); li++) {
                         printer.printKeyword("case");
                         printer.printText(" ");
-                        writeExpression(printer, c.getLabels().get(li), ownerInternalName);
+                        writeCaseLabel(printer, c.getLabels().get(li), ownerInternalName, !hasPatternCase(sw)); // BUG-2026-0166
                         printer.printText(": ");
                     }
                 }
@@ -4141,7 +4756,9 @@ public class JavaSourceWriter implements Processor {
             } else if (fae.getOwnerInternalName() != null && !fae.getOwnerInternalName().isEmpty()
                        && !fae.getOwnerInternalName().equals(ownerInternalName)) {
                 // Static field from different class
-                printer.printText(TypeNameUtil.simpleNameFromInternal(fae.getOwnerInternalName()));
+                // BUG-2026-0141: through emitRef, so nested owners print as Outer.Inner and import
+                emitRef(printer, Printer.TYPE, fae.getOwnerInternalName(),
+                    TypeNameUtil.simpleNameFromInternal(fae.getOwnerInternalName()), "", ownerInternalName);
                 printer.printText(".");
             }
             printer.printText(fae.getName());
@@ -4158,29 +4775,12 @@ public class JavaSourceWriter implements Processor {
         } else if (val instanceof NewArrayExpression) {
             // BUG-2026-0063: a nested array initializer (multi-dimensional `{{1,2},{3,4}}`) — render the
             // real element values (`new int[]{1, 2}`) instead of a `/* N elements */` placeholder.
-            NewArrayExpression innerNae = (NewArrayExpression) val;
-            printer.printKeyword("new");
-            printer.printText(" ");
-            Type innerBase = innerNae.getType();
-            while (innerBase instanceof ArrayType) innerBase = ((ArrayType) innerBase).getElementType();
-            writeType(printer, innerBase, ownerInternalName);
-            if (innerNae.hasInitValues()) {
-                printer.printText("[]{");
-                List<Expression> ivs = innerNae.getInitValues();
-                for (int k = 0; k < ivs.size(); k++) {
-                    if (k > 0) printer.printText(", ");
-                    writeExpressionSimple(printer, ivs.get(k), ownerInternalName);
-                }
-                printer.printText("}");
-            } else if (!innerNae.getDimensionExpressions().isEmpty()) {
-                for (Expression dim : innerNae.getDimensionExpressions()) {
-                    printer.printText("[");
-                    writeExpression(printer, dim, ownerInternalName);
-                    printer.printText("]");
-                }
-            } else {
-                printer.printText("[0]");
-            }
+            // START_CHANGE: BUG-2026-0169-20261018-1 - Render nested arrays through the main
+            // NewArrayExpression path: the local copy always printed ONE `[]`, so a 3-D initializer
+            // came out as `new char[]{new char[]{..}}` and dimension-only elements lost their trailing
+            // `[]`. Recursion depth is the nesting depth (elements still go through the simple path).
+            writeExpression(printer, val, ownerInternalName);
+            // END_CHANGE: BUG-2026-0169-1
         } else {
             // Final fallback - just print the class name to avoid recursion
             printer.printText("/* " + val.getClass().getSimpleName() + " */");
@@ -4193,6 +4793,11 @@ public class JavaSourceWriter implements Processor {
         // START_CHANGE: BUG-2026-0016-20260326-4 - Assignment in condition needs parentheses
         if (child instanceof AssignmentExpression) return true;
         // END_CHANGE: BUG-2026-0016-4
+        // START_CHANGE: BUG-2026-0142-20261017-3 - A ternary operand always needs parentheses
+        // (`(b ? 1 : 0) + x`), and instanceof binds at relational precedence.
+        if (child instanceof TernaryExpression) return true;
+        if (child instanceof InstanceOfExpression) return getOperatorPrecedence(parentOp) >= 7;
+        // END_CHANGE: BUG-2026-0142-3
         if (!(child instanceof BinaryOperatorExpression)) return false;
         String childOp = ((BinaryOperatorExpression) child).getOperator();
         int parentPrec = getOperatorPrecedence(parentOp);
@@ -4497,6 +5102,27 @@ public class JavaSourceWriter implements Processor {
     }
     // END_CHANGE: BUG-2026-0066-2
 
+    // START_CHANGE: BUG-2026-0179-20261018-2 - `this.F = <constant>` where F is a final,
+    // non-static field of this class whose declaration already carries the constant.
+    private boolean isConstantFinalFieldInit(Statement stmt, JavaSyntaxResult result) {
+        if (result == null || result.getFields() == null || !(stmt instanceof ExpressionStatement)) return false;
+        Expression e = ((ExpressionStatement) stmt).getExpression();
+        if (!(e instanceof AssignmentExpression) || !"=".equals(((AssignmentExpression) e).getOperator())) return false;
+        AssignmentExpression ae = (AssignmentExpression) e;
+        if (!(ae.getLeft() instanceof FieldAccessExpression)) return false;
+        FieldAccessExpression fa = (FieldAccessExpression) ae.getLeft();
+        if (!(fa.getObject() instanceof ThisExpression)) return false;
+        Expression rhs = ae.getRight();
+        if (!(rhs instanceof IntegerConstantExpression || rhs instanceof LongConstantExpression
+                || rhs instanceof FloatConstantExpression || rhs instanceof DoubleConstantExpression
+                || rhs instanceof StringConstantExpression || rhs instanceof BooleanExpression)) return false;
+        for (JavaSyntaxResult.FieldDeclaration f : result.getFields()) {
+            if (f.name.equals(fa.getName()) && f.isFinal() && !f.isStatic() && f.initialValue != null) return true;
+        }
+        return false;
+    }
+    // END_CHANGE: BUG-2026-0179-2
+
     // START_CHANGE: BUG-2026-0097-20260610-13 - Helpers for synthetic outer-instance stripping.
     /**
      * True when the constructor's synthetic leading outer-instance parameter must be suppressed:
@@ -4516,6 +5142,110 @@ public class JavaSourceWriter implements Processor {
         Type first = method.parameterTypes.get(0);
         return first instanceof ObjectType && outer.equals(((ObjectType) first).getInternalName());
     }
+
+    // START_CHANGE: BUG-2026-0149-20261017-2 - See BUG-2026-0149-1.
+    private List<Statement> rewriteOuterParamUses(List<Statement> body, final String outerParam,
+                                                  JavaSyntaxResult result) {
+        String outerField = null;
+        String outerDesc = null;
+        if (result.getFields() != null) {
+            for (JavaSyntaxResult.FieldDeclaration f : result.getFields()) {
+                if (f.name != null && f.name.startsWith("this$")) { outerField = f.name; outerDesc = f.descriptor; break; }
+            }
+        }
+        if (outerField == null) {
+            String internal = result.getInternalName();
+            outerField = "this$0";
+            outerDesc = "L" + internal.substring(0, internal.lastIndexOf('$')) + ";";
+        }
+        final FieldAccessExpression outerThis = new FieldAccessExpression(0, null,
+            new ThisExpression(0, null), result.getInternalName(), outerField, outerDesc);
+        it.denzosoft.javadecompiler.service.converter.transform.AstMapper mapper =
+            new it.denzosoft.javadecompiler.service.converter.transform.AstMapper() {
+                @Override
+                protected Expression mapLocal(LocalVariableExpression lv) {
+                    return outerParam.equals(lv.getName()) ? outerThis : lv;
+                }
+            };
+        List<Statement> out = new ArrayList<Statement>(body.size());
+        boolean ctorCallSeen = false;
+        for (Statement st : body) {
+            if (st instanceof ExpressionStatement) {
+                Expression e = ((ExpressionStatement) st).getExpression();
+                if (e instanceof MethodInvocationExpression) {
+                    MethodInvocationExpression m = (MethodInvocationExpression) e;
+                    if (!ctorCallSeen && "getClass".equals(m.getMethodName())
+                            && (m.getArguments() == null || m.getArguments().isEmpty())
+                            && m.getObject() instanceof LocalVariableExpression
+                            && outerParam.equals(((LocalVariableExpression) m.getObject()).getName())) {
+                        continue; // javac's null check of the (now implicit) outer instance
+                    }
+                    if (("super".equals(m.getMethodName()) || "this".equals(m.getMethodName()))
+                            && m.getArguments() != null && !m.getArguments().isEmpty()
+                            && m.getArguments().get(0) instanceof LocalVariableExpression
+                            && outerParam.equals(((LocalVariableExpression) m.getArguments().get(0)).getName())) {
+                        ctorCallSeen = true;
+                        List<Expression> rest = new ArrayList<Expression>(m.getArguments().subList(1, m.getArguments().size()));
+                        MethodInvocationExpression nm = new MethodInvocationExpression(m.getLineNumber(), m.getType(),
+                            m.getObject(), m.getOwnerInternalName(), m.getMethodName(), m.getDescriptor(), rest);
+                        out.add(mapper.map(new ExpressionStatement(nm)));
+                        continue;
+                    }
+                    if ("super".equals(m.getMethodName()) || "this".equals(m.getMethodName())) ctorCallSeen = true;
+                }
+            }
+            out.add(mapper.map(st));
+        }
+        return out;
+    }
+    // END_CHANGE: BUG-2026-0149-2
+
+    // START_CHANGE: BUG-2026-0196-20261018-1 - A captured value is written as the enclosing
+    // method's expression (`proto`, i.e. the outer local `var6`) inside the inlined anonymous body.
+    // Without a LocalVariableTable both scopes name locals by slot, so an inner local `var6`
+    // declared in the anonymous method shadowed the captured outer `var6`: the reads meant for
+    // the captured String bound to an InetSocketAddress (sun.net.spi.DefaultProxySelector).
+    // Inner declarations that collide with a local the captures read are renamed, with their uses.
+    private static void renameShadowingLocals196(JavaSyntaxResult anon, Map<String, Expression> captureMap) {
+        if (anon == null || anon.getMethods() == null || captureMap == null || captureMap.isEmpty()) return;
+        final Set<String> captured = new HashSet<String>();
+        it.denzosoft.javadecompiler.service.converter.transform.AstMapper refs =
+            new it.denzosoft.javadecompiler.service.converter.transform.AstMapper() {
+                @Override
+                protected Expression mapLocal(LocalVariableExpression lv) {
+                    captured.add(lv.getName());
+                    return lv;
+                }
+            };
+        for (Expression ce : captureMap.values()) {
+            if (ce != null) refs.map(new ExpressionStatement(ce));
+        }
+        if (captured.isEmpty()) return;
+        for (JavaSyntaxResult.MethodDeclaration m : anon.getMethods()) {
+            if (m.body == null || "<init>".equals(m.name)) continue;
+            final Set<String> declared = new HashSet<String>();
+            it.denzosoft.javadecompiler.service.converter.transform.AstMapper decls =
+                new it.denzosoft.javadecompiler.service.converter.transform.AstMapper() {
+                    @Override
+                    protected String mapDeclaredName(String name) {
+                        declared.add(name);
+                        return name;
+                    }
+                };
+            decls.mapList(m.body);
+            for (String n : captured) {
+                if (!declared.contains(n)) continue;
+                if (m.parameterNames != null && m.parameterNames.contains(n)) continue;
+                String fresh = n + "_a";
+                while (declared.contains(fresh) || captured.contains(fresh)) fresh = fresh + "a";
+                declared.add(fresh);
+                it.denzosoft.javadecompiler.service.converter.transform.AstMapper.Renamer ren =
+                    new it.denzosoft.javadecompiler.service.converter.transform.AstMapper.Renamer(n, fresh);
+                for (int i = 0; i < m.body.size(); i++) m.body.set(i, ren.map(m.body.get(i)));
+            }
+        }
+    }
+    // END_CHANGE: BUG-2026-0196-1
 
     private JavaSyntaxResult.MethodDeclaration findFirstConstructor(JavaSyntaxResult result) {
         if (result == null || result.getMethods() == null) return null;

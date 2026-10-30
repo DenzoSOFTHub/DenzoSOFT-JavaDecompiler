@@ -97,6 +97,14 @@ public class DecompilerTest {
         testThreadSafetyDeterminism();   // BUG-2026-0124: shared instance, many threads, same output
         testTryBodyNotDisplaced();       // BUG-2026-0122: synthesised statement stays inside the try
         // END_CHANGE: v1.13.0-1
+        // START_CHANGE: BUG-2026-0129-20260907-3 - Inlined finally copy before a NESTED exit.
+        testNestedFinallyCopyRemoved();  // BUG-2026-0129: finally body must not run twice
+        testShowBytecodeEmitted();       // BUG-2026-0201: --show-bytecode prints the instructions
+        testGenericParamForEach();       // BUG-2026-0202: for-each over a List<T> parameter stays typed
+        // START_CHANGE: BUG-2026-0171-20261018-2 - rt.jar semantic campaign guards (BUG-2026-0171..0178).
+        testRtJarSemanticGuards();
+        // END_CHANGE: BUG-2026-0171-2
+        // END_CHANGE: BUG-2026-0129-3
 
         // Summary
         System.out.println("\n=====================================");
@@ -1038,6 +1046,517 @@ public class DecompilerTest {
             new String[]{});
     }
     // END_CHANGE: v1.13.0-2
+
+    // START_CHANGE: BUG-2026-0171-20261018-3 - Guards for the silent defects found by the rt.jar
+    // bytecode-fingerprint gate. Each source is the runtime-oracle fixture of the same name in
+    // src/test/resources/runtime-oracle/ (trimmed to the method that shows the defect); every
+    // assertion FAILS on the build before the matching fix.
+    private static void testRtJarSemanticGuards() {
+        // BUG-2026-0171: the then-branch (ending in a loop) of an if/else was dropped
+        runTestFull("IfElseLoopTail171",
+            "public class IfElseLoopTail171 {\n" +
+            "    int type; int[] r;\n" +
+            "    boolean b(int ch) {\n" +
+            "        boolean ret;\n" +
+            "        if (type == 4) { ret = false; for (int i = 0; i < r.length; i++) { ch++; } }\n" +
+            "        else { ret = true; for (int i = 0; i < r.length; i++) { ch--; } }\n" +
+            "        return ret;\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"} else {", "arg0++;", "arg0--;"}, new String[]{"this.type != 4"});
+        // BUG-2026-0172: nested ternary stored to a field took the pending receiver as an arm
+        runTestFull("TernPending172",
+            "public class TernPending172 {\n" +
+            "    int op;\n" +
+            "    void swap() { this.op = this.op == 2 ? 3 : this.op == 3 ? 2 : this.op == 4 ? 5 : 4; }\n" +
+            "}", "-g:none",
+            new String[]{"this.op == 3 ? 2"}, new String[]{": this;"});
+        // BUG-2026-0173: an Object-typed value must keep the local Object (no unchecked narrowing cast)
+        runTestFull("LubLocal173",
+            "public class LubLocal173 {\n" +
+            "    static String f(Object[] args, int i, boolean sub) {\n" +
+            "        Object obj = args[i];\n" +
+            "        String arg = null;\n" +
+            "        if (obj == null) { arg = \"null\"; }\n" +
+            "        else if (sub) { arg = String.valueOf(obj); if (arg.indexOf('{') >= 0) { obj = args; arg = null; } }\n" +
+            "        return arg + obj;\n" +
+            "    }\n" +
+            "}", "-g:source,lines",
+            new String[]{"Object var3 = arg0[arg1];"}, new String[]{"(Object[]) arg0[arg1]"});
+        // BUG-2026-0174: a later <clinit> assignment of an inlined static field must survive
+        runTestFull("TryBoolClinit174",
+            "public class TryBoolClinit174 {\n" +
+            "    static String prop = System.getProperty(\"p\");\n" +
+            "    private static boolean compat = false;\n" +
+            "    static String mode;\n" +
+            "    static {\n" +
+            "        try { String form = prop.trim(); compat = (form != null && form.equals(\"1.0\")); }\n" +
+            "        catch (Exception e) { }\n" +
+            "        if (compat) mode = \"old\"; else mode = \"new\";\n" +
+            "    }\n" +
+            "}", "-g:source,lines",
+            new String[]{"equals(\"1.0\")"}, new String[0]);
+        // BUG-2026-0175: a synthesised boolean merge statement stays inside its try
+        runTestFull("TryBoolTail175",
+            "public class TryBoolTail175 {\n" +
+            "    static boolean flag;\n" +
+            "    static boolean check(String s) { return s.startsWith(\"1\"); }\n" +
+            "    static String run(String p) {\n" +
+            "        flag = false;\n" +
+            "        try { String form = p.trim(); flag = form != null && check(form); }\n" +
+            "        catch (RuntimeException e) { return \"caught\"; }\n" +
+            "        return \"ok\";\n" +
+            "    }\n" +
+            "}", "-g:source,lines",
+            new String[]{"String var1 = arg0.trim();"}, new String[]{"var1 = arg0.trim();\n        } catch"});
+        // BUG-2026-0176: (a && b && c) || ... is rebuilt, not expanded into an exponential ternary
+        runTestFull("OrAndChain176",
+            "public class OrAndChain176 {\n" +
+            "    static boolean en(long m, int id) {\n" +
+            "        return ((m & 1L) != 0 && id >= 0 && id <= 3) || ((m & 2L) != 0 && id >= 100 && id <= 103)\n" +
+            "            || ((m & 4L) != 0 && id >= 200 && id <= 203);\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"arg1 >= 200 && arg1 <= 203;"}, new String[]{" ? "});
+        // BUG-2026-0177: dcmpg/fcmpl comparisons keep NaN semantics
+        runTestFull("NanCmp177",
+            "public class NanCmp177 {\n" +
+            "    static boolean a(double x, double y) { return !(x < y); }\n" +
+            "    static boolean d(float x, float y) { return !(x >= y); }\n" +
+            "}", "-g:none",
+            new String[]{"return !(arg0 < arg1);", "return !(arg0 >= arg1);"}, new String[]{"return arg0 >= arg1;"});
+        // BUG-2026-0178: two ternary arguments in one call chain stay separate
+        runTestFull("ChainTern178",
+            "public class ChainTern178 {\n" +
+            "    static boolean f(int a) { return a > 0; }\n" +
+            "    static boolean g(int a) { return a > 1; }\n" +
+            "    static String s(int a) { return new StringBuilder().append(f(a) ? 1 : 0).append(g(a) ? 1 : 0).toString(); }\n" +
+            "}", "-g:none",
+            new String[]{"append(f(arg0) ? 1 : 0).append(g(arg0) ? 1 : 0)"}, new String[]{"append(1)"});
+        // START_CHANGE: BUG-2026-0179-20261018-3 - rt.jar campaign guards, second round.
+        // BUG-2026-0179: constant final instance field assigned again in the constructor
+        runTestFull("FinalConst179",
+            "public class FinalConst179 {\n" +
+            "    private final int CAP = 2;\n" +
+            "    private Object o;\n" +
+            "    FinalConst179(Object o) { this.o = o; }\n" +
+            "    int cap() { return CAP; }\n" +
+            "}",
+            new String[]{"private final int CAP = 2;", "this.o = "}, new String[]{"this.CAP = 2;"});
+        // BUG-2026-0180: javac 7/8 try-with-resources desugaring (needs a JDK 8 javac)
+        runTestJavac8("TwrJ8180",
+            "public class TwrJ8180 {\n" +
+            "    static class R implements AutoCloseable { int use(int x) { return x; } public void close() {} }\n" +
+            "    static int single(int x) {\n" +
+            "        int r;\n" +
+            "        try (R a = new R()) { r = a.use(x); }\n" +
+            "        return r + 1;\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"try (TwrJ8180.R ", " = new TwrJ8180.R()) {"},
+            new String[]{"addSuppressed", ".close()", "Throwable"});
+        // BUG-2026-0181: a ternary argument in the try body made the catch disappear at -g:none
+        runTestFull("TernInTry181",
+            "public class TernInTry181 {\n" +
+            "    static void call(int k, boolean b) {}\n" +
+            "    static int one(int k) {\n" +
+            "        try { call(k, k == 2); } catch (RuntimeException t) { return -1; }\n" +
+            "        return 0;\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"try {", "call(arg0, arg0 == 2);", "catch (RuntimeException"}, new String[]{});
+        // BUG-2026-0182: an all-assignment try body lost its catch (Throwable) / finally { close(); }
+        runTestFull("TrivialBody182",
+            "public class TrivialBody182 {\n" +
+            "    static int parse(String s) {\n" +
+            "        int r;\n" +
+            "        try { r = Integer.parseInt(s); } catch (Throwable t) { r = -1; }\n" +
+            "        return r;\n" +
+            "    }\n" +
+            "    static String read(java.io.Reader in) throws java.io.IOException {\n" +
+            "        String v = \"x\";\n" +
+            "        try { v = \"y\" + in.read(); } finally { in.close(); }\n" +
+            "        return v;\n" +
+            "    }\n" +
+            "}", "-g",
+            new String[]{"catch (Throwable", "r = -1;", "} finally {", "in.close();"}, new String[]{});
+        // BUG-2026-0183: a member type inherited from the superclass shadows java.lang.Double
+        runTestFull("InheritedShadow183",
+            "public class InheritedShadow183 extends java.awt.geom.Point2D.Double {\n" +
+            "    int cmp(double a) { return java.lang.Double.compare(a, getX()); }\n" +
+            "}", "-g",
+            new String[]{"java.lang.Double.compare("}, new String[]{});
+        // BUG-2026-0184: `Object first = null; .. first = x;` with catch (IOException x) -> typed IOException
+        runTestFull("CatchTypedThrow184",
+            "import java.io.*;\n" +
+            "public class CatchTypedThrow184 {\n" +
+            "    static void closeAll(Closeable[] cs) throws IOException {\n" +
+            "        IOException first = null;\n" +
+            "        for (Closeable c : cs) {\n" +
+            "            try { c.close(); } catch (IOException x) { if (first == null) first = x; else first.addSuppressed(x); }\n" +
+            "        }\n" +
+            "        if (first != null) throw first;\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"IOException var1 = null;"}, new String[]{"Object var1"});
+        // BUG-2026-0185: `(a <=>l b) <= 0` built after BooleanSimplifier rendered as Double.compare
+        runTestFull("DcmpIf185",
+            "public class DcmpIf185 {\n" +
+            "    static int type = 1;\n" +
+            "    static boolean contains(double w, double h, boolean z) {\n" +
+            "        if (w <= 0.0) { return false; } else {\n" +
+            "            if (type == 2) { return z; } else if (z) { if (h >= 180.0) return true; }\n" +
+            "            else if (h <= 180.0) { return false; }\n" +
+            "            return !z;\n" +
+            "        }\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"arg0 <= 0.0", "arg1 >= 180.0", "arg1 <= 180.0"}, new String[]{"compare("});
+        // BUG-2026-0186: for-each over a 2-D array declared its element with the base type
+        runTestFull("ForEach2D186",
+            "public class ForEach2D186 {\n" +
+            "    static int n(String[][] cs) { int k = 0; for (String[] c : cs) { k += c.length; } return k; }\n" +
+            "}", "-g",
+            new String[]{"for (String[] c : cs)"}, new String[]{"for (String c "});
+        // BUG-2026-0187: the code after `if (a || b) { if (c) x(); return; }` was dropped
+        runTestFull("OrRetTail187",
+            "public class OrRetTail187 {\n" +
+            "    static StringBuilder log = new StringBuilder();\n" +
+            "    static boolean dbg = true;\n" +
+            "    static void f(String s, String p) {\n" +
+            "        if (s == null || !s.equals(p)) {\n" +
+            "            if (dbg) log.append(\"bad;\");\n" +
+            "            return;\n" +
+            "        }\n" +
+            "        log.append(\"tail;\");\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"log.append(\"bad;\");", "log.append(\"tail;\");"}, new String[]{});
+        // BUG-2026-0188: switch arms leaving only through conditional jumps had no merge
+        runTestFull("SwitchCondExit188",
+            "public class SwitchCondExit188 {\n" +
+            "    int type;\n" +
+            "    SwitchCondExit188(int t, int d) {\n" +
+            "        switch (t) {\n" +
+            "            case 0: if (d != 0 && d != 1) throw new IllegalArgumentException(); break;\n" +
+            "            case 1: if (d != 2) throw new IllegalArgumentException(); break;\n" +
+            "        }\n" +
+            "        this.type = t;\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"break;", "}\n        this.type = arg0;"}, new String[]{"return;"});
+        // BUG-2026-0189: a try inside a loop body was wrapped around the whole loop
+        runTestFull("LoopTry189",
+            "public class LoopTry189 {\n" +
+            "    static int f(int d) { return d; }\n" +
+            "    static void m() {\n" +
+            "        for (int d = 0; d < 3; d++) {\n" +
+            "            String r;\n" +
+            "            try { r = \"v\" + f(d); } catch (IllegalArgumentException e) { r = \"E\"; }\n" +
+            "            System.out.println(r);\n" +
+            "        }\n" +
+            "    }\n" +
+            "}", "-g:source,lines",
+            new String[]{"for (int var0 = 0; var0 < 3; var0++) {", "            try {\n                var1 = \"v\" + f(var0);"},
+            new String[]{"        try {\n            while", "        try {\n            for"});
+        // BUG-2026-0190: a method-top pre-declaration was placed before super(..) in a constructor
+        runTestFull("SuperFirst190",
+            "public class SuperFirst190 extends java.util.ArrayList<Object> {\n" +
+            "    int a;\n" +
+            "    SuperFirst190(int n, boolean b) {\n" +
+            "        super(n);\n" +
+            "        int k;\n" +
+            "        if (b) { k = 1; } else { k = 2; }\n" +
+            "        while (n > 0) { if (b) k = n; n--; }\n" +
+            "        a = k;\n" +
+            "    }\n" +
+            "}", "-g",
+            new String[]{"super(n);"}, new String[]{"int k;\n        super(n);", "int k = 0;\n        super(n);"});
+        // START_CHANGE: BUG-2026-0191-20261018-7 - rt.jar campaign guards 0191..0199
+        // BUG-2026-0191: javac for-each temporaries (no LVT entry) took the name/type of another variable of their slot
+        runTestFull("ForEachSlot191",
+            "import java.util.*;\n" +
+            "\n" +
+            "public class ForEachSlot191 {\n" +
+            "    static String run(String[][] groups, List<String> extra) {\n" +
+            "        StringBuilder sb = new StringBuilder();\n" +
+            "        for (String[] g : groups) {\n" +
+            "            if (g.length > 0) {\n" +
+            "                for (String v : g) {\n" +
+            "                    sb.append(v).append(',');\n" +
+            "                }\n" +
+            "            }\n" +
+            "        }\n" +
+            "        for (String[] g : groups) {\n" +
+            "            if (g.length > 1) {\n" +
+            "                String head = g[0];\n" +
+            "                String tail = head.length() > 1 ? head.substring(1) : \"-\";\n" +
+            "                Integer count = Integer.valueOf(g.length);\n" +
+            "                sb.append(tail).append(count);\n" +
+            "                for (String w : extra) {\n" +
+            "                    sb.append(w.toUpperCase());\n" +
+            "                }\n" +
+            "            }\n" +
+            "        }\n" +
+            "        return sb.toString();\n" +
+            "    }\n" +
+            "\n" +
+            "    static int sum(int[] a, int[] b) {\n" +
+            "        int t = 0;\n" +
+            "        for (int x : a) t += x;\n" +
+            "        String label = \"s\" + t;\n" +
+            "        long big = label.length();\n" +
+            "        for (int y : b) big += y * 3;\n" +
+            "        return (int) big + t;\n" +
+            "    }\n" +
+            "\n" +
+            "    public static void main(String[] args) {\n" +
+            "        System.out.println(run(new String[][]{{\"ab\", \"c\"}, {}, {\"xyz\", \"q\", \"r\"}}, Arrays.asList(\"m\", \"n\")));\n" +
+            "        System.out.println(sum(new int[]{1, 2, 3}, new int[]{4, 5}));\n" +
+            "    }\n" +
+            "}", "-g",
+            new String[]{"int var8 = var7.length;"},
+            new String[]{"tail = head.length;"});
+        // BUG-2026-0196: an inner anonymous-method local shadowed the captured outer local of the same slot name
+        runTestNested("AnonShadow196",
+            "import java.util.concurrent.Callable;\n" +
+            "\n" +
+            "public class AnonShadow196 {\n" +
+            "    static String f(String a, String b) throws Exception {\n" +
+            "        String t = a;\n" +
+            "        if (b != null) t = b;\n" +
+            "        final String p = t;\n" +
+            "        Callable<String> c = new Callable<String>() {\n" +
+            "            public String call() {\n" +
+            "                String q = \"in\";\n" +
+            "                String r = q + \"-\";\n" +
+            "                String s = r + p.length();\n" +
+            "                return p + \"/\" + s;\n" +
+            "            }\n" +
+            "        };\n" +
+            "        return c.call();\n" +
+            "    }\n" +
+            "\n" +
+            "    public static void main(String[] args) throws Exception {\n" +
+            "        System.out.println(f(\"a\", null));\n" +
+            "        System.out.println(f(\"a\", \"b\"));\n" +
+            "    }\n" +
+            "}",
+            new String[]{"var3_a"});
+        // BUG-2026-0197: two-counter for-init mixed an assignment with a declaration
+        runTestFull("TwoCounter197",
+            "public class TwoCounter197 {\n" +
+            "    static int common(String[] a, String[] b) {\n" +
+            "        int m = a.length - 1;\n" +
+            "        int n = b.length - 1;\n" +
+            "        while (m >= 0 && n >= 0 && a[m].equals(b[n])) {\n" +
+            "            m--;\n" +
+            "            n--;\n" +
+            "        }\n" +
+            "        return a.length - 1 - m;\n" +
+            "    }\n" +
+            "\n" +
+            "    public static void main(String[] args) {\n" +
+            "        System.out.println(common(new String[]{\"x\", \"a\", \"b\"}, new String[]{\"y\", \"z\", \"a\", \"b\"}));\n" +
+            "        System.out.println(common(new String[]{\"q\"}, new String[]{\"r\"}));\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"for (int var3 = arg1.length - 1;"},
+            new String[]{"for (var2 = "});
+        // BUG-2026-0198/0199: fragmented outer try (dropped protection fragment) + return at range end
+        runTestFull("CatchLoop198",
+            "import java.util.*;\n" +
+            "\n" +
+            "public class CatchLoop198 {\n" +
+            "    static int calls;\n" +
+            "\n" +
+            "    static String get(String s) {\n" +
+            "        calls++;\n" +
+            "        if (s.startsWith(\"b\")) throw new IllegalArgumentException(s);\n" +
+            "        return s.toUpperCase();\n" +
+            "    }\n" +
+            "\n" +
+            "    static String pick(List<String[]> providers) {\n" +
+            "        for (int i = 0; i < providers.size(); i++) {\n" +
+            "            try {\n" +
+            "                String[] infos = providers.get(i);\n" +
+            "                for (int j = 0; j < infos.length; j++) {\n" +
+            "                    try {\n" +
+            "                        return get(infos[j]) + i;\n" +
+            "                    } catch (IllegalArgumentException e) {\n" +
+            "                    }\n" +
+            "                }\n" +
+            "            } catch (IllegalArgumentException e) {\n" +
+            "            } catch (NullPointerException e) {\n" +
+            "            }\n" +
+            "        }\n" +
+            "        return \"miss\" + calls;\n" +
+            "    }\n" +
+            "\n" +
+            "    public static void main(String[] args) {\n" +
+            "        List<String[]> p = new ArrayList<String[]>();\n" +
+            "        p.add(new String[]{\"b1\", \"b2\"});\n" +
+            "        p.add(null);\n" +
+            "        p.add(new String[]{\"b3\"});\n" +
+            "        p.add(new String[]{\"b4\"});\n" +
+            "        p.add(new String[]{\"ok\"});\n" +
+            "        System.out.println(pick(p) + \" \" + calls);\n" +
+            "    }\n" +
+            "}", "-g:none",
+            new String[]{"return \"\" + get(var2[var3]) + var1;\n                    } catch (IllegalArgumentException e) {", "            } catch (IllegalArgumentException e) {\n            } catch (NullPointerException e) {\n            }"},
+            new String[]{"                var1++;\n            } catch"});
+        // BUG-2026-0200: types declared inside synchronized / labeled bodies got no import
+        runTestFull("SyncImport200",
+            "public class SyncImport200 {\n" +
+            "    private final Object lock = new Object();\n" +
+            "    int f(java.util.List<String> l) {\n" +
+            "        synchronized (lock) {\n" +
+            "            java.util.Iterator<String> it = l.iterator();\n" +
+            "            int n = 0;\n" +
+            "            while (it.hasNext()) { it.next(); n++; }\n" +
+            "            return n;\n" +
+            "        }\n" +
+            "    }\n" +
+            "}", "-g",
+            new String[]{"import java.util.Iterator;"}, new String[]{});
+        // END_CHANGE: BUG-2026-0191-7
+        // END_CHANGE: BUG-2026-0179-3
+    }
+    // END_CHANGE: BUG-2026-0171-3
+
+    // START_CHANGE: BUG-2026-0202-20261030-4 - A for-each over a parameter declared List<Double>
+    // keeps its typed loop variable in every debug mode: the parameter's type arguments come from
+    // the method Signature, so it is not a raw Iterable (no `Object x$e` + cast rewrite).
+    private static void testGenericParamForEach() {
+        String src =
+            "import java.util.List;\n" +
+            "public class GenParamFe {\n" +
+            "    static double sum(List<Double> xs) {\n" +
+            "        double total = 0;\n" +
+            "        for (Double x : xs) { total += x; }\n" +
+            "        return total;\n" +
+            "    }\n" +
+            "}\n";
+        String[] modes = {"-g", "-g:source,lines", "-g:none"};
+        for (int i = 0; i < modes.length; i++) {
+            runTestFull("GenParamFe", src, modes[i],
+                new String[]{"for (Double "}, new String[]{"$e :", "for (Object "});
+        }
+    }
+    // END_CHANGE: BUG-2026-0202-4
+
+    // START_CHANGE: BUG-2026-0201-20261030-2 - The showBytecode configuration must put the
+    // disassembled instructions in front of the statements. The reference-collecting dry render
+    // consumed the per-method instruction map, so the real render printed none of them.
+    private static void testShowBytecodeEmitted() {
+        total++;
+        String className = "ShowBc201";
+        try {
+            java.io.File tmpDir = new java.io.File(System.getProperty("java.io.tmpdir"), "decompiler-test");
+            tmpDir.mkdirs();
+            java.io.File srcFile = new java.io.File(tmpDir, className + ".java");
+            java.io.FileWriter fw = new java.io.FileWriter(srcFile);
+            fw.write("public class ShowBc201 {\n" +
+                "    private int offset;\n" +
+                "    public void skip(int count) {\n" +
+                "        offset += count;\n" +
+                "    }\n" +
+                "}\n");
+            fw.close();
+            Process p = new ProcessBuilder(javacPath, "-d", tmpDir.getAbsolutePath(), srcFile.getAbsolutePath())
+                .redirectErrorStream(true).start();
+            if (p.waitFor() != 0) {
+                System.out.println("[SKIP] " + className + " - compilation failed");
+                return;
+            }
+            java.io.File classFile = new java.io.File(tmpDir, className + ".class");
+            final byte[] data = java.nio.file.Files.readAllBytes(classFile.toPath());
+            Loader loader = new Loader() {
+                public boolean canLoad(String internalName) { return "ShowBc201".equals(internalName); }
+                public byte[] load(String internalName) { return data; }
+            };
+            java.util.Map<String, Object> config = new java.util.HashMap<String, Object>();
+            config.put("showBytecode", Boolean.TRUE);
+            StringPrinter printer = new StringPrinter();
+            new DenzoDecompiler().decompile(loader, printer, className, config);
+            String result = printer.getResult();
+            // The getfield / iadd / putfield of `offset += count` must precede the statement.
+            int ins = result.indexOf(": iadd");
+            int stmt = result.indexOf("this.offset += ");
+            if (ins >= 0 && result.contains(": putfield") && stmt > ins) {
+                System.out.println("[PASS] " + className);
+                passed++;
+            } else {
+                System.out.println("[FAIL] " + className + " - no bytecode instructions before the statement");
+                System.out.println("       Output: " + result.replace("\n", "\\n"));
+                failed++;
+            }
+            srcFile.delete();
+            classFile.delete();
+        } catch (Exception e) {
+            System.out.println("[FAIL] " + className + " - " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            failed++;
+        }
+    }
+    // END_CHANGE: BUG-2026-0201-2
+
+    // START_CHANGE: BUG-2026-0180-20261018-6 - runTestFull with a JDK 8 javac: the javac 7/8
+    // try-with-resources desugaring differs from what javac 9+ emit even with --release 8.
+    // The path comes from -Djavac8=..., default the Debian/Ubuntu location; SKIP when missing.
+    private static void runTestJavac8(String className, String sourceCode, String javacDebugFlag,
+                                      String[] mustContain, String[] mustNotContain) {
+        String j8 = System.getProperty("javac8", "/usr/lib/jvm/java-8-openjdk-amd64/bin/javac");
+        if (!new java.io.File(j8).canExecute()) {
+            System.out.println("[SKIP] " + className + " - no JDK 8 javac at " + j8);
+            return;
+        }
+        String saved = javacPath;
+        javacPath = j8;
+        try {
+            runTestFull(className, sourceCode, javacDebugFlag, mustContain, mustNotContain);
+        } finally {
+            javacPath = saved;
+        }
+    }
+    // END_CHANGE: BUG-2026-0180-6
+
+    // START_CHANGE: BUG-2026-0129-20260907-4 - Guard for the inlined-finally-copy defect.
+    /**
+     * BUG-2026-0129: javac inlines the finally body before EVERY exit from the protected region.
+     * `removeDuplicatedFinally` only stripped the copy at the top level of the try body, so a copy
+     * placed before a `return`/`break`/`continue` nested inside an `if`/loop/switch survived and the
+     * action ran twice - for the `lock.unlock()` family, an IllegalMonitorStateException on output
+     * that compiles cleanly.
+     *
+     * Runtime oracle (SCRATCH/w1): the original prints `oneNestedReturn=6 u=1`; the pre-fix
+     * decompilation, recompiled and run, printed `u=2` in all three debug modes.
+     *
+     * Verified against the bytecode: for this shape javac emits the copy in the GAP between the two
+     * protected ranges of the `any` handler (`LinkedBlockingDeque.pollFirst`: unlock at pc 40, ranges
+     * [18,38) and [46,66)), so it is provably not part of the try body.
+     */
+    private static void testNestedFinallyCopyRemoved() {
+        runTestFull("DupFin",
+            "public class DupFin {\n" +
+            "    static int calls = 0;\n" +
+            "    static void release() { calls++; }\n" +
+            "    static int f(int n) {\n" +
+            "        try {\n" +
+            "            if (n > 0) { return n * 2; }\n" +
+            "        } finally { release(); }\n" +
+            "        return -1;\n" +
+            "    }\n" +
+            "}",
+            "-g",
+            // The nested return must follow its declaration directly: nothing inlined in between.
+            new String[]{
+                "int var1 = n * 2;\n                return var1;",
+                "} finally {"},
+            // The inlined copy immediately before the nested return - the defect itself.
+            new String[]{"release();\n                return var1;"});
+    }
+    // END_CHANGE: BUG-2026-0129-4
+
 
     private static void runTestFull(String className, String sourceCode,
                                     String[] mustContain, String[] mustNotContain) {

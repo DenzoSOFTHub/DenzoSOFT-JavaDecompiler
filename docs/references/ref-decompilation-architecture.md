@@ -317,7 +317,9 @@ Detection: When processing a conditional block, if the true or false successor i
 
 ## 5. Post-processing Transforms
 
-After `StructuredFlowBuilder` produces the initial AST, six transform passes refine the output.
+After `StructuredFlowBuilder` produces the initial AST, transform passes refine the output. The six
+historical passes are described first; the passes added in v1.13.0 follow in
+[Late repair passes (v1.13.0)](#late-repair-passes-v1130).
 
 ### BooleanSimplifier
 
@@ -370,6 +372,34 @@ Simplifies assignment patterns:
 
 Also handles assert reconstruction: patterns matching `if (!$assertionsDisabled && !condition) throw new AssertionError()` are converted to `assert condition` statements.
 
+### Structural safety net (v1.13.0)
+
+`ReachabilityChecker` applies JLS 14.22 to a structured body and reports the three defects javac
+rejects: an unreachable statement, a non-void body that can complete normally, and a
+`break`/`continue` with no valid target. When it reports one for the legacy builder's result, the
+converter structures the method again with `SafeStructurer`, which follows Ramsey's "Beyond
+Relooper" algorithm and never guesses; the safe result is kept only if it is itself clean.
+`ExceptionChecker` (JLS 11.2) and `ClassHierarchy` (class headers read through the decompilation's
+`Loader`, falling back to the running JVM) support these structural checks. `Javac7TwrNormalizer`
+rewrites the javac 7/8 try-with-resources desugaring into a plain try/finally before reconstruction.
+
+### Late repair passes (v1.13.0)
+
+These run on the finished method body, in this order, after the historical transforms:
+
+| Pass | Purpose |
+|---|---|
+| `VariableWebSplitter` | One slot name carrying values of incompatible types becomes several variables |
+| `LocalDeclarationFixer` | Declares locals that no enclosing declaration covers (`cannot find symbol` otherwise) |
+| `TypeCoercer` | Spells out the conversions the JVM performs implicitly: int/boolean/char/short narrowing, casts for erased generics and type variables, a for-each over a truly raw `Iterable` iterates `Object` and casts |
+| `ShortCircuitRebuilder` | Turns the duplicated ternary trees of `(a && b) \|\| (c && d)` back into short-circuit chains |
+| `DuplicateDeclarationResolver` | No local is declared while another of the same name is in scope |
+| `EnumSwitchMapResolver` | `switch ($SwitchMap$E[e.ordinal()])` back to `switch (e) { case CONST: }` |
+| `CatchVarNormalizer` | Removes leftover `v = $exception;` handler stores |
+
+`AstMapper` is the identity-preserving rewriter these passes share: it returns the same node instance
+when nothing below it changed, so identity-keyed side tables stay valid.
+
 ---
 
 ## 6. Source Generation
@@ -381,7 +411,11 @@ The `JavaSourceWriter` traverses the AST and generates Java source code by calli
 The writer processes the `JavaSyntaxResult` top-down:
 
 1. **Package declaration**: `package com.example;`
-2. **Imports**: (not generated -- types are fully qualified or simple-named)
+2. **Imports**: since v1.13.0 driven by what is actually rendered. The writer first renders the
+   compilation unit into a discarding printer (a *dry render*) and records every type reference; the
+   import block is the union of those references and an AST walk. Each simple name denotes one type;
+   any other referenced type with the same simple name is printed fully qualified. The dry render
+   must not mutate the AST it renders (BUG-2026-0201).
 3. **Class declaration**: Access modifiers, class/interface/enum/record keyword, name, type parameters, extends, implements, permits.
 4. **Annotations**: `@Deprecated`, `@SuppressWarnings("unchecked")`, custom annotations with element-value pairs.
 5. **Fields**: Modifiers, type, name, optional initializer.

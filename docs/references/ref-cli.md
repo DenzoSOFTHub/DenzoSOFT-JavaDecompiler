@@ -1,6 +1,10 @@
 # CLI Reference
 
-This document describes the command-line interface for DenzoSOFT Java Decompiler.
+This document describes the command-line interface for DenzoSOFT Java Decompiler. For a
+task-oriented walkthrough, including the GUI, see the [User Manual](../guides/guide-user-manual.md).
+
+The examples use the name `denzosoft-decompiler.jar`; the release artifact is
+`java-decompiler-<version>.jar` (for example `java-decompiler-1.13.0.jar`).
 
 ---
 
@@ -19,7 +23,9 @@ java -jar denzosoft-decompiler.jar [options] <command>
 | `--compact` | Compact output without line number alignment. By default, the decompiler preserves original source line numbers by inserting blank lines. |
 | `--show-bytecode` | Show JVM bytecode instructions as comments before each decompiled line, with Java-level explanations (variable names, field accesses, method calls). |
 | `--show-native-info` | Show JNI function names and parameter types as comments on native method declarations. |
-| `--deobfuscate` | Sanitize obfuscated identifiers to produce compilable output. Java keywords (`do`, `if`, `int`, etc.) get a `_` prefix; illegal characters are replaced with `_`. Applies to variables, fields, methods, and class names. |
+| `--deobfuscate` | Sanitize obfuscated identifiers to produce compilable output: illegal characters are replaced with `_`, and obfuscation patterns (encrypted strings, flattened control flow, opaque predicates, reflection) are annotated or simplified. Java keywords used as names (`do`, `if`, `int`, ...) get a `_` prefix with or without this flag. |
+| `--align-lines` | Line-aligned output (the default; accepted for explicitness). |
+| `--gui [archive ...]` | Start the graphical interface, optionally opening `.jar`/`.war`/`.ear`/`.apk` archives. Running with no arguments also starts the GUI. Output options are not passed to the GUI; use its *Options* menu. |
 
 Options can appear anywhere on the command line, before or after the command. Multiple options can be combined.
 
@@ -57,7 +63,7 @@ Opens the JAR file and decompiles the specified class. Other classes in the JAR 
 
 **Arguments:**
 - `<file.jar>` -- Path to a `.jar` file.
-- `<class-name>` -- Fully qualified class name using `/` separators (no `.class` suffix).
+- `<class-name>` -- Fully qualified class name, with `/` or `.` separators (no `.class` suffix).
 
 **Example:**
 
@@ -77,7 +83,7 @@ java -jar denzosoft-decompiler.jar --batch <file.jar|class-dir> <output-dir>
 Decompiles all classes in a JAR file or directory tree, writing each decompiled class to a `.java` file in the output directory. Uses a parallel thread pool with one thread per available CPU core.
 
 **Arguments:**
-- `<file.jar|class-dir>` -- A `.jar` file or a directory containing `.class` files.
+- `<file.jar|class-dir>` -- A `.jar`, `.war`, `.ear` or `.apk` file, or a directory containing `.class` files. Nested archives (`WEB-INF/lib/*.jar`, EAR modules) are not descended into, and APK DEX bytecode is not decompiled (BUG-2026-0207).
 - `<output-dir>` -- Directory where `.java` files will be written. Created if it does not exist.
 
 **Output:**
@@ -140,7 +146,7 @@ Prints the decompiler version and the maximum supported Java version, then exits
 **Output:**
 
 ```
-DenzoSOFT Java Decompiler v1.8.0
+DenzoSOFT Java Decompiler v1.13.0
 Supports Java 1.0 through Java 25
 ```
 
@@ -151,7 +157,11 @@ Supports Java 1.0 through Java 25
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | Error: missing arguments, unsupported file type, decompilation failure, or batch error |
+| 1 | Error: missing arguments, unsupported file type, or single-class decompilation failure |
+
+`--batch` exits 0 even when individual classes fail to decompile; read its summary (`Errors: N`)
+instead of relying on the exit code (BUG-2026-0207). There is no `--help`; it is reported as an
+unsupported file type.
 
 When an error occurs, a diagnostic message is printed to standard error. For `DecompilationException` errors, the diagnostic info includes the pipeline stage where the failure occurred and contextual details.
 
@@ -177,13 +187,13 @@ File not found, I/O errors, and other exceptions print the error message and sta
 ## Examples
 
 ```bash
-# Decompile a single class (compact output, default)
+# Decompile a single class (line-aligned output, the default)
 java -jar denzosoft-decompiler.jar HelloWorld.class
 
 # Decompile with compact output (no line number alignment)
 java -jar denzosoft-decompiler.jar --compact HelloWorld.class
 
-# Decompile with bytecode metadata
+# Decompile with each statement's JVM instructions as comments
 java -jar denzosoft-decompiler.jar --show-bytecode HelloWorld.class
 
 # Decompile with JNI info for native methods
